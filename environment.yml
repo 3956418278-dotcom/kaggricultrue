@@ -1,0 +1,8 @@
+name: kaggriculture
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.3=hab00c5b_0_cpython
+  - pip=25.2=pyh8b19718_0
+  - pip:
+      - -r requirements.lock

@@ -1,0 +1,23 @@
+{
+  "environment": "kaggriculture",
+  "schema_version": "0.1.0",
+  "distribution": "kaggle-environments",
+  "distribution_version": "1.32.7",
+  "python_requires": ">=3.11",
+  "pypi_wheel": "kaggle_environments-1.32.7-py3-none-any.whl",
+  "pypi_wheel_sha256": "2a1bb862ad2d6463080f80f6a766f46d94b53fd57168cfeddb9857fc3dbc4c8f",
+  "source_repository": "https://github.com/Kaggle/kaggle-environments",
+  "source_commit": "28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c",
+  "source_commit_timestamp": "2026-08-15T01:24:24Z",
+  "key_file_sha256": {
+    "AGENTS.md": "e1a80501a7b02a212eaac9370ada4129a64e0ee6cb3cbc790f3d77d22863fe22",
+    "README.md": "3081e52baf8eb2da5d861acc63a3636ce29425f6bdb79a67036ba234ac4ade00",
+    "kaggriculture.json": "a82c89c1a2315b93f39775d8e025471a01b738647c9772658368ee6b1b6f4867",
+    "kaggriculture.py": "bc8a54879ef02c7ea64b8b333d6a976f0ea65c4949149d01f463f23bccee653e"
+  },
+  "upstream_recheck": {
+    "checked_at": "2026-09-04",
+    "commit": "bbda347572cf5134e56f0eb49e8058e2560f9844",
+    "result": "All four key files were byte-identical to the pinned release source."
+  }
+}

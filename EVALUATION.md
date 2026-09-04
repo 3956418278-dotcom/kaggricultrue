@@ -4,7 +4,7 @@
 
 This document defines when match results support a competitive claim or the promotion of a new accepted baseline. It owns the evaluation protocol; `STATE.md` records which evidence and baseline have actually been accepted.
 
-The initial official reference is the full `kaggriculture` environment schema version `0.1.0` at `Kaggle/kaggle-environments` commit `bbda347572cf5134e56f0eb49e8058e2560f9844`, inspected 2026-09-04. Evidence must use an executable environment pinned more precisely than the environment name alone.
+The executable local reference is full `kaggriculture` schema `0.1.0` from `kaggle-environments==1.32.7`, matching official source commit `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`. Its wheel and key-file hashes are in `references/official/kaggriculture-environment-1.32.7.json`. Evidence must use an executable environment pinned more precisely than the environment name or schema version alone.
 
 ## Evidence identity
 
@@ -19,6 +19,8 @@ Every retained evaluation must identify:
 - one row per game with seed, candidate seat, statuses, final money, outcome, replay path/hash, and any error, timeout, or invalid-result flag.
 
 Changing any of these creates a new evidence set. Results from incompatible environment identities or configurations are not pooled silently.
+
+The repository's contract verification proves behavior only for the pinned local distribution. The public competition does not expose an immutable deployed evaluator package or container identity, so remote equivalence remains bounded by the observed submission contract and replay behavior rather than asserted as byte identity.
 
 ## Seed and replication semantics
 
@@ -98,7 +100,7 @@ Before running an acceptance arena, freeze and record:
 
 Acceptance requires all planned games and seat pairs to finish validly and reproduce on a declared audit subset. The primary baseline comparison must meet its prespecified superiority or practical-improvement rule, while prespecified opponent-suite checks must meet their non-inferiority rules. Any multiple opponent or metric claims must be handled as a declared family rather than selected after inspection.
 
-The first baseline's numerical effect threshold, non-inferiority tolerance, seed count, and power/precision target remain undecided in `STATE.md`. Until they are fixed before an acceptance run, results may be strong exploration but cannot promote a strategy as the accepted baseline.
+The bootstrap baseline may be designated under the non-competitive gates above without claiming superiority. Numerical effect thresholds, non-inferiority tolerances, seed count, and power/precision targets govern the first candidate seeking promotion over that anchor; they remain undecided in `STATE.md`. Until they are fixed before that acceptance run, candidate results may be strong exploration but cannot justify a competitive baseline promotion.
 
 Do not relabel a development arena as acceptance evidence after seeing its outcome. A candidate that changes in response to acceptance results requires a fresh candidate identity and fresh held-out evidence.
 
@@ -120,9 +122,11 @@ Kaggle submission evidence must record the submission ID, uploaded artifact hash
 - remote submission acceptance;
 - completed Kaggle episodes;
 - a timestamped public leaderboard snapshot;
-- final or private leaderboard standing.
+- the post-deadline final tournament standing.
 
 Leaderboard results are valuable external validation but are observational: opponent assignment, seeds, environment deployment, and population may be hidden or change over time. Use them to challenge local conclusions and opponent coverage. Do not tune repeatedly to a public score and then cite that same score as independent confirmation.
+
+Under the official evaluation page inspected on 2026-09-04, an upload first runs a self-play validation episode. Valid submissions then play similarly rated agents; only the latest two submissions are tracked for scoring, and the higher-scoring one is displayed. The episode outcome is win/draw/loss from final coins after the 720-turn game, not the size of the money margin. After the deadline, submissions lock and a final Bradley-Terry tournament is computed from subsequent episodes. These remote ratings are population-dependent and are not interchangeable with the fixed local acceptance protocol.
 
 ## Claim language
 

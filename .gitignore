@@ -1,0 +1,28 @@
+# Local Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated evaluation and replay data
+runs/
+replays/
+.cache/
+
+# Built submissions and packaging output
+dist/
+build/
+*.tar.gz
+
+# Local competition data and downloaded opponents
+data/
+opponents/
+
+# Credentials and local environment overrides
+.env
+.env.*
+!.env.example
+access_token
+kaggle.json

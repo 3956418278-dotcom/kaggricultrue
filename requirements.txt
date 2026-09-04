@@ -1,0 +1,2 @@
+# Direct runtime dependency used for local environment and contract verification.
+kaggle-environments==1.32.7

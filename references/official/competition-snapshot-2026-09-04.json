@@ -1,0 +1,36 @@
+{
+  "competition": "kaggriculture",
+  "competition_id": 147734,
+  "retrieved_at": "2026-09-04",
+  "source_urls": {
+    "public_overview": "https://www.kaggle.com/competitions/kaggriculture/overview",
+    "page_api": "https://api.kaggle.com/v1/competitions.CompetitionApiService/ListCompetitionPages",
+    "metadata_api": "https://www.kaggle.com/api/i/competitions.CompetitionService/GetCompetition"
+  },
+  "api_request_bodies": {
+    "page_api": {"competitionName": "kaggriculture"},
+    "metadata_api": {"competitionName": "kaggriculture"}
+  },
+  "official_page_api_response_sha256": "68f38a813eedc5137e8292372c287d1cb8978fad9866c05f3f35daab03a73327",
+  "official_metadata_api_response_sha256": "77c29c0fbe7bf9825d4e2764c3231fb5e2a67a277954d4237d41dcfc657e07c4",
+  "selected_page_sha256": {
+    "How to Play": "83b073e82e043da855d1d9d7b1e475ad0c5a95449f98161752c904fa68f9b3f7",
+    "Evaluation": "5ac05ca0977a0c200a203c46dc8ef031344000143bfa1e864723ee87aff62cfc",
+    "Getting Started: Test Locally & Submit": "57c1a002fc60d8f7eac76bc40ed4dffbb7da123cc58b92ab89afb4a90d8ef535"
+  },
+  "verified_contract_facts": {
+    "submission_entrypoint": "main.py at the archive root exposing agent(observation)",
+    "accepted_upload_forms": ["single main.py", "tar.gz with root main.py", "Kaggle notebook submission"],
+    "submission_size_limit_mb": 20480,
+    "daily_submission_limit": 5,
+    "tracked_submissions": 2,
+    "episode_scoring": "win, draw, or loss according to final coins after the 720-turn game; money margin does not change the episode outcome",
+    "remote_validation": "A self-play validation episode runs after upload; loader or runtime failure is reported as Error with logs.",
+    "episode_network": "No ingress or egress during an episode; the submission must be self-contained.",
+    "simulation_privacy": "Actions and replays may be made public and downloadable."
+  },
+  "unresolved": [
+    "The anonymously rendered FAQ did not expose numeric HDD, RAM, or vCPU resource values.",
+    "Kaggle does not expose an immutable deployed evaluator package or container identity on the public competition pages."
+  ]
+}
