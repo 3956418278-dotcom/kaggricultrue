@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -24,6 +25,7 @@ class WorkTask:
     eligible_worker: int | None = None
     dependency: str | None = None
     capacity: int = 1
+    followup_actions: int = 0
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,62 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
     tasks = _inventory_drop_tasks(state, terminal)
     end_of_day = min(rules.TERMINAL_ACTION_STEP, (state.day + 1) * 24 - 1)
 
+    if terminal:
+        for tile in state.crop_tiles():
+            raw = tile.raw
+            quantity = int(raw.get("yield_units", 0) or 0)
+            rule = rules.CROPS[str(raw["crop"])]
+            age = state.day - int(raw.get("planted_day", state.day))
+            if quantity <= 0 or age < rule.first_yield_day:
+                continue
+            water_gain = rules.one_time_water_gain(
+                str(raw["crop"]),
+                planted_day=int(raw.get("planted_day", state.day)),
+                day=state.day,
+                yield_units=quantity,
+                fertilized_until_day=int(raw.get("fertilized_until_day", -1)),
+                watered_today=bool(raw.get("watered_today", False)),
+            )
+            return_actions = rules.distance_to_shed(tile.position) + 1
+            if water_gain:
+                tasks.append(
+                    WorkTask(
+                        f"terminal-water:{tile.position}",
+                        "WATER",
+                        ("WATER",),
+                        2,
+                        rules.TERMINAL_ACTION_STEP,
+                        tile.position,
+                        followup_actions=1 + return_actions,
+                    )
+                )
+            else:
+                tasks.append(
+                    WorkTask(
+                        f"terminal-harvest:{tile.position}",
+                        "HARVEST",
+                        ("HARVEST",),
+                        3,
+                        rules.TERMINAL_ACTION_STEP,
+                        tile.position,
+                        followup_actions=return_actions,
+                    )
+                )
+        for tile in state.animal_tiles():
+            if int(tile.raw.get("yield_units", 0) or 0) <= 0:
+                continue
+            tasks.append(
+                WorkTask(
+                    f"terminal-animal-harvest:{tile.position}",
+                    "HARVEST",
+                    ("HARVEST",),
+                    3,
+                    rules.TERMINAL_ACTION_STEP,
+                    tile.position,
+                    followup_actions=rules.distance_to_shed(tile.position) + 1,
+                )
+            )
+
     if not terminal:
         for tile in state.crop_tiles():
             raw = tile.raw
@@ -72,17 +130,31 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
             first_day = int(raw.get("planted_day", state.day)) + rule.first_yield_day
             age = state.day - int(raw.get("planted_day", state.day))
             harvest_ready = rule.ongoing and state.day >= first_day
+            final_water_gain = rules.one_time_water_gain(
+                str(raw["crop"]),
+                planted_day=int(raw.get("planted_day", state.day)),
+                day=state.day,
+                yield_units=int(raw.get("yield_units", 0) or 0),
+                fertilized_until_day=int(raw.get("fertilized_until_day", -1)),
+                watered_today=bool(raw.get("watered_today", False)),
+            )
             harvest_ready = harvest_ready or (
-                not rule.ongoing and age >= rule.max_yield_day
+                not rule.ongoing
+                and age >= rule.max_yield_day
+                and final_water_gain == 0
             )
             if int(raw.get("yield_units", 0) or 0) > 0 and harvest_ready:
                 tasks.append(WorkTask(f"harvest:{tile.position}", "HARVEST", ("HARVEST",), 7, end_of_day, tile.position))
-            if not bool(raw.get("watered_today", False)):
+            awaiting_fertilizer = (
+                tile.position in plan.fertilize_targets
+                and int(raw.get("fertilized_until_day", -1)) < state.day + 2
+            )
+            if not bool(raw.get("watered_today", False)) and not awaiting_fertilizer:
                 tasks.append(WorkTask(f"water:{tile.position}", "WATER", ("WATER",), 12, end_of_day, tile.position))
-            if tile.position in plan.fertilize_targets and int(raw.get("fertilized_until_day", -1)) < state.day:
+            if tile.position in plan.fertilize_targets and int(raw.get("fertilized_until_day", -1)) < state.day + 2:
                 tasks.append(
                     WorkTask(
-                        f"fertilize:{tile.position}", "FERTILIZE", ("FERTILIZE",), 18,
+                        f"fertilize:{tile.position}", "FERTILIZE", ("FERTILIZE",), 10,
                         end_of_day, tile.position, required_item="FERTILIZER",
                         dependency="fertilizer-in-worker-inventory",
                     )
@@ -113,7 +185,7 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
         carried_fertilizer = state.carried_total("FERTILIZER")
         if len(plan.fertilize_targets) > carried_fertilizer and state.shed.get("FERTILIZER", 0) > 0:
             quantity = min(len(plan.fertilize_targets) - carried_fertilizer, state.shed.get("FERTILIZER", 0))
-            tasks.append(WorkTask("pickup:fertilizer", "PICKUP", ("PICKUP", "FERTILIZER", quantity), 16, end_of_day, at_shed=True))
+            tasks.append(WorkTask("pickup:fertilizer", "PICKUP", ("PICKUP", "FERTILIZER", quantity), 9, end_of_day, at_shed=True))
 
         for animal in rules.ANIMALS:
             if state.owned_total(animal) <= 0:
@@ -189,6 +261,11 @@ def schedule(state: OwnedState, tasks: tuple[WorkTask, ...]) -> tuple[tuple[list
                         continue
                 target = _task_target(task, worker, state.board_size)
                 distance = rules.manhattan(worker.position, target)
+                if (
+                    state.step >= 707
+                    and distance + 1 + task.followup_actions > state.turns_left
+                ):
+                    continue
                 continuity = (-2 if worker.position == target else 0) + (-1 if task.required_item else 0)
                 # Deadline is ordered before route length.  Folding distance into
                 # slack would perversely favor farther work with the same deadline.
@@ -242,29 +319,44 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
     if terminal:
         return tuple(sales[: rules.MAX_MARKET_ORDERS])
 
-    # Labor is a capacity dependency for the selected work and its Fibonacci
-    # costs are already reserved by the planner, so hire before optional inputs.
-    purchases: list[list[object]] = [["HIRE"] for _ in range(plan.hire_count)]
+    commitment_orders: list[list[object]] = []
     for crop in rules.CROPS:
         targets = sum(value == crop for value in plan.crop_targets.values())
         remaining_targets = max(0, targets - planted.get(crop, 0))
         remaining_seeds = max(0, state.seeds.get(crop, 0) - planted.get(crop, 0))
         shortfall = max(0, remaining_targets - remaining_seeds)
         if shortfall:
-            purchases.append(["BUY_SEED", crop, shortfall])
-    for animal in plan.animal_purchases:
-        purchases.append(["BUY_ANIMAL", animal, 1])
+            commitment_orders.append(["BUY_SEED", crop, shortfall])
+    animal_counts = Counter(plan.animal_purchases)
+    for animal in rules.ANIMALS:
+        if animal_counts[animal]:
+            commitment_orders.append(
+                ["BUY_ANIMAL", animal, animal_counts[animal]]
+            )
     fertilizer_after_actions = max(0, state.owned_total("FERTILIZER") - used_carried.get("FERTILIZER", 0))
     fertilizer_shortfall = max(0, plan.fertilizer_reserve - fertilizer_after_actions)
     if fertilizer_shortfall:
-        purchases.append(["BUY_PRODUCT", "FERTILIZER", fertilizer_shortfall])
+        commitment_orders.append(
+            ["BUY_PRODUCT", "FERTILIZER", fertilizer_shortfall]
+        )
     wheat_after_actions = max(0, state.owned_total("WHEAT") - used_carried.get("WHEAT", 0))
     wheat_shortfall = max(0, plan.feed_reserve - wheat_after_actions)
     if wheat_shortfall:
-        purchases.append(["BUY_PRODUCT", "WHEAT", wheat_shortfall])
+        commitment_orders.append(["BUY_PRODUCT", "WHEAT", wheat_shortfall])
     if plan.buy_land:
-        purchases.append(["BUY_LAND"])
-    return tuple((sales + purchases)[: rules.MAX_MARKET_ORDERS])
+        commitment_orders.append(["BUY_LAND"])
+
+    # Reserve the finite entry budget for commitment inputs.  Sales still execute
+    # first (and can finance later entries), but only occupy genuinely spare slots.
+    if len(commitment_orders) > rules.MAX_MARKET_ORDERS:
+        raise ValueError("planner commitments exceed the market-entry budget")
+    hire_slots = max(
+        0, rules.MAX_MARKET_ORDERS - len(commitment_orders)
+    )
+    hire_orders = [["HIRE"] for _ in range(min(plan.hire_count, hire_slots))]
+    required_orders = [*hire_orders, *commitment_orders]
+    sale_slots = rules.MAX_MARKET_ORDERS - len(required_orders)
+    return tuple([*sales[:sale_slots], *required_orders])
 
 
 def execute(state: OwnedState, plan: Plan) -> Execution:

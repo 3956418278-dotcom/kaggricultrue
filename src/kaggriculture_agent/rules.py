@@ -185,6 +185,27 @@ def fibonacci_hire_cost(index: int) -> int:
     return a
 
 
+def one_time_water_gain(
+    crop: str,
+    *,
+    planted_day: int,
+    day: int,
+    yield_units: int,
+    fertilized_until_day: int,
+    watered_today: bool = False,
+) -> int:
+    """Immediate yield gained by a legal WATER on a one-time crop."""
+    rule = CROPS[crop]
+    if rule.ongoing or watered_today or yield_units >= rule.max_yield:
+        return 0
+    age = day - planted_day
+    window_start = (rule.max_yield_day + 1) // 2
+    if not window_start <= age <= rule.max_yield_day:
+        return 0
+    bonus = 2 if fertilized_until_day >= day else 1
+    return min(bonus, rule.max_yield - yield_units)
+
+
 def quadrant(position: tuple[int, int], board_size: int = BOARD_SIZE) -> str:
     x, y = position
     half = board_size // 2

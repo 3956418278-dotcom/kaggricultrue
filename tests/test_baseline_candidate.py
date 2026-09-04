@@ -18,7 +18,12 @@ from src.kaggriculture_agent.economics import (
     TimeDimension,
 )
 from src.kaggriculture_agent.execution import WorkTask, execute, generate_tasks, schedule
-from src.kaggriculture_agent.planner import PlannerConfig, enumerate_projects, make_plan
+from src.kaggriculture_agent.planner import (
+    PlannerConfig,
+    _fertilizer_marginal_outputs,
+    enumerate_projects,
+    make_plan,
+)
 from src.kaggriculture_agent.state import TileState, WorkerState, reconstruct
 
 
@@ -65,11 +70,11 @@ class BaselineModelTests(unittest.TestCase):
         tiles[position[1] * state.board_size + position[0]] = TileState(
             position,
             {
-                "kind": "PLANT", "crop": "MELON", "planted_day": state.day - 6,
-                "watered_today": False, "fertilized_until_day": -1, "yield_units": 1,
+                "kind": "PLANT", "crop": "TOMATO", "planted_day": state.day - 7,
+                "watered_today": False, "fertilized_until_day": -1, "yield_units": 0,
             },
         )
-        fertilized_state = replace(state, tiles=tuple(tiles), shed={"FERTILIZER": 1, "MELON": 2})
+        fertilized_state = replace(state, tiles=tuple(tiles), shed={"FERTILIZER": 1, "TOMATO": 2})
         kinds = {item.kind for item in make_plan(fertilized_state).support}
         self.assertIn("FERTILIZER", kinds)
         self.assertIn("LIQUIDATION", kinds)
@@ -102,7 +107,7 @@ class BaselineModelTests(unittest.TestCase):
         actions, _ = schedule(state, tasks)
         self.assertLessEqual(sum(action == ["PLANT", "WHEAT"] for action in actions), 1)
 
-    def test_one_time_crop_waits_for_its_bonus_window(self):
+    def test_one_time_crop_waters_before_final_same_day_harvest(self):
         state = initial_state()
         position = (3, 4)
 
@@ -126,7 +131,173 @@ class BaselineModelTests(unittest.TestCase):
 
         mature = crop_state(4)
         mature_kinds = {task.kind for task in generate_tasks(mature, make_plan(mature))}
-        self.assertIn("HARVEST", mature_kinds)
+        self.assertIn("WATER", mature_kinds)
+        self.assertNotIn("HARVEST", mature_kinds)
+
+        watered_tiles = list(mature.tiles)
+        watered_raw = dict(mature.tile_at(position).raw)
+        watered_raw.update({"watered_today": True, "yield_units": 2})
+        watered_tiles[position[1] * mature.board_size + position[0]] = TileState(
+            position, watered_raw
+        )
+        watered = replace(mature, tiles=tuple(watered_tiles))
+        watered_kinds = {
+            task.kind for task in generate_tasks(watered, make_plan(watered))
+        }
+        self.assertIn("HARVEST", watered_kinds)
+        self.assertNotIn("WATER", watered_kinds)
+
+    def test_animal_projection_uses_feed_and_accumulated_care_rules(self):
+        state = initial_state()
+        animals = {
+            str(project.metadata["animal"]): project
+            for project in enumerate_projects(state, PlannerConfig())
+            if project.kind == "ANIMAL"
+        }
+        cow_outputs = [
+            output.quantity
+            for output in animals["COW"].physical.outputs
+            if output.item == "MILK"
+        ]
+        self.assertEqual(cow_outputs[:3], [6, 3, 3])
+        official_tile = official._new_animal("COW", 0)
+        official_farm = {"tiles": [[official_tile]]}
+        observed = []
+        for service_day in range(10):
+            official_tile["fed_today"] = True
+            official_tile["cared_today"] = True
+            official._daily_refresh_animals(official_farm, service_day)
+            if official_tile["yield_units"]:
+                observed.append(official_tile["yield_units"])
+                official_tile["yield_units"] = 0
+        self.assertEqual(observed, cow_outputs[: len(observed)])
+        goose_outputs = [
+            output.quantity
+            for output in animals["GOOSE"].physical.outputs
+            if output.item == "EGG"
+        ]
+        self.assertEqual(goose_outputs[:3], [4, 2, 2])
+
+    def test_fertilizer_uses_actual_marginal_realizable_output(self):
+        state = initial_state()
+        position = (3, 4)
+        tiles = list(state.tiles)
+        tiles[position[1] * state.board_size + position[0]] = TileState(
+            position,
+            {
+                "kind": "PLANT", "crop": "TOMATO", "planted_day": -7,
+                "watered_today": False, "consecutive_unwatered": 0,
+                "yield_units": 0, "max_lifespan_step": -1,
+                "fertilized_until_day": -1,
+            },
+        )
+        state = replace(state, tiles=tuple(tiles), shed={"FERTILIZER": 1})
+        marginal = _fertilizer_marginal_outputs(state, state.tile_at(position))
+        self.assertEqual(
+            [(item.item, item.quantity) for item in marginal],
+            [("TOMATO", 1), ("TOMATO", 1), ("TOMATO", 1)],
+        )
+        support = next(item for item in make_plan(state).support if item.kind == "FERTILIZER")
+        self.assertEqual(support.physical.outputs, marginal)
+        self.assertEqual(support.metadata["marginal_units"], 3)
+        carried = replace(
+            state,
+            shed={},
+            workers=(WorkerState(0, position, {"FERTILIZER": 1}),),
+        )
+        self.assertEqual(
+            execute(carried, make_plan(carried)).worker_actions[0],
+            ["FERTILIZE"],
+        )
+        too_late = replace(carried, step=23, hour=23)
+        self.assertNotIn(
+            "FERTILIZER", {item.kind for item in make_plan(too_late).support}
+        )
+
+        baseline = official._new_plant("TOMATO", -7, 24)
+        treated = dict(baseline)
+        treated["fertilized_until_day"] = 2
+        realized_marginal = []
+        for day in range(3):
+            baseline["watered_today"] = True
+            treated["watered_today"] = True
+            official._daily_refresh_plants({"tiles": [[baseline]]}, day, 24)
+            official._daily_refresh_plants({"tiles": [[treated]]}, day, 24)
+            realized_marginal.append(treated["yield_units"] - baseline["yield_units"])
+            baseline["yield_units"] = 0
+            treated["yield_units"] = 0
+        self.assertEqual(realized_marginal, [1, 1, 1])
+
+    def test_terminal_liquidation_recovers_crop_and_animal_tile_yield(self):
+        state = initial_state()
+        crop_position = (4, 4)
+        animal_position = (3, 4)
+        tiles = list(state.tiles)
+        tiles[crop_position[1] * 10 + crop_position[0]] = TileState(
+            crop_position,
+            {
+                "kind": "PLANT", "crop": "WHEAT", "planted_day": 25,
+                "watered_today": True, "consecutive_unwatered": 0,
+                "yield_units": 4, "max_lifespan_step": 720,
+                "fertilized_until_day": -1,
+            },
+        )
+        tiles[animal_position[1] * 10 + animal_position[0]] = TileState(
+            animal_position,
+            {
+                "kind": "COOP", "animal": "GOOSE", "placed_day": 20,
+                "yield_units": 3, "consecutive_unfed": 0,
+                "fed_today": False, "cared_today": False,
+                "fertilizer_available": False, "pending_care_bonus": 0,
+            },
+        )
+        terminal = replace(
+            state,
+            step=707,
+            day=29,
+            hour=11,
+            tiles=tuple(tiles),
+            workers=(WorkerState(0, crop_position, {}),),
+        )
+        plan = make_plan(terminal)
+        liquidation = next(item for item in plan.support if item.kind == "LIQUIDATION")
+        projected = {(item.item, item.quantity) for item in liquidation.physical.outputs}
+        self.assertEqual(projected, {("WHEAT", 4), ("EGG", 3)})
+        terminal_tasks = generate_tasks(terminal, plan)
+        self.assertEqual(
+            {task.identifier for task in terminal_tasks if task.kind == "HARVEST"},
+            {
+                f"terminal-harvest:{crop_position}",
+                f"terminal-animal-harvest:{animal_position}",
+            },
+        )
+
+    def test_market_budget_keeps_required_purchases_when_sales_fill_budget(self):
+        state = initial_state()
+        full_shed = {item: 1 for item in rules.SELLABLE_PRODUCTS}
+        state = replace(state, shed=full_shed)
+        plan = replace(
+            make_plan(state),
+            crop_targets={(0, 0): "WHEAT", (1, 0): "CARROT", (2, 0): "TOMATO"},
+            hire_count=5,
+            feed_reserve=2,
+            fertilizer_reserve=2,
+            animal_purchases=(),
+            buy_land=False,
+        )
+        orders = execute(state, plan).market_orders
+        self.assertEqual(len(orders), rules.MAX_MARKET_ORDERS)
+        self.assertEqual(sum(order[0] == "HIRE" for order in orders), 5)
+        self.assertEqual(
+            {tuple(order[:2]) for order in orders if order[0].startswith("BUY_")},
+            {
+                ("BUY_SEED", "WHEAT"),
+                ("BUY_SEED", "CARROT"),
+                ("BUY_SEED", "TOMATO"),
+                ("BUY_PRODUCT", "FERTILIZER"),
+                ("BUY_PRODUCT", "WHEAT"),
+            },
+        )
 
     def test_same_observation_is_deterministic_and_json_safe(self):
         environment = make("kaggriculture", configuration={"seed": 43})
