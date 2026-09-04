@@ -169,6 +169,10 @@ The maintained agent should have one owner for each of these concerns:
 
 Opponent inference may be used by the decision core, but only from observable state. It is not a separate authority for game rules.
 
+The decision core represents every economic commitment through six semantic dimensions `(C, T, L, A, Q, R)`: cash commitments and timing; relevant time structure and horizon; land occupancy over time; dated service work plus an explicit travel approximation; physical inputs and outputs; and realizable revenue or terminal-cash effects. These dimensions retain schedules, intervals, and structured records where the game requires them. Terminal profit, profit per action, and profit per tile-day are derived comparisons after feasibility checks, not replacements for the underlying record or an arbitrary weighted utility.
+
+The same representation covers crop and animal production, fertilizer allocation, daily hiring, land expansion, and liquidation. An already-purchased seed, animal, crop, structure, or inventory item is a sunk commitment: planning records its historical cost for diagnosis but evaluates only the marginal cash, work, timing, storage, and realizable value of maintaining, moving, harvesting, using, or liquidating it.
+
 Local environment adapters, arenas, opponent loaders, replay parsers, statistics, and reports are evaluation infrastructure rather than submission-policy components. They must be able to compare an unchanged packaged agent without importing private implementation hooks.
 
 ## Stable architectural boundaries
@@ -180,4 +184,4 @@ Local environment adapters, arenas, opponent loaders, replay parsers, statistics
 - Evaluation instances will be declarative where practical. Generated matches, replays, reports, downloaded opponents, and build artifacts remain outside the project body and authoritative record.
 - Strategy variants must share mechanisms and differ through explicit policy/configuration choices. Market analysis, scheduling, pathfinding, and opponent modeling are code concerns, not separate agent-procedure skills.
 
-This project contract intentionally does not define a competitive strategy or select an accepted baseline.
+This project contract intentionally does not select an accepted competitive strategy or baseline.

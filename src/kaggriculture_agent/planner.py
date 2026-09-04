@@ -1,0 +1,774 @@
+"""Deterministic rolling-horizon economic planner.
+
+The planner filters projects through cash, horizon, land, storage, and dated labor
+constraints.  Among feasible projects it uses transparent derived dominance keys;
+there is no weighted utility that erases the six source dimensions.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from typing import Iterable, Mapping
+
+from . import rules
+from .economics import (
+    ActionDimension,
+    CashDimension,
+    EconomicCommitment,
+    LandDimension,
+    OccupancyInterval,
+    PhysicalDimension,
+    RevenueDimension,
+    TimeDimension,
+    TimedAmount,
+    TimedCash,
+    WorkAmount,
+)
+from .state import OwnedState, Position, TileState
+
+
+@dataclass(frozen=True)
+class PlannerConfig:
+    cash_reserve: int = 150
+    max_daily_hands: int = 5
+    max_new_production_per_turn: int = 3
+    latest_plant_hour: int = 18
+    working_shed_limit: int = 82
+    terminal_liquidation_step: int = 710
+
+
+@dataclass(frozen=True)
+class Plan:
+    obligations: tuple[EconomicCommitment, ...]
+    selected: tuple[EconomicCommitment, ...]
+    support: tuple[EconomicCommitment, ...]
+    rejected: Mapping[str, str]
+    crop_targets: Mapping[Position, str]
+    fertilize_targets: frozenset[Position]
+    animal_purchases: tuple[str, ...]
+    hire_count: int
+    buy_land: bool
+    feed_reserve: int
+    fertilizer_reserve: int
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+
+def _sale_step(state: OwnedState, output_step: int) -> int:
+    return min(rules.TERMINAL_ACTION_STEP, output_step + 4)
+
+
+def _revenue_for_outputs(
+    state: OwnedState,
+    outputs: Iterable[TimedAmount],
+    prior_sales: Mapping[str, int] | None = None,
+) -> int:
+    prior = dict(prior_sales or {})
+    gross = 0
+    for output in sorted(outputs, key=lambda flow: (flow.step, flow.item)):
+        quantity = max(0, output.quantity)
+        gross += rules.projected_sale_revenue(
+            output.item,
+            quantity,
+            state.market_inventory.get(output.item, rules.MARKET_I0),
+            _sale_step(state, output.step),
+            state.step,
+            state.unlocked_shops,
+            prior.get(output.item, 0),
+        )
+        prior[output.item] = prior.get(output.item, 0) + quantity
+    return gross
+
+
+def _crop_output_schedule(state: OwnedState, crop: str) -> tuple[TimedAmount, ...]:
+    rule = rules.CROPS[crop]
+    if rule.ongoing:
+        return tuple(
+            TimedAmount(
+                step=min(
+                    rules.TERMINAL_ACTION_STEP,
+                    (state.day + rule.first_yield_day + index * rule.interval)
+                    * rules.TURNS_PER_DAY,
+                ),
+                item=crop,
+                quantity=1,
+            )
+            for index in range(rule.max_yield)
+            if (state.day + rule.first_yield_day + index * rule.interval)
+            * rules.TURNS_PER_DAY
+            <= rules.TERMINAL_ACTION_STEP
+        )
+    expected_yield = {"WHEAT": 4, "CARROT": 3, "MELON": 6}[crop]
+    harvest_day = state.day + rule.max_yield_day
+    output_step = harvest_day * rules.TURNS_PER_DAY
+    if output_step > rules.TERMINAL_ACTION_STEP:
+        return ()
+    return (TimedAmount(output_step, crop, expected_yield),)
+
+
+def _crop_commitment(state: OwnedState, crop: str, tile: TileState) -> EconomicCommitment:
+    rule = rules.CROPS[crop]
+    outputs = _crop_output_schedule(state, crop)
+    completion = max((output.step for output in outputs), default=rules.TERMINAL_ACTION_STEP + 1)
+    active_days = max(0, completion // rules.TURNS_PER_DAY - state.day + 1)
+    harvest_actions = len(outputs) if rule.ongoing else (1 if outputs else 0)
+    distance = rules.distance_to_shed(tile.position, state.board_size)
+    # Simple travel approximation: one shed round trip plus one local reposition
+    # per four service days.  The dated service actions remain separately visible.
+    travel = 2 * distance + max(0, active_days - 1) // 4
+    work = [
+        WorkAmount(
+            state.day,
+            "PLANT",
+            1,
+            travel_actions=travel,
+            position=tile.position,
+            deadline_step=(state.day + 1) * rules.TURNS_PER_DAY - 1,
+        )
+    ]
+    for offset in range(active_days):
+        work.append(
+            WorkAmount(
+                state.day + offset,
+                "WATER",
+                1,
+                position=tile.position,
+                deadline_step=(state.day + offset + 1) * rules.TURNS_PER_DAY - 1,
+            )
+        )
+    for output in outputs:
+        work.append(
+            WorkAmount(
+                output.step // rules.TURNS_PER_DAY,
+                "HARVEST",
+                1,
+                position=tile.position,
+                deadline_step=min(rules.TERMINAL_ACTION_STEP, output.step + 23),
+            )
+        )
+    gross = _revenue_for_outputs(state, outputs)
+    return EconomicCommitment(
+        identifier=f"crop:{crop}:{tile.position[0]}:{tile.position[1]}",
+        kind="CROP",
+        target=tile.position,
+        existing=False,
+        cash=CashDimension(upfront=rule.seed_cost, reserve_required=0),
+        time=TimeDimension(
+            start_step=state.step,
+            completion_step=completion,
+            last_value_step=min(rules.TERMINAL_ACTION_STEP, completion + 23),
+            deadlines=tuple(
+                amount.deadline_step
+                for amount in work
+                if amount.deadline_step is not None
+            ),
+        ),
+        land=LandDimension(
+            (OccupancyInterval(tile.position, state.step, completion),)
+        ),
+        actions=ActionDimension(tuple(work)),
+        physical=PhysicalDimension(
+            inputs=(TimedAmount(state.step, f"{crop}_SEED", 1),),
+            outputs=outputs,
+            peak_shed_units=max((output.quantity for output in outputs), default=0),
+        ),
+        revenue=RevenueDimension(
+            projected_sales=outputs,
+            projected_gross=gross,
+            terminal_unsold_units=0,
+        ),
+        metadata={"crop": crop},
+    )
+
+
+def _remaining_animal_outputs(
+    state: OwnedState, animal: str, placed_day: int
+) -> tuple[TimedAmount, ...]:
+    rule = rules.ANIMALS[animal]
+    first_day = placed_day + rule.first_yield_day
+    days = range(max(state.day, first_day), 30)
+    return tuple(
+        TimedAmount(day * rules.TURNS_PER_DAY, rule.product, 2)
+        for day in days
+        if (day - first_day) % rule.interval == 0
+        and day * rules.TURNS_PER_DAY <= rules.TERMINAL_ACTION_STEP
+    )
+
+
+def _animal_commitment(
+    state: OwnedState,
+    animal: str,
+    target: Position,
+    *,
+    existing: bool,
+    placed_day: int | None = None,
+    current_yield: int = 0,
+    fertilizer_available: bool = False,
+    needs_structure: bool = False,
+) -> EconomicCommitment:
+    rule = rules.ANIMALS[animal]
+    placed_day = state.day if placed_day is None else placed_day
+    future_outputs = tuple(
+        output
+        for output in _remaining_animal_outputs(state, animal, placed_day)
+        if not existing or output.step // rules.TURNS_PER_DAY > state.day
+    )
+    existing_outputs = (
+        (TimedAmount(state.step, rule.product, current_yield),)
+        if existing and current_yield > 0
+        else ()
+    )
+    outputs = (*existing_outputs, *future_outputs)
+    end_day = 29
+    service_days = max(0, end_day - state.day + 1)
+    feed_price = max(1, state.market_prices.get("WHEAT", rules.MARKET["WHEAT"].base))
+    feed_schedule = tuple(
+        TimedCash(day * rules.TURNS_PER_DAY, "one wheat feed", feed_price)
+        for day in range(state.day, end_day + 1)
+    )
+    work: list[WorkAmount] = []
+    if not existing:
+        travel = 2 * rules.distance_to_shed(target, state.board_size)
+        if needs_structure:
+            work.append(WorkAmount(state.day, "BUILD", 1, travel, target))
+        work.append(WorkAmount(state.day, "PICKUP_PLACE", 2, travel, target))
+    for day in range(state.day, end_day + 1):
+        work.extend(
+            (
+                WorkAmount(day, "FEED", 1, position=target, deadline_step=(day + 1) * 24 - 1),
+                WorkAmount(day, "CARE", 1, position=target, deadline_step=(day + 1) * 24 - 1),
+                WorkAmount(day, "COLLECT_FERTILIZER", 1, position=target),
+            )
+        )
+    for output in outputs:
+        work.append(WorkAmount(output.step // 24, "HARVEST", 1, position=target))
+    fertilizer_outputs = (
+        ((TimedAmount(state.step, "FERTILIZER", 1),) if existing and fertilizer_available else ())
+        + tuple(
+            TimedAmount(day * 24, "FERTILIZER", 1)
+            for day in range(state.day + 1, end_day + 1)
+            if day * 24 <= rules.TERMINAL_ACTION_STEP
+        )
+    )
+    all_outputs = (*outputs, *fertilizer_outputs)
+    gross = _revenue_for_outputs(state, all_outputs)
+    purchase = 0 if existing else rule.cost
+    return EconomicCommitment(
+        identifier=("maintain" if existing else "animal")
+        + f":{animal}:{target[0]}:{target[1]}",
+        kind="ANIMAL_MAINTENANCE" if existing else "ANIMAL",
+        target=target,
+        existing=existing,
+        cash=CashDimension(
+            upfront=purchase,
+            scheduled=feed_schedule,
+            reserve_required=feed_price,
+            sunk_cost=rule.cost if existing else 0,
+        ),
+        time=TimeDimension(
+            state.step,
+            max((item.step for item in outputs), default=state.step),
+            rules.TERMINAL_ACTION_STEP,
+        ),
+        land=LandDimension(
+            (OccupancyInterval(target, state.step, rules.TERMINAL_ACTION_STEP),)
+        ),
+        actions=ActionDimension(tuple(work)),
+        physical=PhysicalDimension(
+            inputs=(TimedAmount(state.step, "WHEAT", service_days),),
+            outputs=all_outputs,
+            peak_shed_units=min(rule.max_held, 2) + 1,
+        ),
+        revenue=RevenueDimension(projected_sales=all_outputs, projected_gross=gross),
+        metadata={"animal": animal, "structure": rule.structure},
+    )
+
+
+def _existing_crop_obligation(state: OwnedState, tile: TileState) -> EconomicCommitment:
+    raw = tile.raw
+    crop = str(raw["crop"])
+    rule = rules.CROPS[crop]
+    age = state.day - int(raw.get("planted_day", state.day))
+    current_yield = max(0, int(raw.get("yield_units", 0) or 0))
+    if rule.ongoing:
+        remaining_events = max(0, rule.max_yield - max(0, (age - rule.first_yield_day) // max(1, rule.interval) + 1))
+        output_qty = current_yield + remaining_events
+        completion_day = min(29, state.day + remaining_events * max(1, rule.interval))
+    else:
+        planted_day = int(raw.get("planted_day", state.day))
+        completion_day = min(29, planted_day + rule.max_yield_day)
+        window_start = planted_day + (rule.max_yield_day + 1) // 2
+        possible_bonus = 0
+        for day in range(max(state.day, window_start), completion_day + 1):
+            if day == state.day and bool(raw.get("watered_today", False)):
+                continue
+            possible_bonus += 2 if int(raw.get("fertilized_until_day", -1)) >= day else 1
+        output_qty = min(rule.max_yield, max(current_yield, 1) + possible_bonus)
+    output_step = min(rules.TERMINAL_ACTION_STEP, completion_day * 24)
+    outputs = (TimedAmount(output_step, crop, output_qty),) if output_qty else ()
+    remaining_days = max(1, completion_day - state.day + 1)
+    work = tuple(
+        WorkAmount(day, "WATER", 1, position=tile.position, deadline_step=(day + 1) * 24 - 1)
+        for day in range(state.day, completion_day + 1)
+    ) + (WorkAmount(completion_day, "HARVEST", 1, position=tile.position),)
+    return EconomicCommitment(
+        identifier=f"existing-crop:{crop}:{tile.position[0]}:{tile.position[1]}",
+        kind="CROP_MAINTENANCE",
+        target=tile.position,
+        existing=True,
+        cash=CashDimension(sunk_cost=rule.seed_cost),
+        time=TimeDimension(state.step, output_step, min(rules.TERMINAL_ACTION_STEP, output_step + 23)),
+        land=LandDimension((OccupancyInterval(tile.position, state.step, output_step),)),
+        actions=ActionDimension(work),
+        physical=PhysicalDimension(outputs=outputs, peak_shed_units=output_qty),
+        revenue=RevenueDimension(projected_sales=outputs, projected_gross=_revenue_for_outputs(state, outputs)),
+        metadata={"crop": crop, "remaining_days": remaining_days},
+    )
+
+
+def existing_obligations(state: OwnedState) -> tuple[EconomicCommitment, ...]:
+    obligations: list[EconomicCommitment] = []
+    for tile in state.tiles:
+        if tile.kind == "PLANT":
+            obligations.append(_existing_crop_obligation(state, tile))
+        elif tile.animal:
+            obligations.append(
+                _animal_commitment(
+                    state,
+                    tile.animal,
+                    tile.position,
+                    existing=True,
+                    placed_day=int(tile.raw.get("placed_day", state.day)),
+                    current_yield=int(tile.raw.get("yield_units", 0) or 0),
+                    fertilizer_available=bool(tile.raw.get("fertilizer_available", False)),
+                )
+            )
+        elif tile.kind == "WEED":
+            obligations.append(
+                EconomicCommitment(
+                    identifier=f"weed:{tile.position[0]}:{tile.position[1]}",
+                    kind="RECOVERY",
+                    target=tile.position,
+                    existing=True,
+                    cash=CashDimension(),
+                    time=TimeDimension(state.step, state.step, rules.TERMINAL_ACTION_STEP),
+                    land=LandDimension(),
+                    actions=ActionDimension((WorkAmount(state.day, "DIG", 1, position=tile.position),)),
+                    physical=PhysicalDimension(),
+                    revenue=RevenueDimension(),
+                )
+            )
+    # Purchased animals are already-paid physical commitments.  Their purchase
+    # price is sunk; only placement, service, and later proceeds remain relevant.
+    pending_animals = {
+        animal: state.owned_total(animal)
+        for animal in rules.ANIMALS
+        if state.owned_total(animal) > 0
+    }
+    targets = list(_candidate_targets(state))
+    for animal, quantity in pending_animals.items():
+        structure = rules.ANIMALS[animal].structure
+        structure_targets = list(state.empty_structures(structure))
+        for index in range(quantity):
+            target_tile = (
+                structure_targets[index]
+                if index < len(structure_targets)
+                else targets[min(index, len(targets) - 1)] if targets else None
+            )
+            if target_tile is None:
+                continue
+            commitment = _animal_commitment(
+                state, animal, target_tile.position, existing=True, placed_day=state.day
+            )
+            travel = 2 * rules.distance_to_shed(target_tile.position, state.board_size)
+            setup = []
+            if target_tile.is_empty:
+                setup.append(WorkAmount(state.day, "BUILD", 1, travel, target_tile.position))
+            setup.append(WorkAmount(state.day, "PICKUP_PLACE", 2, travel, target_tile.position))
+            obligations.append(
+                replace(
+                    commitment,
+                    identifier=f"place-existing:{animal}:{index}:{target_tile.position[0]}:{target_tile.position[1]}",
+                    kind="ANIMAL_PLACEMENT",
+                    actions=ActionDimension((*setup, *commitment.actions.work)),
+                    metadata={**commitment.metadata, "pending": True},
+                )
+            )
+    return tuple(obligations)
+
+
+def _candidate_targets(state: OwnedState) -> tuple[TileState, ...]:
+    access = set(rules.shed_access(state.board_size))
+    return tuple(
+        sorted(
+            (tile for tile in state.empty_tiles() if tile.position not in access),
+            key=lambda tile: (
+                rules.distance_to_shed(tile.position, state.board_size),
+                tile.position[1],
+                tile.position[0],
+            ),
+        )
+    )
+
+
+def enumerate_projects(state: OwnedState, config: PlannerConfig) -> tuple[EconomicCommitment, ...]:
+    if state.step >= config.terminal_liquidation_step:
+        return ()
+    targets = _candidate_targets(state)
+    candidates: list[EconomicCommitment] = []
+    if state.hour <= config.latest_plant_hour:
+        # A bounded frontier is enough: farther identical tiles are dominated by
+        # these targets under the explicit Manhattan travel approximation.
+        for tile in targets[:12]:
+            for crop in rules.CROPS:
+                project = _crop_commitment(state, crop, tile)
+                if project.physical.outputs:
+                    candidates.append(project)
+    animal_targets: dict[str, Position] = {}
+    for animal, animal_rule in rules.ANIMALS.items():
+        empty_structures = state.empty_structures(animal_rule.structure)
+        if empty_structures:
+            animal_targets[animal] = empty_structures[0].position
+        elif targets:
+            animal_targets[animal] = targets[0].position
+    # Finish placing anything already bought before committing cash to another
+    # animal.  This prevents repeated market purchases while a worker is in transit.
+    if not any(state.owned_total(animal) for animal in rules.ANIMALS):
+        for animal, target in animal_targets.items():
+            project = _animal_commitment(
+                state,
+                animal,
+                target,
+                existing=False,
+                needs_structure=state.tile_at(target).is_empty,
+            )
+            if project.physical.outputs:
+                candidates.append(project)
+    return tuple(candidates)
+
+
+def _reprice(state: OwnedState, project: EconomicCommitment, own_sales: Mapping[str, int]) -> EconomicCommitment:
+    gross = _revenue_for_outputs(state, project.physical.outputs, own_sales)
+    return replace(project, revenue=replace(project.revenue, projected_gross=gross))
+
+
+def _daily_load(commitments: Iterable[EconomicCommitment]) -> dict[int, int]:
+    result: dict[int, int] = {}
+    for commitment in commitments:
+        for work in commitment.actions.work:
+            result[work.day] = result.get(work.day, 0) + work.actions + work.travel_actions
+    return result
+
+
+def _capacity(state: OwnedState, config: PlannerConfig, day: int) -> int:
+    if day == state.day:
+        affordable_hands = config.max_daily_hands if state.money >= 20 else 0
+        workers = max(len(state.workers), 1 + affordable_hands)
+        return workers * state.turns_left_today
+    return rules.TURNS_PER_DAY * (1 + config.max_daily_hands)
+
+
+def _selection_reason(
+    state: OwnedState,
+    config: PlannerConfig,
+    project: EconomicCommitment,
+    selected: list[EconomicCommitment],
+    cash_spent: int,
+    occupied: set[Position],
+) -> str | None:
+    if project.time.completion_step > rules.TERMINAL_ACTION_STEP:
+        return "after terminal boundary"
+    if project.terminal_profit <= 0:
+        return "non-positive marginal terminal profit"
+    reserve = config.cash_reserve + state.projected_feed_need_today() * max(
+        1, state.market_prices.get("WHEAT", 25)
+    )
+    if cash_spent + project.cash.upfront > max(0, state.money - reserve):
+        return "insufficient unreserved cash"
+    if project.target is not None and project.target in occupied:
+        return "land interval conflicts with selected project"
+    peak = state.shed_used + sum(item.physical.peak_shed_units for item in selected)
+    if peak + project.physical.peak_shed_units > config.working_shed_limit:
+        return "projected working storage exceeds reserve limit"
+    loads = _daily_load([*selected, project])
+    for day, load in loads.items():
+        if load > _capacity(state, config, day):
+            return f"dated labor demand exceeds day-{day} capacity"
+    return None
+
+
+def _hire_count(state: OwnedState, commitments: tuple[EconomicCommitment, ...], config: PlannerConfig) -> int:
+    if state.hour >= 18 or state.step >= config.terminal_liquidation_step:
+        return 0
+    today_work = _daily_load(commitments).get(state.day, 0)
+    carried = sum(worker.carried for worker in state.workers)
+    today_work += min(8, carried)
+    capacity_per_worker = max(1, state.turns_left_today)
+    workers_needed = max(1, (today_work + capacity_per_worker - 1) // capacity_per_worker)
+    current_hands = max(0, len(state.workers) - 1)
+    available_slots = max(0, config.max_daily_hands - current_hands)
+    additional = max(0, min(available_slots, workers_needed - len(state.workers)))
+    affordable = 0
+    cash = max(0, state.money - config.cash_reserve)
+    for index in range(state.hires_today, state.hires_today + additional):
+        cost = rules.fibonacci_hire_cost(index)
+        if cost > cash:
+            break
+        cash -= cost
+        affordable += 1
+    return affordable
+
+
+def _fertilize_targets(state: OwnedState) -> frozenset[Position]:
+    candidates: list[tuple[int, int, int, Position]] = []
+    for tile in state.crop_tiles():
+        raw = tile.raw
+        crop = str(raw["crop"])
+        rule = rules.CROPS[crop]
+        if int(raw.get("fertilized_until_day", -1)) >= state.day:
+            continue
+        age = state.day - int(raw.get("planted_day", state.day))
+        if rule.ongoing:
+            next_value_day = int(raw.get("planted_day", state.day)) + rule.first_yield_day
+            while next_value_day < state.day:
+                next_value_day += rule.interval
+        else:
+            window_start = (rule.max_yield_day + 1) // 2
+            next_value_day = int(raw.get("planted_day", state.day)) + max(window_start, age)
+        if next_value_day > min(29, state.day + 2):
+            continue
+        incremental = state.market_prices.get(crop, rules.MARKET[crop].base)
+        fertilizer_value = state.market_prices.get(
+            "FERTILIZER", rules.MARKET["FERTILIZER"].base
+        )
+        # Existing fertilizer could be sold, so its sale price remains an
+        # opportunity cost even though its acquisition cost is sunk.
+        if incremental <= fertilizer_value:
+            continue
+        candidates.append((-incremental, rules.distance_to_shed(tile.position), tile.position[1], tile.position))
+    candidates.sort()
+    return frozenset(row[-1] for row in candidates[:2])
+
+
+def _support_commitments(
+    state: OwnedState,
+    fertilize: frozenset[Position],
+    hire_count: int,
+    buy_land: bool,
+) -> tuple[EconomicCommitment, ...]:
+    support: list[EconomicCommitment] = []
+    owned_fertilizer = state.owned_total("FERTILIZER")
+    for index, position in enumerate(sorted(fertilize)):
+        crop = str(state.tile_at(position).raw["crop"])
+        opportunity_cost = state.market_prices.get("FERTILIZER", 100)
+        incremental = state.market_prices.get(crop, rules.MARKET[crop].base)
+        support.append(
+            EconomicCommitment(
+                identifier=f"fertilize:{position[0]}:{position[1]}",
+                kind="FERTILIZER",
+                target=position,
+                existing=index < owned_fertilizer,
+                cash=CashDimension(
+                    upfront=0 if index < owned_fertilizer else opportunity_cost,
+                    scheduled=(TimedCash(state.step, "foregone fertilizer sale", opportunity_cost),)
+                    if index < owned_fertilizer
+                    else (),
+                    sunk_cost=opportunity_cost if index < owned_fertilizer else 0,
+                ),
+                time=TimeDimension(state.step, state.step, min(718, state.step + 71)),
+                land=LandDimension(
+                    (OccupancyInterval(position, state.step, min(718, state.step + 71)),)
+                ),
+                actions=ActionDimension(
+                    (WorkAmount(state.day, "FERTILIZE", 1, position=position),)
+                ),
+                physical=PhysicalDimension(
+                    inputs=(TimedAmount(state.step, "FERTILIZER", 1),),
+                    outputs=(TimedAmount(state.step, crop, 1),),
+                ),
+                revenue=RevenueDimension(
+                    projected_sales=(TimedAmount(state.step, crop, 1),),
+                    projected_gross=incremental,
+                ),
+                metadata={"crop": crop, "from_stock": index < owned_fertilizer},
+            )
+        )
+    for offset in range(hire_count):
+        hire_index = state.hires_today + offset
+        cost = rules.fibonacci_hire_cost(hire_index)
+        support.append(
+            EconomicCommitment(
+                identifier=f"hire:{state.day}:{hire_index}",
+                kind="HIRE",
+                target=None,
+                existing=False,
+                cash=CashDimension(upfront=cost),
+                time=TimeDimension(state.step, (state.day + 1) * 24 - 1, (state.day + 1) * 24 - 1),
+                land=LandDimension(),
+                actions=ActionDimension(capacity_supplied={state.day: state.turns_left_today}),
+                physical=PhysicalDimension(
+                    outputs=(TimedAmount(state.step, "WORKER_ACTION_CAPACITY", state.turns_left_today),)
+                ),
+                revenue=RevenueDimension(),
+                metadata={"hire_index": hire_index},
+            )
+        )
+    if buy_land:
+        price = rules.LAND_PRICES[len(state.unlocked_quadrants) - 1]
+        support.append(
+            EconomicCommitment(
+                identifier=f"land:{rules.LAND_ORDER[len(state.unlocked_quadrants) - 1]}",
+                kind="LAND",
+                target=None,
+                existing=False,
+                cash=CashDimension(upfront=price),
+                time=TimeDimension(state.step, state.step, rules.TERMINAL_ACTION_STEP),
+                land=LandDimension(capacity_created=25),
+                actions=ActionDimension(),
+                physical=PhysicalDimension(outputs=(TimedAmount(state.step, "LAND_TILE_CAPACITY", 25),)),
+                revenue=RevenueDimension(),
+            )
+        )
+    inventory_outputs = tuple(
+        TimedAmount(state.step, item, state.shed.get(item, 0) + state.carried_total(item))
+        for item in rules.SELLABLE_PRODUCTS
+        if state.shed.get(item, 0) + state.carried_total(item) > 0
+    )
+    if inventory_outputs:
+        support.append(
+            EconomicCommitment(
+                identifier=f"liquidate:{state.step}",
+                kind="LIQUIDATION",
+                target=None,
+                existing=True,
+                cash=CashDimension(),
+                time=TimeDimension(state.step, rules.TERMINAL_ACTION_STEP, rules.TERMINAL_ACTION_STEP),
+                land=LandDimension(),
+                actions=ActionDimension(
+                    tuple(
+                        WorkAmount(state.day, "TRANSPORT", 1, rules.distance_to_shed(worker.position), worker.position)
+                        for worker in state.workers
+                        if worker.carried
+                    )
+                ),
+                physical=PhysicalDimension(inputs=inventory_outputs),
+                revenue=RevenueDimension(
+                    projected_sales=inventory_outputs,
+                    projected_gross=_revenue_for_outputs(state, inventory_outputs),
+                ),
+                metadata={"inventory_is_sunk": True},
+            )
+        )
+    return tuple(support)
+
+
+def make_plan(state: OwnedState, config: PlannerConfig | None = None) -> Plan:
+    config = config or PlannerConfig()
+    obligations = existing_obligations(state)
+    candidates = list(enumerate_projects(state, config))
+    selected: list[EconomicCommitment] = []
+    rejected: dict[str, str] = {}
+    occupied: set[Position] = {
+        project.target for project in obligations if project.target is not None
+    }
+    own_sales: dict[str, int] = {}
+    cash_spent = 0
+
+    while candidates and len(selected) < config.max_new_production_per_turn:
+        repriced = []
+        for candidate in candidates:
+            candidate = _reprice(state, candidate, own_sales)
+            if candidate.kind == "CROP":
+                crop = str(candidate.metadata["crop"])
+                used = sum(
+                    item.kind == "CROP" and item.metadata.get("crop") == crop
+                    for item in selected
+                )
+                from_stock = state.seeds.get(crop, 0) > used
+                if from_stock:
+                    candidate = replace(
+                        candidate,
+                        cash=replace(candidate.cash, upfront=0, sunk_cost=rules.CROPS[crop].seed_cost),
+                        metadata={**candidate.metadata, "seed_purchase_required": False},
+                    )
+                else:
+                    candidate = replace(
+                        candidate,
+                        metadata={**candidate.metadata, "seed_purchase_required": True},
+                    )
+            repriced.append(candidate)
+        # Lexicographic dominance on derived quantities, not a weighted collapse.
+        repriced.sort(
+            key=lambda item: (
+                -item.profit_per_action,
+                -item.terminal_profit,
+                -item.profit_per_tile_day,
+                item.kind,
+                item.identifier,
+            )
+        )
+        chosen = None
+        for project in repriced:
+            reason = _selection_reason(
+                state, config, project, [*obligations, *selected], cash_spent, occupied
+            )
+            if reason is None:
+                chosen = project
+                break
+            rejected.setdefault(project.identifier, reason)
+        if chosen is None:
+            break
+        selected.append(chosen)
+        cash_spent += chosen.cash.upfront
+        if chosen.target is not None:
+            occupied.add(chosen.target)
+        for output in chosen.physical.outputs:
+            own_sales[output.item] = own_sales.get(output.item, 0) + output.quantity
+        candidates = [item for item in candidates if item.identifier != chosen.identifier]
+
+    crop_targets = {
+        project.target: str(project.metadata["crop"])
+        for project in selected
+        if project.kind == "CROP" and project.target is not None
+    }
+    animal_purchases = tuple(
+        str(project.metadata["animal"])
+        for project in selected
+        if project.kind == "ANIMAL"
+    )
+    today_feed = state.projected_feed_need_today()
+    feed_reserve = max(today_feed, len(state.animal_tiles()) * 2)
+    fertilize = _fertilize_targets(state)
+    fertilizer_reserve = len(fertilize)
+
+    buy_land = False
+    if (
+        not _candidate_targets(state)
+        and len(state.unlocked_quadrants) < 4
+        and state.days_left >= 5
+    ):
+        price = rules.LAND_PRICES[len(state.unlocked_quadrants) - 1]
+        # Capacity is purchased only when one conservative wheat project per new
+        # tile could repay the land; the land project is not valued in isolation.
+        unit_margin = max(0, 4 * state.market_prices.get("WHEAT", 25) - rules.CROPS["WHEAT"].seed_cost)
+        buy_land = state.money - cash_spent - config.cash_reserve >= price and 25 * unit_margin > price
+
+    hire_count = _hire_count(state, (*obligations, *selected), config)
+    support = _support_commitments(state, fertilize, hire_count, buy_land)
+    return Plan(
+        obligations=obligations,
+        selected=tuple(selected),
+        support=support,
+        rejected=rejected,
+        crop_targets=crop_targets,
+        fertilize_targets=fertilize,
+        animal_purchases=animal_purchases,
+        hire_count=hire_count,
+        buy_land=buy_land,
+        feed_reserve=feed_reserve,
+        fertilizer_reserve=fertilizer_reserve,
+        diagnostics={
+            "selected_terminal_profit": sum(item.terminal_profit for item in selected),
+            "selected_actions": sum(item.actions.total_actions for item in selected),
+            "existing_obligation_value": sum(max(0, item.terminal_profit) for item in obligations),
+        },
+    )

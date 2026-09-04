@@ -10,7 +10,6 @@ import hashlib
 import importlib
 import json
 import sys
-import tempfile
 import unittest
 from importlib.metadata import distributions, version
 from pathlib import Path
@@ -245,6 +244,50 @@ class GameContractTests(unittest.TestCase):
         self.assertEqual(seeds["WHEAT"], 1)
         self.assertEqual(seeds["CARROT"], 0)
 
+    def test_drop_discards_only_shed_overflow(self):
+        env = _make_env(episode_steps=4)
+        private = env.state[0].observation.private
+        private["shed"]["WHEAT"] = 99
+        private["inventories"][0]["MELON"] = 3
+        drop = {"farmer": ["DROP"], "hands": [], "market": []}
+        env.step([drop, PASS_ACTION])
+
+        result = env.state[0].observation.private
+        self.assertEqual(sum(result["shed"].values()), 100)
+        self.assertEqual(result["shed"]["MELON"], 1)
+        self.assertNotIn("MELON", result["inventories"][0])
+
+    def test_animal_placement_and_fertilizer_lifetime(self):
+        env = _make_env(episode_steps=5, weedSpawnChance=0)
+        observation = env.state[0].observation
+        x, y = observation.farms[0]["farmer"]
+        observation.farms[0]["tiles"][y][x] = {"kind": "PASTURE"}
+        observation.private["inventories"][0]["COW"] = 1
+        place = {"farmer": ["PLACE", "COW"], "hands": [], "market": []}
+        env.step([place, PASS_ACTION])
+        self.assertEqual(env.state[0].observation.farms[0]["tiles"][y][x]["animal"], "COW")
+
+        # A separate fresh environment avoids DIG's prohibition on placed animals.
+        crop_env = _make_env(episode_steps=5, weedSpawnChance=0)
+        crop_observation = crop_env.state[0].observation
+        cx, cy = crop_observation.farms[0]["farmer"]
+        crop_observation.farms[0]["tiles"][cy][cx] = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "planted_day": 0,
+            "watered_today": False,
+            "consecutive_unwatered": 0,
+            "fertilized_until_day": -1,
+            "yield_units": 1,
+            "max_lifespan_step": 120,
+        }
+        crop_observation.private["inventories"][0]["FERTILIZER"] = 1
+        fertilize = {"farmer": ["FERTILIZE"], "hands": [], "market": []}
+        crop_env.step([fertilize, PASS_ACTION])
+        tile = crop_env.state[0].observation.farms[0]["tiles"][cy][cx]
+        self.assertEqual(tile["fertilized_until_day"], 2)
+        self.assertNotIn("FERTILIZER", crop_env.state[0].observation.private["inventories"][0])
+
     def test_full_pass_episode_has_720_states_and_final_money_rewards(self):
         env = _make_env()
         calls = [0, 0]
@@ -292,15 +335,8 @@ class GameContractTests(unittest.TestCase):
 
 class SubmissionContractTests(unittest.TestCase):
     def test_root_main_py_agent_loads_through_official_file_loader(self):
-        source = (
-            "def agent(observation):\n"
-            "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n"
-        )
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            agent_path = Path(temporary_directory) / "main.py"
-            agent_path.write_text(source, encoding="utf-8")
-            env = _make_env(episode_steps=4)
-            env.run([str(agent_path), pass_agent])
+        env = _make_env(episode_steps=4)
+        env.run([str(REPOSITORY_ROOT / "main.py"), pass_agent])
 
         self.assertEqual([state.status for state in env.state], ["DONE", "DONE"])
 
