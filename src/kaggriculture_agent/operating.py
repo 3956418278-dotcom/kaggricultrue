@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from . import rules
-from .execution import generate_tasks
 from .planner import Plan, PlannerConfig, make_plan
 from .state import OwnedState
 
@@ -67,35 +65,13 @@ def _target_invalidation(state: OwnedState, plan: Plan) -> str | None:
 
 
 def daily_plan_replan_reason(state: OwnedState, plan: Plan) -> str | None:
-    """Detect only material invalidation or certain same-day infeasibility.
+    """Invalidate owned physical premises, not a speculative spatial binding.
 
-    Current market-price movement is deliberately absent: selling is reactive in
-    execution and does not rewrite production commitments.  The task-count check
-    is a lower bound, so it fires only if remaining mandatory operations cannot
-    fit even with zero travel.
+    Intraday search owns executable capacity and remaining work. Rebinding all
+    new projects here would mistake completed plantings for more unfulfilled
+    work and silently change the economic plan late in the day.
     """
-
-    invalidation = _target_invalidation(state, plan)
-    if invalidation:
-        return invalidation
-
-    end_of_day = min(rules.TERMINAL_ACTION_STEP, (state.day + 1) * rules.TURNS_PER_DAY - 1)
-    mandatory_tasks = tuple(
-        task
-        for task in generate_tasks(state, plan)
-        if task.deadline_step <= end_of_day and task.priority < 70
-    )
-    # Outstanding hires are part of the fixed plan and normally arrive after
-    # this turn's unit actions. Do not declare the plan infeasible merely because
-    # those already-planned workers are not visible in the current observation.
-    planned_workers = max(len(state.workers), 1 + plan.hire_count)
-    remaining_capacity = planned_workers * state.turns_left_today
-    if len(mandatory_tasks) > remaining_capacity:
-        return (
-            f"{len(mandatory_tasks)} remaining same-day operations exceed "
-            f"{remaining_capacity} worker-action slots"
-        )
-    return None
+    return _target_invalidation(state, plan)
 
 
 @dataclass
@@ -105,10 +81,18 @@ class DailyPlanningSession:
     config: PlannerConfig = field(default_factory=PlannerConfig)
     _plans: dict[int, Plan] = field(default_factory=dict, init=False)
     _last_steps: dict[int, int] = field(default_factory=dict, init=False)
+    _intraday: object = field(default=None, init=False)
+
+    def execution_for(self, state: OwnedState, plan: Plan):
+        from .intraday import IntradaySession
+        if self._intraday is None:
+            self._intraday = IntradaySession()
+        return self._intraday.execution_for(state, plan)
 
     def reset(self) -> None:
         self._plans.clear()
         self._last_steps.clear()
+        self._intraday = None
 
     def plan_for(self, state: OwnedState) -> Plan:
         prior = self._plans.get(state.player)
@@ -140,3 +124,7 @@ class DailyPlanningSession:
     @property
     def plans(self) -> Mapping[int, Plan]:
         return dict(self._plans)
+
+    @property
+    def planning_diagnostics(self) -> tuple[dict, ...]:
+        return tuple(self._intraday.diagnostics) if self._intraday is not None else ()

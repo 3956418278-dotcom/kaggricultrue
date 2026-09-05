@@ -243,3 +243,212 @@ def move_toward(start: tuple[int, int], target: tuple[int, int]) -> list[str]:
     if y > ty:
         return ["NORTH"]
     return ["PASS"]
+
+
+def advance_owned(state, actions, orders=()):
+    """One default-contract turn for our farm, with no opponent transactions.
+
+    Branch copies are isolated. Units resolve before orders, town, decay, then
+    deterministic refresh. Random weeds/shop unlocks are intentionally omitted
+    at the boundary; search stops there and observes the real next day.
+    """
+    from collections import Counter
+    from dataclasses import replace
+    from .state import TileState, WorkerState
+
+    tiles = [dict(t.raw) if isinstance(t.raw, Mapping) else t.raw for t in state.tiles]
+    positions = [w.position for w in state.workers]
+    inventories = [dict(w.inventory) for w in state.workers]
+    shed, seeds, market = dict(state.shed), dict(state.seeds), dict(state.market_inventory)
+    money, hires = state.money, state.hires_today
+    unlocked = list(state.unlocked_quadrants)
+    access = shed_access(state.board_size)
+    requests = Counter(a[1] for a in actions if a and a[0] == "PLANT")
+
+    def take(inv, item, n=1):
+        if inv.get(item, 0) < n:
+            return False
+        inv[item] -= n
+        if not inv[item]:
+            del inv[item]
+        return True
+
+    def drop(inv):
+        for item, n in list(inv.items()):
+            shed[item] = shed.get(item, 0) + min(n, max(0, SHED_CAPACITY - sum(shed.values())))
+        inv.clear()
+
+    moves = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
+    for i, action in enumerate(actions[:len(positions)]):
+        if not action:
+            continue
+        op, pos, inv = action[0], positions[i], inventories[i]
+        index = pos[1] * state.board_size + pos[0]
+        tile = tiles[index]
+        if op in moves:
+            dx, dy = moves[op]
+            new = (pos[0] + dx, pos[1] + dy)
+            if all(0 <= v < state.board_size for v in new):
+                positions[i] = new
+        elif op == "DROP" and pos in access:
+            drop(inv)
+        elif op == "PICKUP" and pos in access:
+            item = action[1]
+            n = min(max(0, int(action[2]) if len(action) > 2 else 1), shed.get(item, 0))
+            if n:
+                shed[item] -= n
+                inv[item] = inv.get(item, 0) + n
+        elif op == "PLACE":
+            item = action[1]
+            if item in ANIMALS and isinstance(tile, dict) and tile.get("kind") == ANIMALS[item].structure and "animal" not in tile:
+                if take(inv, item):
+                    tiles[index] = dict(kind=ANIMALS[item].structure, animal=item,
+                        placed_day=state.day, yield_units=0, consecutive_unfed=0,
+                        fed_today=False, cared_today=False, fertilizer_available=False,
+                        pending_care_bonus=0)
+            elif pos in access:
+                n = min(inv.get(item, 0), max(0, int(action[2]) if len(action) > 2 else 1),
+                        max(0, SHED_CAPACITY - sum(shed.values())))
+                if n and take(inv, item, n):
+                    shed[item] = shed.get(item, 0) + n
+        elif tile == "LOCKED":
+            continue
+        elif op == "PLANT" and tile is None:
+            crop = action[1]
+            if crop in CROPS and requests[crop] <= state.seeds.get(crop, 0):
+                # Atomic check uses pre-turn seeds, not the decremented stock.
+                pass
+            else:
+                continue
+            seeds[crop] -= 1
+            rule = CROPS[crop]
+            tiles[index] = dict(kind="PLANT", crop=crop, planted_day=state.day,
+                watered_today=False, consecutive_unwatered=1, yield_units=0 if rule.ongoing else 1,
+                max_lifespan_step=-1 if rule.ongoing else (state.day + rule.max_yield_day + 1) * TURNS_PER_DAY,
+                fertilized_until_day=-1)
+        elif op in ("BUILD_COOP", "BUILD_PASTURE") and tile is None:
+            tiles[index] = {"kind": "COOP" if op == "BUILD_COOP" else "PASTURE"}
+        elif isinstance(tile, dict):
+            if op == "WATER" and tile.get("kind") == "PLANT" and not tile.get("watered_today", False):
+                tile["yield_units"] = tile.get("yield_units", 0) + one_time_water_gain(
+                    tile["crop"], planted_day=tile["planted_day"], day=state.day,
+                    yield_units=tile.get("yield_units", 0), fertilized_until_day=tile.get("fertilized_until_day", -1))
+                tile["watered_today"] = True
+            elif op == "FERTILIZE" and tile.get("kind") == "PLANT" and take(inv, "FERTILIZER"):
+                tile["fertilized_until_day"] = max(tile.get("fertilized_until_day", -1), state.day + 2)
+            elif op == "HARVEST" and tile.get("yield_units", 0) > 0:
+                item = None
+                if tile.get("kind") == "PLANT" and state.day - tile["planted_day"] >= CROPS[tile["crop"]].first_yield_day:
+                    item = tile["crop"]
+                    if not CROPS[item].ongoing:
+                        tiles[index] = None
+                elif "animal" in tile:
+                    item = ANIMALS[tile["animal"]].product
+                if item:
+                    inv[item] = inv.get(item, 0) + tile["yield_units"]
+                    tile["yield_units"] = 0
+            elif op == "DIG" and "animal" not in tile:
+                tiles[index] = None
+            elif "animal" in tile:
+                if op == "FEED" and not tile.get("fed_today", False) and take(inv, "WHEAT"):
+                    tile["fed_today"] = True
+                elif op == "CARE":
+                    tile["cared_today"] = True
+                elif op == "COLLECT_FERTILIZER" and tile.get("fertilizer_available", False):
+                    tile["fertilizer_available"] = False
+                    inv["FERTILIZER"] = inv.get("FERTILIZER", 0) + 1
+
+    for order in orders[:MAX_MARKET_ORDERS]:
+        op = order[0]
+        if op == "HIRE":
+            cost = fibonacci_hire_cost(hires)
+            if money >= cost:
+                money -= cost
+                hires += 1
+                positions.append(min(access, key=lambda p: (positions.count(p), access.index(p))))
+                inventories.append({})
+        elif op == "BUY_LAND":
+            if len(unlocked) < 4 and money >= LAND_PRICES[len(unlocked) - 1]:
+                money -= LAND_PRICES[len(unlocked) - 1]
+                new = LAND_ORDER[len(unlocked) - 1]
+                unlocked.append(new)
+                for i, tile in enumerate(tiles):
+                    if tile == "LOCKED" and quadrant((i % state.board_size, i // state.board_size), state.board_size) == new:
+                        tiles[i] = None
+        else:
+            item = order[1]
+            for _ in range(max(0, int(order[2]) if len(order) > 2 else 1)):
+                if op == "SELL" and shed.get(item, 0):
+                    price = market_price(item, market[item])
+                    shed[item] -= 1
+                    money += price
+                    market[item] += price > 1
+                elif op in ("BUY_PRODUCT", "BUY_ANIMAL", "BUY_SEED"):
+                    price = (market_price(item, market[item] - 1) if op == "BUY_PRODUCT"
+                             else ANIMALS[item].cost if op == "BUY_ANIMAL" else CROPS[item].seed_cost)
+                    if money < price or (op != "BUY_SEED" and sum(shed.values()) >= SHED_CAPACITY):
+                        break
+                    money -= price
+                    dest = seeds if op == "BUY_SEED" else shed
+                    dest[item] = dest.get(item, 0) + 1
+                    if op == "BUY_PRODUCT":
+                        market[item] -= 1
+    if state.step % 4 == 0:
+        for shop in state.unlocked_shops:
+            basket = SHOPS[shop]
+            for item in basket:
+                market[item] -= 2 if len(basket) == 1 else 1
+    if state.step % TURNS_PER_DAY == 0:
+        for item in PRODUCTS:
+            if item != "FERTILIZER":
+                market[item] -= 1
+    for i, tile in enumerate(tiles):
+        if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+            lifespan = tile.get("max_lifespan_step", -1)
+            if lifespan >= 0 and state.step >= lifespan and (state.step - lifespan) % 2 == 0:
+                tile["yield_units"] -= 1
+                if tile["yield_units"] <= 0:
+                    tiles[i] = {"kind": "WEED"}
+    if state.hour == TURNS_PER_DAY - 1:
+        for i, tile in enumerate(tiles):
+            if not isinstance(tile, dict):
+                continue
+            if tile.get("kind") == "PLANT":
+                watered = tile.get("watered_today", False)
+                tile["consecutive_unwatered"] = 0 if watered else tile.get("consecutive_unwatered", 0) + 1
+                tile["watered_today"] = False
+                if tile["consecutive_unwatered"] >= 2:
+                    tiles[i] = {"kind": "WEED"}
+                    continue
+                rule = CROPS[tile["crop"]]
+                age = state.day + 1 - tile["planted_day"] - rule.first_yield_day
+                if rule.ongoing and age >= 0 and age % rule.interval == 0:
+                    count = age // rule.interval + 1
+                    if count <= rule.max_yield:
+                        tile["yield_units"] = min(rule.max_yield, tile["yield_units"] + (2 if watered and tile.get("fertilized_until_day", -1) >= state.day else 1))
+                        if count == rule.max_yield:
+                            tile["max_lifespan_step"] = (state.day + 2) * TURNS_PER_DAY
+            elif "animal" in tile:
+                rule = ANIMALS[tile["animal"]]
+                fed = tile.get("fed_today", False)
+                tile["consecutive_unfed"] = 0 if fed else tile.get("consecutive_unfed", 0) + 1
+                if tile["consecutive_unfed"] >= 2:
+                    tiles[i] = {"kind": rule.structure}
+                    continue
+                age = state.day + 1 - tile["placed_day"] - rule.first_yield_day
+                if age >= 0 and age % rule.interval == 0:
+                    bonus = tile.get("pending_care_bonus", 0) if fed else 0
+                    tile["yield_units"] = min(rule.max_held, tile["yield_units"] + 1 + bonus)
+                    tile["pending_care_bonus"] = 0
+                if fed and tile.get("cared_today", False):
+                    tile["pending_care_bonus"] = tile.get("pending_care_bonus", 0) + 1
+                tile.update(fertilizer_available=True, fed_today=False, cared_today=False)
+        for inv in inventories:
+            drop(inv)
+        positions, inventories, hires = [access[0]], [{}], 0
+    step = state.step + 1
+    return replace(state, step=step, day=step // TURNS_PER_DAY, hour=step % TURNS_PER_DAY,
+        money=money, hires_today=hires, unlocked_quadrants=tuple(unlocked), shed=shed, seeds=seeds,
+        market_inventory=market, market_prices={i: market_price(i, n) for i, n in market.items()},
+        tiles=tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles)),
+        workers=tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories))))

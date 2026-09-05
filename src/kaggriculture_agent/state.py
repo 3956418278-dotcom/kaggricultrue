@@ -176,7 +176,8 @@ def reconstruct(observation: Any) -> OwnedState:
         hires_today=int(get(farm, "hires_today", 0) or 0),
         shed=_int_map(get(private, "shed", {})),
         seeds=_int_map(get(private, "seeds", {})),
-        market_inventory=_int_map(get(market, "inventory", {})),
+        # Town demand can drive inventory below zero; those prices remain valid.
+        market_inventory={str(k): int(v) for k, v in get(market, "inventory", {}).items()},
         market_prices=_int_map(get(market, "prices", {})),
         unlocked_shops=tuple(str(shop) for shop in (get(town, "unlocked_shops", ()) or ())),
     )

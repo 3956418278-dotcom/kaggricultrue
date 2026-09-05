@@ -19,6 +19,7 @@ from src.kaggriculture_agent.economics import (
 )
 from src.kaggriculture_agent.execution import WorkTask, execute, generate_tasks, schedule
 from src.kaggriculture_agent.operating import DailyPlanningSession
+from src.kaggriculture_agent.realization import bind_plan
 from src.kaggriculture_agent.planner import (
     PlannerConfig,
     _fertilizer_marginal_outputs,
@@ -278,7 +279,7 @@ class BaselineModelTests(unittest.TestCase):
         full_shed = {item: 1 for item in rules.SELLABLE_PRODUCTS}
         state = replace(state, shed=full_shed)
         plan = replace(
-            make_plan(state),
+            bind_plan(state, make_plan(state)),
             crop_targets={(0, 0): "WHEAT", (1, 0): "CARROT", (2, 0): "TOMATO"},
             hire_count=5,
             feed_reserve=2,
@@ -370,7 +371,7 @@ class BaselineModelTests(unittest.TestCase):
 
     def test_fixed_daily_plan_does_not_repeat_fulfilled_commitment_orders(self):
         opening = initial_state()
-        crop_plan = make_plan(opening)
+        crop_plan = bind_plan(opening, make_plan(opening))
         self.assertTrue(crop_plan.crop_targets)
         tiles = list(opening.tiles)
         for target, crop in crop_plan.crop_targets.items():
@@ -535,7 +536,15 @@ class BaselineModelTests(unittest.TestCase):
         session = DailyPlanningSession()
         opening = initial_state()
         original = session.plan_for(opening)
-        first_target = original.selected[0].target
+        # New-production sites belong to the intraday realization now. An
+        # existing crop is a fixed physical premise of daily economic intent.
+        position = (3, 4)
+        tiles = list(opening.tiles)
+        tiles[43] = TileState(position, official._new_plant("MELON", 0, 24))
+        opening = replace(opening, tiles=tuple(tiles))
+        session.reset()
+        original = session.plan_for(opening)
+        first_target = original.obligations[0].target
         self.assertIsNotNone(first_target)
         tiles = list(opening.tiles)
         tiles[first_target[1] * opening.board_size + first_target[0]] = TileState(
@@ -545,9 +554,9 @@ class BaselineModelTests(unittest.TestCase):
 
         repaired = session.plan_for(invalidated)
         self.assertEqual(repaired.revision, 1)
-        self.assertIn("became unavailable", repaired.replan_reason)
+        self.assertIn("disappeared", repaired.replan_reason)
 
-        second_target = repaired.selected[0].target
+        second_target = bind_plan(invalidated, repaired).selected[0].target
         tiles = list(invalidated.tiles)
         tiles[second_target[1] * opening.board_size + second_target[0]] = TileState(
             second_target, {"kind": "WEED"}

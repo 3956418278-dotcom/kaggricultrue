@@ -34,6 +34,8 @@ class Execution:
     tasks: tuple[WorkTask, ...]
     assignments: Mapping[int, str]
     market_orders: tuple[list[object], ...]
+    defer_sales: bool = False
+    benchmark_orders: bool = False
 
 
 def _task_target(task: WorkTask, worker: WorkerState, board_size: int) -> Position:
@@ -66,6 +68,9 @@ def _inventory_drop_tasks(state: OwnedState, terminal: bool) -> list[WorkTask]:
 
 def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
     """Generate current concrete work; future work stays in commitments."""
+    from .realization import Realization, bind_plan
+    if not isinstance(plan, Realization):
+        plan = bind_plan(state, plan)
     terminal = state.step >= 707
     tasks = _inventory_drop_tasks(state, terminal)
     end_of_day = min(rules.TERMINAL_ACTION_STEP, (state.day + 1) * 24 - 1)
@@ -293,6 +298,9 @@ def schedule(state: OwnedState, tasks: tuple[WorkTask, ...]) -> tuple[tuple[list
 
 def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[list[object], ...]) -> tuple[list[object], ...]:
     """Construct ordered sales and purchases using post-unit-action inventory."""
+    from .realization import Realization, bind_plan
+    if not isinstance(plan, Realization):
+        plan = bind_plan(state, plan)
     projected_shed = dict(state.shed)
     used_carried: dict[str, int] = {}
     for worker, action in zip(state.workers, worker_actions):
@@ -385,6 +393,9 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
 
 
 def execute(state: OwnedState, plan: Plan) -> Execution:
+    from .realization import Realization, bind_plan
+    if not isinstance(plan, Realization):
+        plan = bind_plan(state, plan)
     tasks = generate_tasks(state, plan)
     worker_actions, assignments = schedule(state, tasks)
     market_orders = build_market_orders(state, plan, worker_actions)

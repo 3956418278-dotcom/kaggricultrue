@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from .contract import construct_action, pass_action
-from .execution import execute
 from .operating import DailyPlanningSession
 from .state import get, reconstruct
 
@@ -19,8 +18,9 @@ def decide(
     session: DailyPlanningSession | None = None,
 ) -> dict[str, list[Any]]:
     state = reconstruct(observation)
-    operating_plan = (session or _DEFAULT_SESSION).plan_for(state)
-    return construct_action(state, execute(state, operating_plan))
+    owner = session or _DEFAULT_SESSION
+    operating_plan = owner.plan_for(state)
+    return construct_action(state, owner.execution_for(state, operating_plan))
 
 
 def agent(observation: Any) -> dict[str, list[Any]]:

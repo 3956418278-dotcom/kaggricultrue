@@ -33,7 +33,6 @@ from .state import OwnedState, Position, TileState
 class PlannerConfig:
     cash_reserve: int = 150
     max_daily_hands: int = 5
-    max_new_production_per_day: int = 3
     latest_plant_hour: int = 18
     latest_hire_hour: int = 2
     working_shed_limit: int = 82
@@ -47,10 +46,9 @@ class Plan:
     selected: tuple[EconomicCommitment, ...]
     support: tuple[EconomicCommitment, ...]
     rejected: Mapping[str, str]
-    crop_targets: Mapping[Position, str]
     fertilize_targets: frozenset[Position]
     animal_purchases: tuple[str, ...]
-    hire_count: int  # target total hands for the day; execution buys only the shortfall
+    hire_count: int  # aggregate-work staffing proposal; realization searches executable capacity
     buy_land: bool
     feed_reserve: int
     fertilizer_reserve: int
@@ -60,6 +58,17 @@ class Plan:
     formed_step: int = -1
     revision: int = 0
     replan_reason: str | None = None
+    max_hands: int = 5
+
+
+def unbind_project(project: EconomicCommitment, state: OwnedState) -> EconomicCommitment:
+    """Keep economic quantities and dated work; defer spatial allocation."""
+    if project.kind not in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT"):
+        return project
+    return replace(project, target=None,
+        land=replace(project.land, intervals=tuple(replace(i, position=None) for i in project.land.intervals)),
+        actions=replace(project.actions, work=tuple(replace(w, position=None) for w in project.actions.work)),
+        metadata={**project.metadata, "placement_open": True})
 
 
 @dataclass(frozen=True)
@@ -455,7 +464,7 @@ def enumerate_projects(state: OwnedState, config: PlannerConfig) -> tuple[Econom
     if state.hour <= config.latest_plant_hour:
         # A bounded frontier is enough: farther identical tiles are dominated by
         # these targets under the explicit Manhattan travel approximation.
-        for tile in targets[:12]:
+        for tile in targets:
             for crop in rules.CROPS:
                 project = _crop_commitment(state, crop, tile)
                 if project.physical.outputs:
@@ -699,6 +708,19 @@ def _fertilizer_opportunities(
     return tuple(selected)
 
 
+def hiring_commitments(state: OwnedState, hire_target: int) -> tuple[EconomicCommitment, ...]:
+    """Dated labor capacity: a market-hired hand first acts NEXT turn."""
+    capacity = max(0, min(state.turns_left_today, state.turns_left) - 1)
+    return tuple(EconomicCommitment(
+        identifier=f"hire:{state.day}:{index}", kind="HIRE", target=None, existing=False,
+        cash=CashDimension(upfront=rules.fibonacci_hire_cost(index)),
+        time=TimeDimension(state.step, min(718, (state.day + 1) * 24 - 1), min(718, (state.day + 1) * 24 - 1)),
+        land=LandDimension(), actions=ActionDimension(capacity_supplied={state.day: capacity}),
+        physical=PhysicalDimension(outputs=(TimedAmount(state.step + 1, "WORKER_ACTION_CAPACITY", capacity),)),
+        revenue=RevenueDimension(), metadata={"hire_index": index})
+        for index in range(state.hires_today, hire_target))
+
+
 def _support_commitments(
     state: OwnedState,
     fertilizer_opportunities: tuple[FertilizerOpportunity, ...],
@@ -757,25 +779,7 @@ def _support_commitments(
                 },
             )
         )
-    for hire_index in range(state.hires_today, hire_target):
-        cost = rules.fibonacci_hire_cost(hire_index)
-        support.append(
-            EconomicCommitment(
-                identifier=f"hire:{state.day}:{hire_index}",
-                kind="HIRE",
-                target=None,
-                existing=False,
-                cash=CashDimension(upfront=cost),
-                time=TimeDimension(state.step, (state.day + 1) * 24 - 1, (state.day + 1) * 24 - 1),
-                land=LandDimension(),
-                actions=ActionDimension(capacity_supplied={state.day: state.turns_left_today}),
-                physical=PhysicalDimension(
-                    outputs=(TimedAmount(state.step, "WORKER_ACTION_CAPACITY", state.turns_left_today),)
-                ),
-                revenue=RevenueDimension(),
-                metadata={"hire_index": hire_index},
-            )
-        )
+    support.extend(hiring_commitments(state, hire_target))
     if buy_land:
         quadrant = rules.LAND_ORDER[len(state.unlocked_quadrants) - 1]
         price = rules.LAND_PRICES[len(state.unlocked_quadrants) - 1]
@@ -904,7 +908,7 @@ def make_plan(
     own_sales: dict[str, int] = {}
     cash_spent = 0
 
-    while candidates and len(selected) < config.max_new_production_per_day:
+    while candidates:
         repriced = []
         for candidate in candidates:
             candidate = _reprice(state, candidate, own_sales)
@@ -956,18 +960,14 @@ def make_plan(
             own_sales[output.item] = own_sales.get(output.item, 0) + output.quantity
         candidates = [item for item in candidates if item.identifier != chosen.identifier]
 
-    crop_targets = {
-        project.target: str(project.metadata["crop"])
-        for project in selected
-        if project.kind == "CROP" and project.target is not None
-    }
     animal_purchases = tuple(
         str(project.metadata["animal"])
         for project in selected
         if project.kind == "ANIMAL"
     )
     today_feed = state.projected_feed_need_today()
-    feed_reserve = max(today_feed, len(state.animal_tiles()) * 2)
+    feed_reserve = max(today_feed, len(state.animal_tiles()) * 2) + len(animal_purchases) + sum(
+        state.owned_total(animal) for animal in rules.ANIMALS)
     fertilizer_opportunities = _fertilizer_opportunities(state)
     fertilize = frozenset(
         opportunity.position for opportunity in fertilizer_opportunities
@@ -996,11 +996,10 @@ def make_plan(
         state, fertilizer_opportunities, hire_count, buy_land
     )
     return Plan(
-        obligations=obligations,
-        selected=tuple(selected),
+        obligations=tuple(unbind_project(p, state) for p in obligations),
+        selected=tuple(unbind_project(p, state) for p in selected),
         support=support,
         rejected=rejected,
-        crop_targets=crop_targets,
         fertilize_targets=fertilize,
         animal_purchases=animal_purchases,
         hire_count=hire_count,
@@ -1019,4 +1018,5 @@ def make_plan(
         formed_step=state.step,
         revision=revision,
         replan_reason=replan_reason,
+        max_hands=config.max_daily_hands,
     )
