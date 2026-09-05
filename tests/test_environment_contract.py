@@ -229,6 +229,26 @@ class GameContractTests(unittest.TestCase):
         self.assertEqual(observation.farms[0]["hires_today"], 0)
         self.assertEqual(len(observation.town["unlocked_shops"]), 1)
 
+    def test_daily_refresh_drops_inventory_with_overflow_and_resets_farmer(self):
+        env = _make_env(episode_steps=5, turnsPerDay=2, weedSpawnChance=0)
+        hire = {"farmer": ["PASS"], "hands": [], "market": [["HIRE"]]}
+        env.step([hire, PASS_ACTION])
+        observation = env.state[0].observation
+        observation.farms[0]["farmer"] = [0, 0]
+        observation.private["shed"]["WHEAT"] = 97
+        observation.private["inventories"][0]["CARROT"] = 2
+        observation.private["inventories"][1]["MELON"] = 3
+
+        env.step([PASS_ACTION, PASS_ACTION])
+
+        refreshed = env.state[0].observation
+        self.assertEqual(refreshed.farms[0]["farmer"], [4, 4])
+        self.assertEqual(refreshed.farms[0]["hands"], [])
+        self.assertEqual(sum(refreshed.private["shed"].values()), 100)
+        self.assertEqual(refreshed.private["shed"]["CARROT"], 2)
+        self.assertEqual(refreshed.private["shed"]["MELON"], 1)
+        self.assertEqual(refreshed.private["inventories"], [{}])
+
     def test_market_order_entry_limit_discards_later_entries(self):
         env = _make_env(episode_steps=4, maxMarketOrdersPerTurn=1)
         orders = {

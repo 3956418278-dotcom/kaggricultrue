@@ -50,7 +50,10 @@ def _inventory_drop_tasks(state: OwnedState, terminal: bool) -> list[WorkTask]:
     for worker in state.workers:
         if not worker.carried:
             continue
-        if terminal or state.hour >= 21 or worker.carried >= 3:
+        # Daily refresh drops every inventory into the shed and returns the
+        # farmer to spawn. Do not spend late-day travel merely to preserve carry;
+        # ordinary drops exist to expose a useful batch for intraday sale.
+        if terminal or worker.carried >= 3:
             tasks.append(
                 WorkTask(
                     f"drop:{worker.index}", "DROP", ("DROP",), 1 if terminal else 32,
@@ -291,7 +294,6 @@ def schedule(state: OwnedState, tasks: tuple[WorkTask, ...]) -> tuple[tuple[list
 def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[list[object], ...]) -> tuple[list[object], ...]:
     """Construct ordered sales and purchases using post-unit-action inventory."""
     projected_shed = dict(state.shed)
-    planted: dict[str, int] = {}
     used_carried: dict[str, int] = {}
     for worker, action in zip(state.workers, worker_actions):
         op = action[0] if action else "PASS"
@@ -305,12 +307,20 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
             used_carried["WHEAT"] = used_carried.get("WHEAT", 0) + 1
         elif op == "FERTILIZE":
             used_carried["FERTILIZER"] = used_carried.get("FERTILIZER", 0) + 1
-        elif op == "PLANT" and len(action) > 1:
-            crop = str(action[1])
-            planted[crop] = planted.get(crop, 0) + 1
-
     terminal = state.step >= 707
-    reserves = {"WHEAT": 0 if terminal else plan.feed_reserve, "FERTILIZER": 0 if terminal else plan.fertilizer_reserve}
+    pending_fertilizer = (
+        sum(
+            state.tile_at(target).kind == "PLANT"
+            and int(state.tile_at(target).raw.get("fertilized_until_day", -1)) < state.day + 2
+            for target in plan.fertilize_targets
+        )
+        if plan.fertilize_targets
+        else plan.fertilizer_reserve
+    )
+    reserves = {
+        "WHEAT": 0 if terminal else plan.feed_reserve,
+        "FERTILIZER": 0 if terminal else pending_fertilizer,
+    }
     sales: list[list[object]] = []
     for item in sorted(rules.SELLABLE_PRODUCTS, key=lambda name: (-state.market_prices.get(name, 0), name)):
         quantity = max(0, projected_shed.get(item, 0) - reserves.get(item, 0))
@@ -321,20 +331,26 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
 
     commitment_orders: list[list[object]] = []
     for crop in rules.CROPS:
-        targets = sum(value == crop for value in plan.crop_targets.values())
-        remaining_targets = max(0, targets - planted.get(crop, 0))
-        remaining_seeds = max(0, state.seeds.get(crop, 0) - planted.get(crop, 0))
-        shortfall = max(0, remaining_targets - remaining_seeds)
+        remaining_targets = sum(
+            planned_crop == crop and state.tile_at(target).is_empty
+            for target, planned_crop in plan.crop_targets.items()
+        )
+        shortfall = max(0, remaining_targets - state.seeds.get(crop, 0))
         if shortfall:
             commitment_orders.append(["BUY_SEED", crop, shortfall])
     animal_counts = Counter(plan.animal_purchases)
     for animal in rules.ANIMALS:
-        if animal_counts[animal]:
+        acquired_today = max(
+            0,
+            state.owned_animals(animal) - plan.starting_animals.get(animal, 0),
+        )
+        shortfall = max(0, animal_counts[animal] - acquired_today)
+        if shortfall:
             commitment_orders.append(
-                ["BUY_ANIMAL", animal, animal_counts[animal]]
+                ["BUY_ANIMAL", animal, shortfall]
             )
     fertilizer_after_actions = max(0, state.owned_total("FERTILIZER") - used_carried.get("FERTILIZER", 0))
-    fertilizer_shortfall = max(0, plan.fertilizer_reserve - fertilizer_after_actions)
+    fertilizer_shortfall = max(0, pending_fertilizer - fertilizer_after_actions)
     if fertilizer_shortfall:
         commitment_orders.append(
             ["BUY_PRODUCT", "FERTILIZER", fertilizer_shortfall]
@@ -343,7 +359,15 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
     wheat_shortfall = max(0, plan.feed_reserve - wheat_after_actions)
     if wheat_shortfall:
         commitment_orders.append(["BUY_PRODUCT", "WHEAT", wheat_shortfall])
-    if plan.buy_land:
+    land_target = next(
+        (
+            str(commitment.metadata.get("quadrant"))
+            for commitment in plan.support
+            if commitment.kind == "LAND"
+        ),
+        None,
+    )
+    if plan.buy_land and land_target not in state.unlocked_quadrants:
         commitment_orders.append(["BUY_LAND"])
 
     # Reserve the finite entry budget for commitment inputs.  Sales still execute
@@ -353,7 +377,8 @@ def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[lis
     hire_slots = max(
         0, rules.MAX_MARKET_ORDERS - len(commitment_orders)
     )
-    hire_orders = [["HIRE"] for _ in range(min(plan.hire_count, hire_slots))]
+    outstanding_hires = max(0, plan.hire_count - state.hires_today)
+    hire_orders = [["HIRE"] for _ in range(min(outstanding_hires, hire_slots))]
     required_orders = [*hire_orders, *commitment_orders]
     sale_slots = rules.MAX_MARKET_ORDERS - len(required_orders)
     return tuple([*sales[:sale_slots], *required_orders])

@@ -173,12 +173,15 @@ The decision core represents every economic commitment through six semantic dime
 
 The same representation covers crop and animal production, fertilizer allocation, daily hiring, land expansion, and liquidation. An already-purchased seed, animal, crop, structure, or inventory item is a sunk commitment: planning records its historical cost for diagnosis but evaluates only the marginal cash, work, timing, storage, and realizable value of maintaining, moving, harvesting, using, or liquidating it.
 
+Economic planning has a daily operating cadence. At the first observation of each day, the decision core forms that day's production commitments, maintenance work, required inputs, staffing target, and land decision from the dated work already carried by `(C, T, L, A, Q, R)`. Intraday observations normally reuse that plan while the execution controller adapts tasks, routes, carried inventory, harvesting, transport, and current-market sales. At most one intraday economic repair is permitted when a physical premise is materially invalidated or the remaining same-day work has become certainly infeasible; ordinary price movement alone is not a replan trigger. The next day's post-refresh observation starts a fresh plan after automatic inventory drop, hand removal, and farmer reset.
+
 Local environment adapters, arenas, opponent loaders, replay parsers, statistics, and reports are evaluation infrastructure rather than submission-policy components. They must be able to compare an unchanged packaged agent without importing private implementation hooks.
 
 ## Stable architectural boundaries
 
 - `main.py` is the Kaggle entrypoint and eventual packaged runtime boundary. It should be thin unless self-containment requires generated or vendored code.
 - `src/kaggriculture_agent/` will own reusable observation, rule, planning, and execution mechanisms.
+- `src/kaggriculture_eval/` owns reusable local evaluation and replay mechanisms and must not be imported by the submission policy.
 - `scripts/` will contain thin local-match, league, replay-analysis, and packaging commands that call maintained owners.
 - `tests/` will own contract, determinism, integration, packaging, and regression checks.
 - Evaluation instances will be declarative where practical. Generated matches, replays, reports, downloaded opponents, and build artifacts remain outside the project body and authoritative record.

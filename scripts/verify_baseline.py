@@ -25,16 +25,18 @@ from kaggle_environments import make  # noqa: E402
 
 from main import agent  # noqa: E402
 from src.kaggriculture_agent.agent import decide  # noqa: E402
+from src.kaggriculture_agent.operating import DailyPlanningSession  # noqa: E402
 
 
 def run(seed: int, candidate_seat: int) -> dict[str, object]:
     durations: list[float] = []
+    planning_session = DailyPlanningSession()
 
     def measured_decide(observation):
         started = time.perf_counter()
-        action = decide(observation)
+        action = decide(observation, session=planning_session)
         durations.append(time.perf_counter() - started)
-        if action != decide(copy.deepcopy(observation)):
+        if action != decide(copy.deepcopy(observation), session=planning_session):
             raise AssertionError(
                 f"identical observation produced different actions at step {observation.step}"
             )

@@ -1,8 +1,10 @@
-"""Deterministic rolling-horizon economic planner.
+"""Deterministic day-level rolling-horizon economic planner.
 
 The planner filters projects through cash, horizon, land, storage, and dated labor
 constraints.  Among feasible projects it uses transparent derived dominance keys;
-there is no weighted utility that erases the six source dimensions.
+there is no weighted utility that erases the six source dimensions. ``make_plan``
+forms one operating plan from a day's opening state; the planning session owns
+when that plan may be replaced.
 """
 
 from __future__ import annotations
@@ -31,10 +33,12 @@ from .state import OwnedState, Position, TileState
 class PlannerConfig:
     cash_reserve: int = 150
     max_daily_hands: int = 5
-    max_new_production_per_turn: int = 3
+    max_new_production_per_day: int = 3
     latest_plant_hour: int = 18
+    latest_hire_hour: int = 2
     working_shed_limit: int = 82
     terminal_liquidation_step: int = 710
+    max_intraday_replans: int = 1
 
 
 @dataclass(frozen=True)
@@ -46,11 +50,16 @@ class Plan:
     crop_targets: Mapping[Position, str]
     fertilize_targets: frozenset[Position]
     animal_purchases: tuple[str, ...]
-    hire_count: int
+    hire_count: int  # target total hands for the day; execution buys only the shortfall
     buy_land: bool
     feed_reserve: int
     fertilizer_reserve: int
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    starting_animals: Mapping[str, int] = field(default_factory=dict)
+    day: int = -1
+    formed_step: int = -1
+    revision: int = 0
+    replan_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -524,13 +533,22 @@ def _selection_reason(
     return None
 
 
-def _hire_count(state: OwnedState, commitments: tuple[EconomicCommitment, ...], config: PlannerConfig) -> int:
-    if state.hour >= 18 or state.step >= config.terminal_liquidation_step:
-        return 0
-    today_work = _daily_load(commitments).get(state.day, 0)
+def _hire_target(
+    state: OwnedState,
+    commitments: tuple[EconomicCommitment, ...],
+    config: PlannerConfig,
+    additional_today_work: int = 0,
+) -> int:
+    """Return the target number of hands for this day, not an order count."""
+    if state.hour > config.latest_hire_hour or state.step >= config.terminal_liquidation_step:
+        return state.hires_today
+    today_work = _daily_load(commitments).get(state.day, 0) + additional_today_work
     carried = sum(worker.carried for worker in state.workers)
     today_work += min(8, carried)
-    capacity_per_worker = max(1, state.turns_left_today)
+    # Staffing is a day-opening decision. Do not create extra demand for hands
+    # merely because the same workload is observed one hour later during a
+    # bounded repair; elapsed turns are handled by feasibility/local execution.
+    capacity_per_worker = rules.TURNS_PER_DAY
     workers_needed = max(1, (today_work + capacity_per_worker - 1) // capacity_per_worker)
     current_hands = max(0, len(state.workers) - 1)
     available_slots = max(0, config.max_daily_hands - current_hands)
@@ -543,7 +561,7 @@ def _hire_count(state: OwnedState, commitments: tuple[EconomicCommitment, ...], 
             break
         cash -= cost
         affordable += 1
-    return affordable
+    return state.hires_today + affordable
 
 
 def _fertilizer_marginal_outputs(
@@ -684,7 +702,7 @@ def _fertilizer_opportunities(
 def _support_commitments(
     state: OwnedState,
     fertilizer_opportunities: tuple[FertilizerOpportunity, ...],
-    hire_count: int,
+    hire_target: int,
     buy_land: bool,
 ) -> tuple[EconomicCommitment, ...]:
     support: list[EconomicCommitment] = []
@@ -739,8 +757,7 @@ def _support_commitments(
                 },
             )
         )
-    for offset in range(hire_count):
-        hire_index = state.hires_today + offset
+    for hire_index in range(state.hires_today, hire_target):
         cost = rules.fibonacci_hire_cost(hire_index)
         support.append(
             EconomicCommitment(
@@ -760,10 +777,11 @@ def _support_commitments(
             )
         )
     if buy_land:
+        quadrant = rules.LAND_ORDER[len(state.unlocked_quadrants) - 1]
         price = rules.LAND_PRICES[len(state.unlocked_quadrants) - 1]
         support.append(
             EconomicCommitment(
-                identifier=f"land:{rules.LAND_ORDER[len(state.unlocked_quadrants) - 1]}",
+                identifier=f"land:{quadrant}",
                 kind="LAND",
                 target=None,
                 existing=False,
@@ -773,6 +791,7 @@ def _support_commitments(
                 actions=ActionDimension(),
                 physical=PhysicalDimension(outputs=(TimedAmount(state.step, "LAND_TILE_CAPACITY", 25),)),
                 revenue=RevenueDimension(),
+                metadata={"quadrant": quadrant},
             )
         )
     inventory_outputs = tuple(
@@ -866,7 +885,14 @@ def _support_commitments(
     return tuple(support)
 
 
-def make_plan(state: OwnedState, config: PlannerConfig | None = None) -> Plan:
+def make_plan(
+    state: OwnedState,
+    config: PlannerConfig | None = None,
+    *,
+    revision: int = 0,
+    replan_reason: str | None = None,
+) -> Plan:
+    """Form the economic and production commitments for ``state.day``."""
     config = config or PlannerConfig()
     obligations = existing_obligations(state)
     candidates = list(enumerate_projects(state, config))
@@ -878,7 +904,7 @@ def make_plan(state: OwnedState, config: PlannerConfig | None = None) -> Plan:
     own_sales: dict[str, int] = {}
     cash_spent = 0
 
-    while candidates and len(selected) < config.max_new_production_per_turn:
+    while candidates and len(selected) < config.max_new_production_per_day:
         repriced = []
         for candidate in candidates:
             candidate = _reprice(state, candidate, own_sales)
@@ -960,7 +986,12 @@ def make_plan(state: OwnedState, config: PlannerConfig | None = None) -> Plan:
         unit_margin = max(0, 4 * state.market_prices.get("WHEAT", 25) - rules.CROPS["WHEAT"].seed_cost)
         buy_land = state.money - cash_spent - config.cash_reserve >= price and 25 * unit_margin > price
 
-    hire_count = _hire_count(state, (*obligations, *selected), config)
+    hire_count = _hire_target(
+        state,
+        (*obligations, *selected),
+        config,
+        additional_today_work=len(fertilizer_opportunities),
+    )
     support = _support_commitments(
         state, fertilizer_opportunities, hire_count, buy_land
     )
@@ -981,4 +1012,11 @@ def make_plan(state: OwnedState, config: PlannerConfig | None = None) -> Plan:
             "selected_actions": sum(item.actions.total_actions for item in selected),
             "existing_obligation_value": sum(max(0, item.terminal_profit) for item in obligations),
         },
+        starting_animals={
+            animal: state.owned_animals(animal) for animal in rules.ANIMALS
+        },
+        day=state.day,
+        formed_step=state.step,
+        revision=revision,
+        replan_reason=replan_reason,
     )

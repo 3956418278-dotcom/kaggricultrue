@@ -1,4 +1,4 @@
-"""Pure deterministic baseline policy composition."""
+"""Deterministic baseline composition with episode-local daily plans."""
 
 from __future__ import annotations
 
@@ -6,13 +6,21 @@ from typing import Any
 
 from .contract import construct_action, pass_action
 from .execution import execute
-from .planner import make_plan
+from .operating import DailyPlanningSession
 from .state import get, reconstruct
 
 
-def decide(observation: Any) -> dict[str, list[Any]]:
+_DEFAULT_SESSION = DailyPlanningSession()
+
+
+def decide(
+    observation: Any,
+    *,
+    session: DailyPlanningSession | None = None,
+) -> dict[str, list[Any]]:
     state = reconstruct(observation)
-    return construct_action(state, execute(state, make_plan(state)))
+    operating_plan = (session or _DEFAULT_SESSION).plan_for(state)
+    return construct_action(state, execute(state, operating_plan))
 
 
 def agent(observation: Any) -> dict[str, list[Any]]:
