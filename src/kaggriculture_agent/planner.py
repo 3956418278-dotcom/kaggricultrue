@@ -48,7 +48,6 @@ class Plan:
     rejected: Mapping[str, str]
     fertilize_targets: frozenset[Position]
     animal_purchases: tuple[str, ...]
-    hire_count: int  # aggregate-work staffing proposal; realization searches executable capacity
     buy_land: bool
     feed_reserve: int
     fertilizer_reserve: int
@@ -58,17 +57,31 @@ class Plan:
     formed_step: int = -1
     revision: int = 0
     replan_reason: str | None = None
-    max_hands: int = 5
+    max_hands: int | None = 5  # None: constrained only by cash and remaining time
+    placement_domains: Mapping[str, tuple[Position, ...]] = field(default_factory=dict)
 
 
-def unbind_project(project: EconomicCommitment, state: OwnedState) -> EconomicCommitment:
-    """Keep economic quantities and dated work; defer spatial allocation."""
-    if project.kind not in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT"):
-        return project
-    return replace(project, target=None,
-        land=replace(project.land, intervals=tuple(replace(i, position=None) for i in project.land.intervals)),
-        actions=replace(project.actions, work=tuple(replace(w, position=None) for w in project.actions.work)),
-        metadata={**project.metadata, "placement_open": True})
+def _production_intent(state, projects):
+    """Retain economic spatial constraints, not a route-dependent witness.
+
+    A reusable structure is NOT equivalent to an empty tile requiring
+    construction. Domains describe the actual opening farm; execution may not
+    invent additional land or silently change that construction requirement.
+    """
+    result, domains = [], {}
+    for project in projects:
+        if project.kind in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT"):
+            original = state.tile_at(project.target)
+            domain = tuple(t.position for t in state.tiles if
+                (t.is_empty if original.is_empty else
+                 t.kind == original.kind and t.animal is None))
+            domains[project.identifier] = domain
+            project = replace(project, target=None,
+                land=replace(project.land, intervals=tuple(replace(i, position=None) for i in project.land.intervals)),
+                actions=replace(project.actions, work=tuple(replace(w, position=None) for w in project.actions.work)),
+                metadata={**project.metadata, "requires_construction": original.is_empty and project.kind != "CROP"})
+        result.append(project)
+    return tuple(result), domains
 
 
 @dataclass(frozen=True)
@@ -443,10 +456,9 @@ def existing_obligations(state: OwnedState) -> tuple[EconomicCommitment, ...]:
 
 
 def _candidate_targets(state: OwnedState) -> tuple[TileState, ...]:
-    access = set(rules.shed_access(state.board_size))
     return tuple(
         sorted(
-            (tile for tile in state.empty_tiles() if tile.position not in access),
+            state.empty_tiles(),
             key=lambda tile: (
                 rules.distance_to_shed(tile.position, state.board_size),
                 tile.position[1],
@@ -724,7 +736,6 @@ def hiring_commitments(state: OwnedState, hire_target: int) -> tuple[EconomicCom
 def _support_commitments(
     state: OwnedState,
     fertilizer_opportunities: tuple[FertilizerOpportunity, ...],
-    hire_target: int,
     buy_land: bool,
 ) -> tuple[EconomicCommitment, ...]:
     support: list[EconomicCommitment] = []
@@ -779,7 +790,6 @@ def _support_commitments(
                 },
             )
         )
-    support.extend(hiring_commitments(state, hire_target))
     if buy_land:
         quadrant = rules.LAND_ORDER[len(state.unlocked_quadrants) - 1]
         price = rules.LAND_PRICES[len(state.unlocked_quadrants) - 1]
@@ -853,30 +863,25 @@ def _support_commitments(
             )
         )
     liquidation_sales = (*inventory_outputs, *tile_outputs)
-    if liquidation_sales:
+    if tile_outputs and state.day == 29:
         support.append(
             EconomicCommitment(
-                identifier=f"liquidate:{state.step}",
-                kind="LIQUIDATION",
+                identifier=f"recover:{state.step}",
+                kind="RECOVERY",
                 target=None,
                 existing=True,
                 cash=CashDimension(),
                 time=TimeDimension(state.step, rules.TERMINAL_ACTION_STEP, rules.TERMINAL_ACTION_STEP),
                 land=LandDimension(),
                 actions=ActionDimension(
-                    (*tuple(
-                        WorkAmount(state.day, "TRANSPORT", 1, rules.distance_to_shed(worker.position), worker.position)
-                        for worker in state.workers
-                        if worker.carried
-                    ), *tile_work)
+                    tuple(tile_work)
                 ),
                 physical=PhysicalDimension(
-                    inputs=inventory_outputs,
                     outputs=tuple(tile_outputs),
                 ),
                 revenue=RevenueDimension(
-                    projected_sales=liquidation_sales,
-                    projected_gross=_revenue_for_outputs(state, liquidation_sales),
+                    projected_sales=tuple(tile_outputs),
+                    projected_gross=_revenue_for_outputs(state, tile_outputs),
                 ),
                 metadata={
                     "inventory_is_sunk": True,
@@ -986,23 +991,18 @@ def make_plan(
         unit_margin = max(0, 4 * state.market_prices.get("WHEAT", 25) - rules.CROPS["WHEAT"].seed_cost)
         buy_land = state.money - cash_spent - config.cash_reserve >= price and 25 * unit_margin > price
 
-    hire_count = _hire_target(
-        state,
-        (*obligations, *selected),
-        config,
-        additional_today_work=len(fertilizer_opportunities),
-    )
     support = _support_commitments(
-        state, fertilizer_opportunities, hire_count, buy_land
+        state, fertilizer_opportunities, buy_land
     )
+    obligations, owned_domains = _production_intent(state, obligations)
+    selected, new_domains = _production_intent(state, selected)
     return Plan(
-        obligations=tuple(unbind_project(p, state) for p in obligations),
-        selected=tuple(unbind_project(p, state) for p in selected),
+        obligations=obligations,
+        selected=selected,
         support=support,
         rejected=rejected,
         fertilize_targets=fertilize,
         animal_purchases=animal_purchases,
-        hire_count=hire_count,
         buy_land=buy_land,
         feed_reserve=feed_reserve,
         fertilizer_reserve=fertilizer_reserve,
@@ -1019,4 +1019,5 @@ def make_plan(
         revision=revision,
         replan_reason=replan_reason,
         max_hands=config.max_daily_hands,
+        placement_domains={**owned_domains, **new_domains},
     )

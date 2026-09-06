@@ -17,6 +17,18 @@ Official executable source outranks prose when they disagree about game behavior
 
 ## Selected public references
 
+### Player-day reference sources
+
+| Source | Inspected identity | Role and limitations |
+| --- | --- | --- |
+| [Official episodes index](https://www.kaggle.com/datasets/kaggle/kaggriculture-episodes-index) | Version 37; manifest SHA-256 `78c4d110c8e1f5c1b78654ed6d164dc1ac22f59b2098683d34622fc6356747fe` | Candidate pool only: 37 days, 26,212 episodes. No per-side strength mapping. Official source license CC0-1.0; raw data stays ignored or in private cloud outputs. |
+| [Official September 4 episode dataset](https://www.kaggle.com/datasets/kaggle/kaggriculture-episodes-2026-09-04) | Dataset ID 11902854; 668 rows; manifest SHA-256 `91b2037cdad455022cf90688d593b72cc93c84f767f7ad1be722d3eccd67c1a4` | Frozen pilot source. Aggregate ratings cannot identify the stronger side. Every included replay has its own hash and official-transition audit. |
+| [Competition leaderboard](https://www.kaggle.com/competitions/kaggriculture/leaderboard) | Frozen supported-API snapshot 2026-09-05 13:44:52 UTC, ten teams; cutoff 2828.9 | Team qualification snapshot, not a claim of historical submission rank. Full snapshot is retained with pilot selection metadata. |
+| [Public episode metadata service](https://www.kaggle.com/api/i/competitions.EpisodeService/ListEpisodes) | Read-only responses inspected September 5; response hashes retained by the pipeline | Actual per-side submission/team IDs, index and pre-/post-game scores. Internal service, not a stable supported bulk-data contract; cache requests and stop on denial/rate limit. Missing joins are not guessed. |
+| [X-ray your agent notebook](https://www.kaggle.com/code/destbreso/x-ray-your-agent) | Source inspected September 5, ignored inspection copy only | Lead to the public episode-service interface. No third-party code copied. Its leaderboard-climbing assertion and action buckets are not adopted as ranking evidence or Plan semantics. |
+
+The private project pilot is [Kaggriculture Player Day Pilot](https://www.kaggle.com/code/f7e6n5g4/kaggriculture-player-day-pilot), notebook version 1. Startup was confirmed; completion and final Dataset publication are pending in `STATE.md`. Notebook source, input identities and output manifests—not this link alone—identify an extraction version.
+
 | Source | Exact identity inspected | Useful for | Caveats and retention |
 | --- | --- | --- | --- |
 | [`COK-ZhangZiliang/Kaggriculture`](https://github.com/COK-ZhangZiliang/Kaggriculture/tree/7ef67eac458cd9ecd13786063e2e581fbe7403ec) | Commit `7ef67eac458cd9ecd13786063e2e581fbe7403ec` (2026-08-29), Apache-2.0 | Examples of a league runner, replay analysis, submission packaging, evidence manifests, and environment tests | Reference only; no code copied and no full clone retained |

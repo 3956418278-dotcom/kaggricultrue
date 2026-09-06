@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import Mapping
 
 from . import rules
 from .planner import Plan
+from .market import build_market_orders
 from .state import OwnedState, Position, WorkerState
 
 
@@ -34,7 +34,6 @@ class Execution:
     tasks: tuple[WorkTask, ...]
     assignments: Mapping[int, str]
     market_orders: tuple[list[object], ...]
-    defer_sales: bool = False
     benchmark_orders: bool = False
 
 
@@ -66,11 +65,10 @@ def _inventory_drop_tasks(state: OwnedState, terminal: bool) -> list[WorkTask]:
     return tasks
 
 
-def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
+def generate_tasks(state: OwnedState, plan: Plan, choices=None) -> tuple[WorkTask, ...]:
     """Generate current concrete work; future work stays in commitments."""
-    from .realization import Realization, bind_plan
-    if not isinstance(plan, Realization):
-        plan = bind_plan(state, plan)
+    from .realization import legacy_choices
+    choices = choices or legacy_choices(state, plan)
     terminal = state.step >= 707
     tasks = _inventory_drop_tasks(state, terminal)
     end_of_day = min(rules.TERMINAL_ACTION_STEP, (state.day + 1) * 24 - 1)
@@ -199,7 +197,9 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
             if state.owned_total(animal) <= 0:
                 continue
             structure = rules.ANIMALS[animal].structure
-            empties = state.empty_structures(structure)
+            targets = {choices.target(p) for p in (*plan.obligations, *plan.selected)
+                       if p.metadata.get("animal") == animal and choices.target(p) is not None}
+            empties = tuple(t for t in state.empty_structures(structure) if t.position in targets)
             carried = [worker for worker in state.workers if worker.inventory.get(animal, 0) > 0]
             for index, worker in enumerate(carried[: len(empties)]):
                 target = empties[index].position
@@ -220,15 +220,15 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
 
         build_requests: dict[Position, str] = {}
         for project in (*plan.obligations, *plan.selected):
-            if project.kind not in ("ANIMAL", "ANIMAL_PLACEMENT") or project.target is None:
+            if project.kind not in ("ANIMAL", "ANIMAL_PLACEMENT") or choices.target(project) is None:
                 continue
-            if state.tile_at(project.target).is_empty:
-                build_requests[project.target] = str(project.metadata["structure"])
+            if state.tile_at(choices.target(project)).is_empty:
+                build_requests[choices.target(project)] = str(project.metadata["structure"])
         for target, structure in sorted(build_requests.items()):
             operation = "BUILD_COOP" if structure == "COOP" else "BUILD_PASTURE"
             tasks.append(WorkTask(f"build:{target}", "BUILD", (operation,), 25, end_of_day, target))
 
-        for target, crop in sorted(plan.crop_targets.items()):
+        for target, crop in sorted(choices.crop_targets(plan).items()):
             if state.tile_at(target).is_empty and state.seeds.get(crop, 0) > 0:
                 tasks.append(
                     WorkTask(
@@ -239,7 +239,24 @@ def generate_tasks(state: OwnedState, plan: Plan) -> tuple[WorkTask, ...]:
         for tile in state.tiles_of_kind("WEED"):
             tasks.append(WorkTask(f"dig:{tile.position}", "DIG", ("DIG",), 70, rules.TERMINAL_ACTION_STEP, tile.position))
 
+    allowed = daily_work(plan, choices)
+    tasks = [t for t in tasks if t.kind in ("PICKUP", "DROP") or (t.target, t.kind) in allowed]
     return tuple(sorted(tasks, key=lambda task: (task.priority, task.deadline_step, task.identifier)))
+
+
+def daily_work(plan, choices):
+    """Daily service goals from the existing dated commitment schedules."""
+    aliases = {"PICKUP_PLACE": ("PLACE",), "HARVEST_TRANSPORT": ("HARVEST",),
+               "WATER_HARVEST_TRANSPORT": ("WATER", "HARVEST")}
+    result = set()
+    for project in (*plan.obligations, *plan.selected, *plan.support):
+        for work in project.actions.work:
+            if work.day != plan.day:
+                continue
+            position = work.position if work.position is not None else choices.target(project)
+            for kind in aliases.get(work.kind, (work.kind,)):
+                result.add((position, kind))
+    return result
 
 
 def _worker_can_do(worker: WorkerState, task: WorkTask) -> bool:
@@ -296,107 +313,12 @@ def schedule(state: OwnedState, tasks: tuple[WorkTask, ...]) -> tuple[tuple[list
     return tuple(actions), assignments
 
 
-def build_market_orders(state: OwnedState, plan: Plan, worker_actions: tuple[list[object], ...]) -> tuple[list[object], ...]:
-    """Construct ordered sales and purchases using post-unit-action inventory."""
-    from .realization import Realization, bind_plan
-    if not isinstance(plan, Realization):
-        plan = bind_plan(state, plan)
-    projected_shed = dict(state.shed)
-    used_carried: dict[str, int] = {}
-    for worker, action in zip(state.workers, worker_actions):
-        op = action[0] if action else "PASS"
-        if op == "DROP":
-            for item, quantity in worker.inventory.items():
-                projected_shed[item] = projected_shed.get(item, 0) + quantity
-        elif op == "PLACE" and len(action) > 1:
-            item = str(action[1])
-            used_carried[item] = used_carried.get(item, 0) + 1
-        elif op == "FEED":
-            used_carried["WHEAT"] = used_carried.get("WHEAT", 0) + 1
-        elif op == "FERTILIZE":
-            used_carried["FERTILIZER"] = used_carried.get("FERTILIZER", 0) + 1
-    terminal = state.step >= 707
-    pending_fertilizer = (
-        sum(
-            state.tile_at(target).kind == "PLANT"
-            and int(state.tile_at(target).raw.get("fertilized_until_day", -1)) < state.day + 2
-            for target in plan.fertilize_targets
-        )
-        if plan.fertilize_targets
-        else plan.fertilizer_reserve
-    )
-    reserves = {
-        "WHEAT": 0 if terminal else plan.feed_reserve,
-        "FERTILIZER": 0 if terminal else pending_fertilizer,
-    }
-    sales: list[list[object]] = []
-    for item in sorted(rules.SELLABLE_PRODUCTS, key=lambda name: (-state.market_prices.get(name, 0), name)):
-        quantity = max(0, projected_shed.get(item, 0) - reserves.get(item, 0))
-        if quantity:
-            sales.append(["SELL", item, quantity])
-    if terminal:
-        return tuple(sales[: rules.MAX_MARKET_ORDERS])
-
-    commitment_orders: list[list[object]] = []
-    for crop in rules.CROPS:
-        remaining_targets = sum(
-            planned_crop == crop and state.tile_at(target).is_empty
-            for target, planned_crop in plan.crop_targets.items()
-        )
-        shortfall = max(0, remaining_targets - state.seeds.get(crop, 0))
-        if shortfall:
-            commitment_orders.append(["BUY_SEED", crop, shortfall])
-    animal_counts = Counter(plan.animal_purchases)
-    for animal in rules.ANIMALS:
-        acquired_today = max(
-            0,
-            state.owned_animals(animal) - plan.starting_animals.get(animal, 0),
-        )
-        shortfall = max(0, animal_counts[animal] - acquired_today)
-        if shortfall:
-            commitment_orders.append(
-                ["BUY_ANIMAL", animal, shortfall]
-            )
-    fertilizer_after_actions = max(0, state.owned_total("FERTILIZER") - used_carried.get("FERTILIZER", 0))
-    fertilizer_shortfall = max(0, pending_fertilizer - fertilizer_after_actions)
-    if fertilizer_shortfall:
-        commitment_orders.append(
-            ["BUY_PRODUCT", "FERTILIZER", fertilizer_shortfall]
-        )
-    wheat_after_actions = max(0, state.owned_total("WHEAT") - used_carried.get("WHEAT", 0))
-    wheat_shortfall = max(0, plan.feed_reserve - wheat_after_actions)
-    if wheat_shortfall:
-        commitment_orders.append(["BUY_PRODUCT", "WHEAT", wheat_shortfall])
-    land_target = next(
-        (
-            str(commitment.metadata.get("quadrant"))
-            for commitment in plan.support
-            if commitment.kind == "LAND"
-        ),
-        None,
-    )
-    if plan.buy_land and land_target not in state.unlocked_quadrants:
-        commitment_orders.append(["BUY_LAND"])
-
-    # Reserve the finite entry budget for commitment inputs.  Sales still execute
-    # first (and can finance later entries), but only occupy genuinely spare slots.
-    if len(commitment_orders) > rules.MAX_MARKET_ORDERS:
-        raise ValueError("planner commitments exceed the market-entry budget")
-    hire_slots = max(
-        0, rules.MAX_MARKET_ORDERS - len(commitment_orders)
-    )
-    outstanding_hires = max(0, plan.hire_count - state.hires_today)
-    hire_orders = [["HIRE"] for _ in range(min(outstanding_hires, hire_slots))]
-    required_orders = [*hire_orders, *commitment_orders]
-    sale_slots = rules.MAX_MARKET_ORDERS - len(required_orders)
-    return tuple([*sales[:sale_slots], *required_orders])
 
 
-def execute(state: OwnedState, plan: Plan) -> Execution:
-    from .realization import Realization, bind_plan
-    if not isinstance(plan, Realization):
-        plan = bind_plan(state, plan)
-    tasks = generate_tasks(state, plan)
+def execute(state: OwnedState, plan: Plan, choices=None) -> Execution:
+    from .realization import legacy_choices
+    choices = choices or legacy_choices(state, plan)
+    tasks = generate_tasks(state, plan, choices)
     worker_actions, assignments = schedule(state, tasks)
-    market_orders = build_market_orders(state, plan, worker_actions)
+    market_orders = build_market_orders(state, plan, worker_actions, choices)
     return Execution(worker_actions, tasks, assignments, market_orders)

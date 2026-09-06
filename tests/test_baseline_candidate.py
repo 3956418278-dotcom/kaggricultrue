@@ -19,7 +19,7 @@ from src.kaggriculture_agent.economics import (
 )
 from src.kaggriculture_agent.execution import WorkTask, execute, generate_tasks, schedule
 from src.kaggriculture_agent.operating import DailyPlanningSession
-from src.kaggriculture_agent.realization import bind_plan
+from src.kaggriculture_agent.realization import ExecutionChoices, legacy_choices
 from src.kaggriculture_agent.planner import (
     PlannerConfig,
     _fertilizer_marginal_outputs,
@@ -79,14 +79,15 @@ class BaselineModelTests(unittest.TestCase):
         fertilized_state = replace(state, tiles=tuple(tiles), shed={"FERTILIZER": 1, "TOMATO": 2})
         kinds = {item.kind for item in make_plan(fertilized_state).support}
         self.assertIn("FERTILIZER", kinds)
-        self.assertIn("LIQUIDATION", kinds)
+        self.assertNotIn("LIQUIDATION", kinds)
+        self.assertNotIn("HIRE", kinds)
 
         weed_tiles = tuple(
             TileState(tile.position, {"kind": "WEED"}) if tile.is_empty else tile
             for tile in state.tiles
         )
         labor_plan = make_plan(replace(state, tiles=weed_tiles))
-        self.assertIn("HIRE", {item.kind for item in labor_plan.support})
+        self.assertNotIn("HIRE", {item.kind for item in labor_plan.support})
         self.assertIn("LAND", {item.kind for item in labor_plan.support})
         market_operations = [order[0] for order in execute(replace(state, tiles=weed_tiles), labor_plan).market_orders]
         self.assertIn("HIRE", market_operations)
@@ -262,7 +263,7 @@ class BaselineModelTests(unittest.TestCase):
             workers=(WorkerState(0, crop_position, {}),),
         )
         plan = make_plan(terminal)
-        liquidation = next(item for item in plan.support if item.kind == "LIQUIDATION")
+        liquidation = next(item for item in plan.support if item.kind == "RECOVERY")
         projected = {(item.item, item.quantity) for item in liquidation.physical.outputs}
         self.assertEqual(projected, {("WHEAT", 4), ("EGG", 3)})
         terminal_tasks = generate_tasks(terminal, plan)
@@ -278,16 +279,13 @@ class BaselineModelTests(unittest.TestCase):
         state = initial_state()
         full_shed = {item: 1 for item in rules.SELLABLE_PRODUCTS}
         state = replace(state, shed=full_shed)
-        plan = replace(
-            bind_plan(state, make_plan(state)),
-            crop_targets={(0, 0): "WHEAT", (1, 0): "CARROT", (2, 0): "TOMATO"},
-            hire_count=5,
-            feed_reserve=2,
-            fertilizer_reserve=2,
-            animal_purchases=(),
-            buy_land=False,
-        )
-        orders = execute(state, plan).market_orders
+        from src.kaggriculture_agent.planner import _crop_commitment
+        selected = tuple(_crop_commitment(state, crop, state.tile_at((i, 0)))
+                         for i, crop in enumerate(("WHEAT", "CARROT", "TOMATO")))
+        plan = replace(make_plan(state), selected=selected, placement_domains={},
+                       feed_reserve=2, fertilizer_reserve=2,
+                       animal_purchases=(), buy_land=False)
+        orders = execute(state, plan, ExecutionChoices(hire_count=5)).market_orders
         self.assertEqual(len(orders), rules.MAX_MARKET_ORDERS)
         self.assertEqual(sum(order[0] == "HIRE" for order in orders), 5)
         self.assertEqual(
@@ -327,7 +325,7 @@ class BaselineModelTests(unittest.TestCase):
             tuple(item.identifier for item in same_plan.selected),
             tuple(item.identifier for item in plan.selected),
         )
-        self.assertEqual(same_plan.hire_count, plan.hire_count)
+        self.assertFalse(hasattr(plan, "hire_count"))
 
     def test_daily_staffing_is_hired_at_day_start_and_not_repeated(self):
         opening = initial_state()
@@ -339,19 +337,20 @@ class BaselineModelTests(unittest.TestCase):
         session = DailyPlanningSession()
         plan = session.plan_for(opening)
 
-        self.assertGreater(plan.hire_count, 0)
+        choices = legacy_choices(opening, plan)
+        self.assertGreater(choices.hire_count, 0)
         self.assertIn("HIRE", [order[0] for order in execute(opening, plan).market_orders])
 
         hired = replace(
             opening,
             step=1,
             hour=1,
-            hires_today=plan.hire_count,
+            hires_today=choices.hire_count,
             workers=(
                 *opening.workers,
                 *tuple(
                     WorkerState(index + 1, (4, 4), {})
-                    for index in range(plan.hire_count)
+                    for index in range(choices.hire_count)
                 ),
             ),
         )
@@ -367,14 +366,15 @@ class BaselineModelTests(unittest.TestCase):
         opening = replace(opening, tiles=recovery_tiles)
         one_hour_later = replace(opening, step=1, hour=1)
 
-        self.assertEqual(make_plan(opening).hire_count, make_plan(one_hour_later).hire_count)
+        self.assertEqual(legacy_choices(opening, make_plan(opening)).hire_count, legacy_choices(one_hour_later, make_plan(one_hour_later)).hire_count)
 
     def test_fixed_daily_plan_does_not_repeat_fulfilled_commitment_orders(self):
         opening = initial_state()
-        crop_plan = bind_plan(opening, make_plan(opening))
-        self.assertTrue(crop_plan.crop_targets)
+        crop_plan = make_plan(opening)
+        crop_choices = legacy_choices(opening, crop_plan)
+        self.assertTrue(crop_choices.crop_targets(crop_plan))
         tiles = list(opening.tiles)
-        for target, crop in crop_plan.crop_targets.items():
+        for target, crop in crop_choices.crop_targets(crop_plan).items():
             tiles[target[1] * opening.board_size + target[0]] = TileState(
                 target,
                 {
@@ -386,7 +386,7 @@ class BaselineModelTests(unittest.TestCase):
             )
         planted = replace(opening, step=1, hour=1, tiles=tuple(tiles))
         self.assertNotIn(
-            "BUY_SEED", [order[0] for order in execute(planted, crop_plan).market_orders]
+            "BUY_SEED", [order[0] for order in execute(planted, crop_plan, crop_choices).market_orders]
         )
 
         animal_plan = replace(crop_plan, animal_purchases=("COW",))
@@ -552,17 +552,8 @@ class BaselineModelTests(unittest.TestCase):
         )
         invalidated = replace(opening, step=1, hour=1, tiles=tuple(tiles))
 
-        repaired = session.plan_for(invalidated)
-        self.assertEqual(repaired.revision, 1)
-        self.assertIn("disappeared", repaired.replan_reason)
-
-        second_target = bind_plan(invalidated, repaired).selected[0].target
-        tiles = list(invalidated.tiles)
-        tiles[second_target[1] * opening.board_size + second_target[0]] = TileState(
-            second_target, {"kind": "WEED"}
-        )
-        invalidated_again = replace(invalidated, step=2, hour=2, tiles=tuple(tiles))
-        self.assertIs(session.plan_for(invalidated_again), repaired)
+        self.assertIs(session.plan_for(invalidated), original)
+        self.assertEqual(original.revision, 0)
 
     def test_late_day_carry_relies_on_official_refresh_drop(self):
         state = initial_state()

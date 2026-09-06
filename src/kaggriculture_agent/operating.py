@@ -104,18 +104,7 @@ class DailyPlanningSession:
             plan = make_plan(state, self.config)
         else:
             plan = prior
-            if (
-                state.step > plan.formed_step
-                and plan.revision < self.config.max_intraday_replans
-            ):
-                reason = daily_plan_replan_reason(state, plan)
-                if reason is not None:
-                    plan = make_plan(
-                        state,
-                        self.config,
-                        revision=plan.revision + 1,
-                        replan_reason=reason,
-                    )
+            # Even an impossible target stays fixed; realization reports it.
 
         self._plans[state.player] = plan
         self._last_steps[state.player] = state.step

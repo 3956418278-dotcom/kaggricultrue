@@ -128,6 +128,19 @@ Leaderboard results are valuable external validation but are observational: oppo
 
 Under the official evaluation page inspected on 2026-09-04, an upload first runs a self-play validation episode. Valid submissions then play similarly rated agents; only the latest two submissions are tracked for scoring, and the higher-scoring one is displayed. The episode outcome is win/draw/loss from final coins after the 720-turn game, not the size of the money margin. After the deadline, submissions lock and a final Bradley-Terry tournament is computed from subsequent episodes. These remote ratings are population-dependent and are not interchangeable with the fixed local acceptance protocol.
 
+## Intraday realization references
+
+Player-day research is a separate development benchmark, not competitive baseline-promotion evidence. Its interface is `identical day-start state + identical fixed reconstructed Plan -> reference / candidate realizations`. The target is Plan fulfillment and the state reached, not imitation of actions or final-game strategy. Keep full episodes as legality/runtime/integration checks and greedy scheduling as a weak sanity baseline.
+
+- Use the official episodes index only as a candidate pool. Qualify each player-side separately using metadata that was actually obtained. Freeze the leaderboard snapshot, pre-game score cutoff, candidate sampling rule and source versions before extracting or inspecting outcomes. Missing or ambiguous side joins remain unqualified.
+- The approved initial cohort uses membership in a frozen top-10 team snapshot AND that particular side's pre-game rating at least the snapshot's tenth-place score. Call it a snapshot-qualified high-rating cohort, not historical top-10 rank or proof of optimal execution. Do not select winners or use post-game score to qualify a side.
+- Normalize replay frame/shared fields explicitly. Frame `t+1` carries the action from state `t`; the final day has 23 actionable turns. Reexecute both players through the pinned official interpreter with the recorded seed and configuration; quarantine incompatible or divergent episodes.
+- Reconstruct economic work from direct action/state effects. Preserve existing-location constraints and meaningful construction/land dependencies, while leaving equivalent new placements open. Keep worker identities, staffing, paths, pickup organization, order and selling in the demonstrated realization, not Plan. Distinguish successful effects, demonstrably failed input-dependent attempts and unresolved no-ops. Do not infer hidden intent from a route or pass.
+- Compare Plan completion first; diagnose materials, coordination, timing, resulting assets and labor capacity. Movement, pickup, drop and placement are not waste by definition. Efficiency is relative to another feasible realization achieving the same or better outcome.
+- Keep selling separate. Flag and control sale-financing only if it materially changes executable work or purchases; do not impose a financing correction merely because a replay includes hiring and sales.
+- Treat the pilot as exploratory. Before planner tuning, freeze development/held-out episode groups (never split days of one episode across them), report team/submission overlap and duplicate behavior, and choose the completion/efficiency comparison from inspected samples. Keep held-out results untouched during tuning. No claim of planner maturity is established by a pilot extraction alone.
+- Keep code, schemas, tests and inspection commands maintained locally. Extract large samples in private CPU Kaggle runs. Publish versioned private Kaggle Datasets with selection metadata, source hashes, per-episode checkpoints, exclusions and exact extractor identity. Resume only hash-compatible checkpoints; keep generated local copies ignored.
+
 ## Claim language
 
 Claims must name their evidence boundary:

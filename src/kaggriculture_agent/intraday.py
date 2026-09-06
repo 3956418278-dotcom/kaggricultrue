@@ -12,9 +12,10 @@ from time import perf_counter
 
 from . import rules
 from .execution import (Execution, WorkTask, _task_target, _worker_can_do,
-                        build_market_orders, execute, generate_tasks)
+                        execute, generate_tasks)
+from .market import build_market_orders
 from .planner import Plan, _animal_commitment, _existing_crop_obligation
-from .realization import bind_plan
+from .realization import ExecutionChoices, legacy_choices
 
 
 def farm_key(state):
@@ -38,7 +39,7 @@ class SearchConfig:
 
 @dataclass(frozen=True)
 class Trajectory:
-    realization: Plan
+    choices: ExecutionChoices
     executions: tuple[Execution, ...]
     expected: tuple[object, ...]
     final_state: object
@@ -112,9 +113,9 @@ class EndValue:
         return (value, -debt, -servicing)
 
 
-def search_tasks(state, plan):
+def search_tasks(state, plan, choices):
     """Execution choices include carrying chains the benchmark cannot express."""
-    tasks = list(generate_tasks(state, plan))
+    tasks = list(generate_tasks(state, plan, choices))
     if state.step >= 707:
         for tile in state.animal_tiles():
             if tile.raw.get("fertilizer_available", False):
@@ -139,8 +140,8 @@ def search_tasks(state, plan):
     return tuple(tasks)
 
 
-def joint_options(state, plan, routes, count):
-    tasks = search_tasks(state, plan)
+def joint_options(state, plan, choices, routes, count):
+    tasks = search_tasks(state, plan, choices)
     by_id = {t.identifier: t for t in tasks}
     options = []
     # Multiple complete matchings, with route-continuity and interrupt variants.
@@ -205,22 +206,8 @@ def joint_options(state, plan, routes, count):
             options.append(Execution(tuple(actions), tasks, assignments, ()))
     # Wait is a real option: stored output does not decay, and town demand may
     # make delaying a sale better. Also prevents worthless weed-clearing tails.
-    options.append(Execution(tuple(["PASS"] for _ in state.workers), tasks, {}, (), True))
+    options.append(Execution(tuple(["PASS"] for _ in state.workers), tasks, {}, ()))
     return options
-
-
-def market_for(state, plan, actions, defer_sales=False):
-    # Read input requirements after local consumption, but before market phase.
-    # Do not simulate refresh here: orders precede the automatic daily drop.
-    pending = frozenset(p for p in plan.fertilize_targets if state.tile_at(p).kind == "PLANT"
-        and state.tile_at(p).raw.get("fertilized_until_day", -1) < state.day + 2)
-    applied = {w.position for w, a in zip(state.workers, actions) if a[0] == "FERTILIZE"}
-    view = replace(plan, fertilize_targets=pending - applied, fertilizer_reserve=len(pending - applied))
-    orders = build_market_orders(state, view, actions)
-    # A hold never removes financing sales from an input/hire transaction.
-    if defer_sales and all(order[0] == "SELL" for order in orders) and state.step < 718:
-        return ()
-    return orders
 
 
 @dataclass(frozen=True)
@@ -235,9 +222,8 @@ class _Node:
     states: tuple = ()
 
 
-def _edge(node, execution, plan, greedy=False):
-    orders = (build_market_orders(node.state, plan, execution.worker_actions) if greedy
-              else market_for(node.state, plan, execution.worker_actions, execution.defer_sales))
+def _edge(node, execution, plan, choices, greedy=False):
+    orders = build_market_orders(node.state, plan, execution.worker_actions, choices)
     execution = replace(execution, market_orders=orders, benchmark_orders=greedy)
     following = rules.advance_owned(node.state, execution.worker_actions, orders)
     ops = [a[0] for a in execution.worker_actions]
@@ -248,29 +234,29 @@ def _edge(node, execution, plan, greedy=False):
         node.idle + ops.count("PASS"), node.states + (node.state,))
 
 
-def search_day(state, daily: Plan, config: SearchConfig | None = None, *, bound=None):
+def search_day(state, daily: Plan, config: SearchConfig | None = None, *, previous=None):
     started = perf_counter()
     config = config or SearchConfig()
     value = EndValue(state)
     horizon = min(state.turns_left_today, state.turns_left)
     roots = []
     staffing = (list(range(state.hires_today, max(state.hires_today, daily.max_hands) + 1))
-                if state.hour <= 2 else [max(state.hires_today, bound.hire_count if bound else daily.hire_count)])
+                if state.hour <= 2 else [max(state.hires_today, previous.hire_count if previous else state.hires_today)])
     for hands in staffing:
-        for placement in range(config.placement_variants if bound is None else 1):
-            plan = bind_plan(state, daily if bound is None else bound, placement, hands)
-            if plan not in roots:
-                roots.append(plan)
+        for placement in range(config.placement_variants if previous is None else 1):
+            choices = legacy_choices(state, daily, placement, hands, previous)
+            if choices not in roots:
+                roots.append(choices)
     expanded, rollouts = 0, 0
-    def rollout(node, plan, mode=0):
+    def rollout(node, choices, mode=0):
         nonlocal expanded
         while len(node.trace) < horizon:
             if mode == -1:
-                action = execute(node.state, plan)
+                action = execute(node.state, daily, choices)
             else:
-                options = joint_options(node.state, plan, node.routes, config.joint_branches)
+                options = joint_options(node.state, daily, choices, node.routes, config.joint_branches)
                 action = options[min(mode, len(options) - 2)]
-            node = _edge(node, action, plan, greedy=mode == -1)
+            node = _edge(node, action, daily, choices, greedy=mode == -1)
             expanded += 1
         return node
 
@@ -281,8 +267,8 @@ def search_day(state, daily: Plan, config: SearchConfig | None = None, *, bound=
     # Beam entries are COMPLETE reachable trajectories, not shallow prefixes.
     # This avoids pruning a pickup/travel/use chain merely because its first
     # several actions spend cash/time before delivering any economic benefit.
-    finalists = [(rollout(_Node(state), plan, mode), plan)
-                  for plan in roots for mode in (-1, 0, 1)]
+    finalists = [(rollout(_Node(state), choices, mode), choices)
+                  for choices in roots for mode in (-1, 0, 1)]
     beam = sorted(finalists, key=final_rank, reverse=True)[:config.beam_width]
     visited = set()
     # Spread the bounded neighborhood search across the horizon, not just its
@@ -290,7 +276,7 @@ def search_day(state, daily: Plan, config: SearchConfig | None = None, *, bound=
     times = sorted(range(horizon), key=lambda n: (int(f"{n:05b}"[::-1], 2), n))
     for _ in range(2):
         for index in times:
-            for complete, plan in tuple(beam):
+            for complete, choices in tuple(beam):
                 prefix_ops = [a[0] for e in complete.trace[:index] for a in e.worker_actions]
                 current = complete.states[index]
                 previous = complete.trace[index - 1].assignments if index else {}
@@ -299,16 +285,15 @@ def search_day(state, daily: Plan, config: SearchConfig | None = None, *, bound=
                     sum(op in ("NORTH", "SOUTH", "EAST", "WEST") for op in prefix_ops),
                     sum(op in ("PICKUP", "DROP", "PLACE") for op in prefix_ops),
                     prefix_ops.count("PASS"), complete.states[:index])
-                for action in joint_options(current, plan, prefix.routes, config.joint_branches):
-                    key = (farm_key(current), current.money, repr(plan.crop_targets),
-                           plan.hire_count, action.defer_sales, tuple(tuple(a) for a in action.worker_actions))
-                    if key in visited or (action.worker_actions == complete.trace[index].worker_actions
-                        and action.defer_sales == complete.trace[index].defer_sales):
+                for action in joint_options(current, daily, choices, prefix.routes, config.joint_branches):
+                    key = (farm_key(current), current.money, repr(choices.placements),
+                           choices.hire_count, tuple(tuple(a) for a in action.worker_actions))
+                    if key in visited or (action.worker_actions == complete.trace[index].worker_actions):
                         continue
                     visited.add(key)
                     if rollouts >= config.rollout_budget:
                         break
-                    candidate = (rollout(_edge(prefix, action, plan), plan), plan)
+                    candidate = (rollout(_edge(prefix, action, daily, choices), choices), choices)
                     expanded += 1
                     rollouts += 1
                     # Dominance across complete reachable states and stable
@@ -324,16 +309,18 @@ def search_day(state, daily: Plan, config: SearchConfig | None = None, *, bound=
                     beam = list(unique.values())[:config.beam_width]
             if rollouts >= config.rollout_budget:
                 break
-    best, plan = max(beam, key=final_rank)
-    unfinished = [p.identifier for p in (*plan.selected, *plan.obligations)
-        if p.kind in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT") and p.target is not None
-        and not (best.state.tile_at(p.target).raw and isinstance(best.state.tile_at(p.target).raw, dict)
-            and (best.state.tile_at(p.target).raw.get("crop") == p.metadata.get("crop") if p.kind == "CROP"
-                 else best.state.tile_at(p.target).animal == p.metadata.get("animal")))]
-    return Trajectory(plan, best.trace, best.expected, best.state, final_rank((best, plan)),
+    best, choices = max(beam, key=final_rank)
+    unfinished = [p.identifier for p in (*daily.selected, *daily.obligations)
+        if p.kind in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT") and
+        (choices.target(p) is None or not (
+            best.state.tile_at(choices.target(p)).kind == "PLANT"
+            and best.state.tile_at(choices.target(p)).raw.get("crop") == p.metadata.get("crop")
+            if p.kind == "CROP" else
+            choices.target(p) is not None and best.state.tile_at(choices.target(p)).animal == p.metadata.get("animal")))]
+    return Trajectory(choices, best.trace, best.expected, best.state, final_rank((best, choices)),
         {"seconds": perf_counter() - started, "expanded": expanded, "roots": len(roots), "rollouts": rollouts,
          "horizon": horizon, "movement": best.moves, "logistics": best.logistics,
-         "idle": best.idle, "hands": plan.hire_count, "value": final_rank((best, plan)),
+         "idle": best.idle, "hands": choices.hire_count, "value": final_rank((best, choices)),
          "unfulfilled_production": unfinished,
          "maintenance_debt": -value(best.state)[1]})
 
@@ -351,9 +338,7 @@ class IntradaySession:
         valid_day = identity is daily and 0 <= offset < len(trajectory.executions) if trajectory else False
         def live_execution(trajectory, index):
             execution = trajectory.executions[index]
-            orders = (build_market_orders(state, trajectory.realization, execution.worker_actions)
-                      if execution.benchmark_orders else market_for(state, trajectory.realization,
-                          execution.worker_actions, execution.defer_sales))
+            orders = build_market_orders(state, daily, execution.worker_actions, trajectory.choices)
             return replace(execution, market_orders=orders)
 
         diverged = valid_day and farm_key(state) != trajectory.expected[offset]
@@ -366,8 +351,8 @@ class IntradaySession:
             # inputs or worker capacity. Repair before emitting the failed buy.
             diverged = farm_key(predicted) != expected
         if not valid_day or diverged:
-            bound = trajectory.realization if valid_day else None
-            trajectory = search_day(state, daily, bound=bound)
+            previous = trajectory.choices if valid_day else None
+            trajectory = search_day(state, daily, previous=previous)
             origin, offset = state.step, 0
             self.trajectories[state.player] = (trajectory, origin, daily)
             self.diagnostics.append({"step": state.step, "reason": "divergence" if valid_day else "daily", **trajectory.diagnostics})

@@ -16,7 +16,7 @@ from src.kaggriculture_agent import rules
 from src.kaggriculture_agent.execution import execute
 from src.kaggriculture_agent.intraday import EndValue, farm_key, search_day
 from src.kaggriculture_agent.planner import PlannerConfig, make_plan
-from src.kaggriculture_agent.realization import bind_plan
+from src.kaggriculture_agent.realization import ExecutionChoices, legacy_choices
 from src.kaggriculture_agent.state import TileState, WorkerState, reconstruct
 
 
@@ -102,10 +102,10 @@ def run_scenario(name, state, plan):
     for label in ("greedy", "search"):
         env = oracle_environment(state)
         current = state
-        realization = bind_plan(state, plan) if label == "greedy" else searched.realization
+        choices = legacy_choices(state, plan) if label == "greedy" else searched.choices
         operations = Counter()
         for i in range(min(state.turns_left_today, state.turns_left)):
-            action = execute(current, realization) if label == "greedy" else searched.executions[i]
+            action = execute(current, plan, choices) if label == "greedy" else searched.executions[i]
             predicted = rules.advance_owned(current, action.worker_actions, action.market_orders)
             actual = oracle_step(env, action.worker_actions, action.market_orders)
             if farm_key(actual) != farm_key(predicted) or actual.money != predicted.money or actual.market_inventory != predicted.market_inventory:
