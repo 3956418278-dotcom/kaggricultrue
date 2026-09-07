@@ -1,5 +1,6 @@
 """Correctness checks for event-route representation and compilation."""
 from dataclasses import replace
+from random import Random
 import unittest
 
 from src.kaggriculture_agent import rules
@@ -13,7 +14,9 @@ from src.kaggriculture_agent.route_structure import (
     LogisticsEvent, ResourceLink, RouteSkeleton, SyncBundle, TileLease, build_route_problem,
     initial_skeleton, selected_paths, with_initial_logistics,
 )
-from src.kaggriculture_agent.route_search import RouteSearchConfig, solve_routes
+from src.kaggriculture_agent.route_search import (
+    RouteSearchConfig, _ruin_recreate, normalize, solve_routes,
+)
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState
 
 
@@ -170,6 +173,39 @@ class RouteCompilerTests(unittest.TestCase):
         staged = compile_skeleton(problem, replace(skeleton, hire_caps=(3,)))
         self.assertEqual(sum(order[0] == "HIRE"
                              for order in staged.executions[0].market_orders), 3)
+
+    def test_ruin_recreate_changes_several_assignments_without_losing_work(self):
+        positions = ((0, 0), (0, 4), (4, 0), (4, 4), (8, 0),
+                     (8, 4), (0, 8), (4, 8), (8, 8))
+        state = state_at(hour=8, tiles={position: crop() for position in positions},
+                         workers=[((4, 4), {}), ((5, 4), {}), ((4, 5), {})])
+        plan = work_plan(state, [(f"crop-{n}", position, ("WATER",), {})
+                                 for n, position in enumerate(positions)])
+        problem = build_route_problem(state, plan)
+        opening = initial_skeleton(problem, workforce=3)
+        first = normalize(problem, _ruin_recreate(problem, opening, Random(0)))
+        second = normalize(problem, _ruin_recreate(problem, opening, Random(0)))
+        self.assertEqual(first.routes, second.routes)
+        before = {goal: worker for worker, route in enumerate(opening.routes) for goal in route}
+        after = {goal: worker for worker, route in enumerate(first.routes)
+                 for goal in route if goal in before}
+        self.assertEqual(set(after), set(before))
+        self.assertGreaterEqual(sum(before[goal] != after[goal] for goal in before), 2)
+
+    def test_ruin_recreate_preserves_unplaced_goal_as_reported_infeasibility(self):
+        positions = ((0, 0), (4, 4), (8, 8))
+        state = state_at(hour=8, tiles={position: crop() for position in positions},
+                         workers=[((4, 4), {}), ((5, 4), {})])
+        plan = work_plan(state, [(f"crop-{n}", position, ("WATER",), {})
+                                 for n, position in enumerate(positions)])
+        problem = build_route_problem(state, plan)
+        opening = initial_skeleton(problem, workforce=2)
+        entity = problem.goal_entity[next(iter(problem.goals))]
+        placement = dict(opening.placements); placement.pop(entity)
+        incomplete = replace(opening, placements=placement)
+        goal = next(goal for goal, owner in problem.goal_entity.items() if owner == entity)
+        rebuilt = _ruin_recreate(problem, incomplete, Random(0), focus_goals=(goal,))
+        self.assertEqual(sum(goal in route for route in rebuilt.routes), 1)
 
 
 if __name__ == "__main__":
