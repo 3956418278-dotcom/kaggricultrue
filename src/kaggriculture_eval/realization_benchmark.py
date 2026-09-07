@@ -97,7 +97,7 @@ def execute_reference_controlled(start, actions):
         "pickup_drop_place": sum(operations[o] for o in ("PICKUP", "DROP", "PLACE"))}
 
 
-def compare_sample(sample, config):
+def compare_sample(sample, config, solver=solve_temporal):
     # Explicitly reject nondefault physics; do not silently change the game.
     expected = {"boardSize": 10, "turnsPerDay": 24, "shedCapacity": 100,
                 "episodeSteps": 720, "farmHandCostMult": 1, "maxMarketOrdersPerTurn": 10,
@@ -109,7 +109,7 @@ def compare_sample(sample, config):
             raise ValueError(f"unsupported reference configuration: {key}")
     start, plan = reconstruct(sample["day_start_state"]), plan_from_dict(sample["plan"])
     problem = compile_intent(start, plan)
-    candidate = solve_temporal(start, plan, config)
+    candidate = solver(start, plan, config)
     # No demonstrated action, staffing, assignment or placement entered solve.
     actions = [{"farmer": e.worker_actions[0], "hands": list(e.worker_actions[1:]),
                 "market": list(e.market_orders)} for e in candidate.executions]
