@@ -27,9 +27,10 @@ def main():
     parser.add_argument("--exact-candidates", type=int, default=18)
     parser.add_argument("--refinement-candidates", type=int, default=4)
     parser.add_argument("--repair-rounds", type=int, default=6)
-    parser.add_argument("--compression-rounds", type=int, default=8)
-    parser.add_argument("--compression-candidates", type=int, default=8)
-    parser.add_argument("--ruin-probability", type=float, default=.10)
+    parser.add_argument("--max-exact-evaluations", type=int, default=96)
+    parser.add_argument("--compression-rounds", type=int, default=2)
+    parser.add_argument("--compression-candidates", type=int, default=4)
+    parser.add_argument("--ruin-probability", type=float, default=.35)
     args = parser.parse_args()
     files = sorted(args.samples.glob("episode-*.jsonl.gz"))
     if not files:
@@ -54,6 +55,7 @@ def main():
                                exact_candidates=args.exact_candidates,
                                refinement_candidates=args.refinement_candidates,
                                repair_rounds=args.repair_rounds,
+                               max_exact_evaluations=args.max_exact_evaluations,
                                compression_rounds=args.compression_rounds,
                                compression_candidates=args.compression_candidates,
                                ruin_probability=args.ruin_probability)
@@ -81,7 +83,8 @@ def main():
                    "structural_patterns": result["structural_patterns"],
                    "diagnostics": {key: result["candidate"]["diagnostics"].get(key)
                                    for key in ("search_seconds", "search_generated",
-                                               "search_exact_evaluations", "search_improved_start")}}
+                                               "search_exact_evaluations", "search_improved_start",
+                                               "search_economic_state_value")}}
             rows.append(row)
             print(json.dumps(row), flush=True)
     patterns = sorted({pattern for row in rows

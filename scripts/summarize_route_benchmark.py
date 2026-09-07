@@ -52,6 +52,10 @@ def main():
             "equal_goal_set_realization_comparison": result.get(
                 "equal_goal_set_realization_comparison"),
             "search_seconds": result["candidate"]["diagnostics"]["search_seconds"],
+            "exact_compilations": result["candidate"]["diagnostics"].get(
+                "search_exact_evaluations", 0),
+            "workforce_basins": result["candidate"]["diagnostics"].get(
+                "search_workforce_basins", []),
             "staffing_compression_rounds": result["candidate"]["diagnostics"].get(
                 "staffing_compression_rounds", 0),
             "staffing_compression_attempts": result["candidate"]["diagnostics"].get(
@@ -63,7 +67,8 @@ def main():
         "peak_workforce_difference", "executed_hires_difference",
         "hire_expenditure_difference", "input_expenditure_difference",
         "land_expenditure_difference", "sale_revenue_difference",
-        "ending_cash_difference", "used_worker_turn_difference",
+        "ending_cash_difference", "economic_state_value_difference",
+        "used_worker_turn_difference",
         "movement_difference", "logistics_difference",
     )
     equal_goal_economics = {
@@ -113,6 +118,10 @@ def main():
                 for row in rows),
             "mean_search_seconds": sum(row["search_seconds"] for row in rows)/len(rows),
             "max_search_seconds": max(row["search_seconds"] for row in rows),
+            "mean_exact_compilations": (sum(row["exact_compilations"] for row in rows)
+                                         / len(rows)),
+            "max_exact_compilations": max(row["exact_compilations"] for row in rows),
+            "total_exact_compilations": sum(row["exact_compilations"] for row in rows),
             "staffing_compression_rounds": sum(
                 row["staffing_compression_rounds"] for row in rows),
             "staffing_compression_attempts": sum(

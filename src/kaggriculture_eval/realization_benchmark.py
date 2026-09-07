@@ -11,6 +11,7 @@ from pathlib import Path
 
 from src.kaggriculture_agent import rules
 from src.kaggriculture_agent.intent import compile_intent, matches
+from src.kaggriculture_agent.route_search import resulting_state_value
 from src.kaggriculture_agent.route_structure import selected_paths
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState, reconstruct
 from src.kaggriculture_agent.temporal_model import solve_temporal
@@ -232,7 +233,8 @@ def compare_farm_states(target, realization):
     }
 
 
-def compare_efficiency(target_score, target_effort, realization_score, realization_effort):
+def compare_efficiency(target_score, target_effort, realization_score, realization_effort,
+                       target_economic_value=None, realization_economic_value=None):
     """Compare capacity only when the economic result makes it meaningful."""
     target_ids = set(target_score["completed_ids"])
     realized_ids = set(realization_score["completed_ids"])
@@ -257,10 +259,13 @@ def compare_efficiency(target_score, target_effort, realization_score, realizati
                 "ending_cash"):
         comparison[f"{key}_difference"] = (realization_effort.get(key, 0)
                                               - target_effort.get(key, 0))
+    if target_economic_value is not None and realization_economic_value is not None:
+        comparison["economic_state_value_difference"] = (
+            realization_economic_value-target_economic_value)
     return comparison
 
 
-def realization_economic_summary(score, effort, state):
+def realization_economic_summary(score, effort, state, opening_state):
     """Inspectable realization outcome; meaningful comparisons require equal goals."""
     return {
         "completed_goal_count": score["completed"],
@@ -282,6 +287,7 @@ def realization_economic_summary(score, effort, state):
             "sale_revenue_by_item": effort["sale_revenue_by_item"],
         },
         "ending_cash": state.money,
+        "economic_state_value": resulting_state_value(opening_state, state),
         "ending_inventory": _physical_inventory(state),
         "ending_assets": _asset_counts(state),
         "labor": {
@@ -447,6 +453,11 @@ def compare_route_sample(sample, config, solver):
                        ("goal_count", "completed", "completed_ids", "unfulfilled")}
     reference_end = _owned_from_mapping(controlled["final_state"])
     candidate_end = _owned_from_mapping(candidate["final_state"])
+    economic_values = {
+        "reference": resulting_state_value(start, reference_end),
+        "witness": resulting_state_value(start, witness_end),
+        "candidate": resulting_state_value(start, candidate_end),
+    }
     demonstration_witness_gap = goal_set_gap(controlled_score, witness_score)
     search_gap = goal_set_gap(witness_score, candidate_score)
     reference_gap = goal_set_gap(controlled_score, candidate_score)
@@ -496,11 +507,14 @@ def compare_route_sample(sample, config, solver):
     candidate_effort = {key: candidate[key] for key in effort_keys}
     result["efficiency"] = {
         "representation_witness_vs_controlled_reference": compare_efficiency(
-            controlled_score, controlled_effort, witness_score, witness_effort),
+            controlled_score, controlled_effort, witness_score, witness_effort,
+            economic_values["reference"], economic_values["witness"]),
         "candidate_vs_representation_witness": compare_efficiency(
-            witness_score, witness_effort, candidate_score, candidate_effort),
+            witness_score, witness_effort, candidate_score, candidate_effort,
+            economic_values["witness"], economic_values["candidate"]),
         "candidate_vs_controlled_reference": compare_efficiency(
-            controlled_score, controlled_effort, candidate_score, candidate_effort),
+            controlled_score, controlled_effort, candidate_score, candidate_effort,
+            economic_values["reference"], economic_values["candidate"]),
     }
     result["equal_goal_set_realization_comparison"] = {
         "comparison_status": result["efficiency"][
@@ -508,9 +522,9 @@ def compare_route_sample(sample, config, solver):
         "interpretation": ("Workforce and economic-efficiency differences are directly "
                            "comparable only when achieved goal sets are equal."),
         "reference": realization_economic_summary(
-            controlled_score, controlled_effort, reference_end),
+            controlled_score, controlled_effort, reference_end, start),
         "candidate": realization_economic_summary(
-            candidate_score, candidate_effort, candidate_end),
+            candidate_score, candidate_effort, candidate_end, start),
     }
     result["route_structure_comparison"] = compare_route_structures(
         problem, skeleton, candidate["diagnostics"]["skeleton"],

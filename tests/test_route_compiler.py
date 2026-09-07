@@ -1,6 +1,7 @@
 """Correctness checks for event-route representation and compilation."""
 from dataclasses import replace
 from random import Random
+from types import SimpleNamespace
 import unittest
 
 from src.kaggriculture_agent import rules
@@ -15,8 +16,9 @@ from src.kaggriculture_agent.route_structure import (
     initial_skeleton, selected_paths, with_initial_logistics,
 )
 from src.kaggriculture_agent.route_search import (
-    RouteSearchConfig, _compress_workforce_frontier,
-    _reconstruct_open_placement_matching, _ruin_recreate, normalize, solve_routes,
+    RouteSearchConfig, _complete_initial_placement, _compress_workforce_frontier,
+    _reconstruct_open_placement_matching,
+    _ruin_recreate, normalize, result_score, solve_routes,
 )
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState
 
@@ -153,6 +155,28 @@ class RouteCompilerTests(unittest.TestCase):
         self.assertEqual(first.diagnostics["workforce"], 1)
         self.assertEqual(first.diagnostics["hire_expenditure"], 0)
         self.assertEqual(len(first.completed), 3)
+        basins = first.diagnostics["search_workforce_basins"]
+        self.assertEqual([basin["workforce"] for basin in basins], [1, 2, 3])
+        self.assertEqual(first.diagnostics["search_global_iterations"]
+                         + sum(basin["structural_iterations"] for basin in basins), 30)
+        self.assertTrue(all(basin["structural_iterations"] >= 3 for basin in basins))
+        self.assertTrue(all(basin["exact_compilations"] >= 1 for basin in basins))
+
+    def test_exact_score_values_reached_state_without_ledger_double_counting(self):
+        state = state_at(hour=20, money=20)
+        diagnostics = {"hire_expenditure": 0, "used_worker_turns": 2,
+                       "movement": 1, "logistics": 0, "workforce": 1}
+        baseline = SimpleNamespace(completed=frozenset({"goal"}), final_state=state,
+                                   diagnostics=diagnostics)
+        misleading_ledger = SimpleNamespace(
+            completed=baseline.completed, final_state=state,
+            diagnostics={**diagnostics, "hire_expenditure": 10_000, "workforce": 20})
+        self.assertEqual(result_score(baseline, state),
+                         result_score(misleading_ledger, state))
+        richer = SimpleNamespace(completed=baseline.completed,
+                                 final_state=replace(state, money=state.money+1),
+                                 diagnostics={**diagnostics, "hire_expenditure": 1})
+        self.assertGreater(result_score(richer, state), result_score(baseline, state))
 
     def test_hire_spawn_layout_can_defer_logistics_without_losing_it(self):
         animal = dict(kind="COOP", animal="GOOSE", placed_day=0, fed_today=False,
@@ -245,6 +269,24 @@ class RouteCompilerTests(unittest.TestCase):
         rebuilt = _reconstruct_open_placement_matching(problem, skeleton, Random(0))
         self.assertEqual(len(rebuilt.placements), len(problem.intent.entities))
         self.assertEqual(len(set(rebuilt.placements.values())), 3)
+
+    def test_search_initialization_routes_every_matchable_placement_goal(self):
+        state = state_at(hour=18, money=100, seeds={"WHEAT": 3})
+        plan = work_plan(state, [
+            ("broad", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+            ("medium", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+            ("narrow", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+        ], {"broad": ((4, 4), (3, 4), (5, 4)),
+            "medium": ((4, 4), (3, 4)), "narrow": ((4, 4),)})
+        plan = replace(plan, selected=tuple(replace(item, kind="CROP")
+                                            for item in plan.obligations), obligations=())
+        problem = build_route_problem(state, plan)
+        incomplete = initial_skeleton(problem, workforce=2)
+        self.assertLess(len(incomplete.placements), len(problem.intent.entities))
+        initialized = _complete_initial_placement(problem, incomplete, seed=0)
+        routed = {goal for route in initialized.routes for goal in route}
+        self.assertEqual(len(initialized.placements), len(problem.intent.entities))
+        self.assertEqual(set(problem.goals), routed & set(problem.goals))
 
     def test_staffing_compression_preserves_identical_goal_set(self):
         positions = ((4, 4), (4, 5), (5, 4))

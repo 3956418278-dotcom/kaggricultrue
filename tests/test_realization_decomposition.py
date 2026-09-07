@@ -31,13 +31,15 @@ class RealizationDecompositionTests(unittest.TestCase):
                             "land_expenditure": 0, "sale_revenue": 5,
                             "ending_cash": 90}
         comparison = compare_efficiency(
-            target, target_effort, faster_but_incomplete, candidate_effort)
+            target, target_effort, faster_but_incomplete, candidate_effort,
+            target_economic_value=120, realization_economic_value=105)
         self.assertEqual(comparison["comparison_status"],
                          "not-comparable-different-goal-set")
         self.assertEqual(comparison["used_worker_turn_difference"], -9)
         self.assertEqual(comparison["peak_workforce_difference"], -1)
         self.assertEqual(comparison["hire_expenditure_difference"], -1)
         self.assertEqual(comparison["ending_cash_difference"], -10)
+        self.assertEqual(comparison["economic_state_value_difference"], -15)
 
 
 if __name__ == "__main__":
