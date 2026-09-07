@@ -245,7 +245,7 @@ def move_toward(start: tuple[int, int], target: tuple[int, int]) -> list[str]:
     return ["PASS"]
 
 
-def advance_owned(state, actions, orders=()):
+def advance_owned(state, actions, orders=(), *, unit_only=False):
     """One default-contract turn for our farm, with no opponent transactions.
 
     Branch copies are isolated. Units resolve before orders, town, decay, then
@@ -357,6 +357,13 @@ def advance_owned(state, actions, orders=()):
                 elif op == "COLLECT_FERTILIZER" and tile.get("fertilizer_available", False):
                     tile["fertilizer_available"] = False
                     inv["FERTILIZER"] = inv.get("FERTILIZER", 0) + 1
+
+    if unit_only:
+        # Shared primitive projection for semantic planning/validation. No
+        # second rule implementation, market transaction, clock or refresh.
+        return replace(state, shed=shed, seeds=seeds,
+            tiles=tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles)),
+            workers=tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories))))
 
     for order in orders[:MAX_MARKET_ORDERS]:
         op = order[0]

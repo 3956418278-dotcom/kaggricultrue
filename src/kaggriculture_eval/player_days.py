@@ -25,7 +25,7 @@ from src.kaggriculture_agent.economics import (
 )
 from src.kaggriculture_agent.planner import Plan
 
-SCHEMA_VERSION = "player-day-v1"
+SCHEMA_VERSION = "player-day-v2"
 
 
 def jsonable(value):
@@ -102,13 +102,16 @@ def _changes(before, after):
             for k in sorted(set(a) | set(b)) if (k in a, a.get(k)) != (k in b, b.get(k))}
 
 
-def unit_effects(obs, action):
+def unit_effects(obs, action, configuration=None):
     """Ordered unit effects with official atomic-seed validation.
 
     Aggregate inventory erases pickup/drop/carry implementation. Only direct
     asset changes qualify as economic work. No-op attempts are retained for
     inspection, but are not guessed into fulfilled goals.
     """
+    configuration = configuration or {}
+    turns_per_day = int(configuration.get("turnsPerDay", 24))
+    shed_capacity = int(configuration.get("shedCapacity", 100))
     farm, private = deepcopy(obs["farms"][obs["player"]]), deepcopy(obs["private"])
     units = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
     demand = Counter(a[1] for a in units if isinstance(a, list) and len(a) >= 2 and a[0] == "PLANT")
@@ -124,7 +127,7 @@ def unit_effects(obs, action):
         pre_farm, pre_private = deepcopy(farm), deepcopy(private)
         allowed = ["PASS"] if (isinstance(submitted, list) and len(submitted) >= 2
                     and submitted[0] == "PLANT" and submitted[1] in blocked) else submitted
-        official._apply_unit_action(farm, private, worker, allowed, len(farm["tiles"]), obs["day"], 24, 100)
+        official._apply_unit_action(farm, private, worker, allowed, len(farm["tiles"]), obs["day"], turns_per_day, shed_capacity)
         after = deepcopy(farm["tiles"][pos[1]][pos[0]])
         fields = _changes(before, after)
         amounts = _physical(private)
@@ -146,7 +149,7 @@ def unit_effects(obs, action):
                 probe_private["seeds"][crop] = max(1, probe_private["seeds"].get(crop, 0))
             probe_before = _physical(probe_private)
             official._apply_unit_action(probe_farm, probe_private, worker, submitted,
-                                       len(farm["tiles"]), obs["day"], 24, 100)
+                                       len(farm["tiles"]), obs["day"], turns_per_day, shed_capacity)
             probe_after = probe_farm["tiles"][pos[1]][pos[0]]
             changed = _changes(before, probe_after)
             if changed:
@@ -172,19 +175,25 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
                  if tile == "LOCKED" and official._quadrant_of(x, y, len(initial_tiles)) in new_land}
     entities = {(x, y): f"existing:{x}:{y}" for y, row in enumerate(initial_tiles)
                 for x, tile in enumerate(row) if isinstance(tile, dict)}
-    entity_domains, goals, trace = {}, {}, []
+    entity_domains, goals, trace, pending_entities = {}, {}, [], {}
     cleared = set()
     for frame in range(start, end):
         obs = observation(replay, frame, side)
         action = deepcopy(replay["steps"][frame + 1][side].get("action") or {})
-        events, noops = unit_effects(obs, action)
+        events, noops = unit_effects(obs, action, replay["configuration"])
         step_events = []
         for event in events:
             pos, before, after = event["position"], event["before"], event["after"]
             occupies_structure = (isinstance(before, dict) and isinstance(after, dict)
                                   and "animal" not in before and "animal" in after)
             if not isinstance(before, dict) or (occupies_structure and not entities.get(pos, "").startswith("new:")):
-                entity = f"new:{len(entity_domains)}"
+                # An input-starved retry is the same attempted asset, not a
+                # second investment. Scope identity to location and lifecycle;
+                # successful removal invalidates pending identities below.
+                retry_key = (pos, digest({"before": before, "after": after}))
+                entity = pending_entities.get(retry_key)
+                if entity is None:
+                    entity = f"new:{len(entity_domains)}"
                 # All initially identical terrain is execution freedom. Other
                 # terrain is not silently assumed available or unlocked.
                 entity_domains[entity] = tuple(sorted({(x, y) for y, row in enumerate(initial_tiles)
@@ -192,6 +201,9 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
                                               | ((cleared | expansion) if before is None else set())))
                 if event["achieved"]:
                     entities[pos] = entity
+                    pending_entities.pop(retry_key, None)
+                else:
+                    pending_entities[retry_key] = entity
             else:
                 entity = entities.get(pos, f"existing:{pos[0]}:{pos[1]}")
             fixed = None if entity.startswith("new:") else pos
@@ -208,6 +220,7 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
             if after is None and event["achieved"]:
                 entities.pop(pos, None)
                 cleared.add(pos)
+                pending_entities = {k: v for k, v in pending_entities.items() if k[0] != pos}
         trace.append({"step": frame, "state_before": obs, "action": action, "effects": step_events, "noops": noops,
                       "opponent_market": deepcopy((replay["steps"][frame + 1][1-side].get("action") or {}).get("market", []))})
     commitments, domains = [], {}

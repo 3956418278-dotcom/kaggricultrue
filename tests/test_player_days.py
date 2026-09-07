@@ -10,6 +10,7 @@ from src.kaggriculture_eval.player_days import (
     observation, reconstruct_day, unit_effects, validate_replay, write_shard, read_samples,
 )
 from src.kaggriculture_eval.reference_pipeline import qualify_sides
+from src.kaggriculture_eval.reference_audit import audit_sample
 from src.kaggriculture_agent.planner import make_plan, PlannerConfig
 from src.kaggriculture_agent.realization import ExecutionChoices, legacy_choices
 from src.kaggriculture_agent.state import reconstruct, TileState
@@ -82,6 +83,35 @@ class PlayerDayTests(unittest.TestCase):
             first = write_shard(path, [self.sample])
             self.assertEqual(first, write_shard(path, [self.sample]))
             self.assertEqual(list(read_samples(path)), [self.sample])
+
+    def test_repeated_failed_planting_is_one_eventual_asset(self):
+        env = make("kaggriculture", configuration={"seed": 123})
+        def retry(obs):
+            if obs.step < 3:
+                return {"farmer": ["PLANT", "WHEAT"],
+                        "market": [["BUY_SEED", "WHEAT", 1]] if obs.step == 1 else []}
+            return {}
+        env.run([retry, "pass"])
+        replay = env.toJSON()
+        replay["info"]["EpisodeId"] = 456
+        sample = reconstruct_day(replay, 0, 0, {}, "test")
+        goals = sample["plan"]["selected"]
+        self.assertEqual(len(goals), 1)
+        self.assertTrue(goals[0]["metadata"]["attempt_observed"])
+        self.assertTrue(goals[0]["metadata"]["completion_observed"])
+        self.assertEqual(audit_sample(sample)["attempt_only_goals"], 0)
+
+    def test_audit_rejects_goal_effect_and_boundary_corruption(self):
+        self.assertEqual(audit_sample(self.sample)["player_days"], 1)
+        for mutate in (
+            lambda s: s["plan"].update(hire_count=3),
+            lambda s: s["plan"]["selected"][0]["metadata"].update(demonstrated_count=99),
+            lambda s: s["day_end_state"].update(step=23),
+        ):
+            sample = deepcopy(self.sample)
+            mutate(sample)
+            with self.assertRaises(ValueError):
+                audit_sample(sample)
 
 
 class FixedBoundaryTests(unittest.TestCase):

@@ -24,7 +24,7 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def discover_metadata(directory, snapshot, seed_submission=55897276, limit=24):
+def discover_metadata(directory, snapshot, seed_submission=55897276, limit=24, initial=None):
     """Metadata discovery only, NOT a method of determining leaderboard rank.
 
     Query once per submission, cache responses, stop on any denial/rate limit.
@@ -32,7 +32,6 @@ def discover_metadata(directory, snapshot, seed_submission=55897276, limit=24):
     against the separately frozen leaderboard. Missing coverage is reported.
     """
     directory = Path(directory)
-    top = {row["teamId"] for row in snapshot["teams"]}
     queue = {seed_submission: (False, 0.0, "")}
     queried, episodes, provenance = set(), {}, []
     recent = (datetime.fromisoformat(snapshot["observed_at"]).date() - timedelta(days=1)).isoformat()
@@ -47,6 +46,10 @@ def discover_metadata(directory, snapshot, seed_submission=55897276, limit=24):
                     stamp = episode.get("endTime", "")
                     priority = (stamp >= recent, float(side.get("initialScore", 0)), stamp)
                     queue[sid] = max(queue.get(sid, (False, 0.0, "")), priority)
+    if initial:
+        ingest({"episodes": list(initial["episodes"].values())})
+        queried.update(initial.get("queried_submissions", []))
+        provenance.extend(initial.get("response_provenance", []))
     # Reuse every earlier discovery response, not just the path followed by a
     # previous queue order. This is metadata caching, never a ranking definition.
     for cached in sorted(directory.glob("submission-*.json")):
@@ -63,9 +66,16 @@ def discover_metadata(directory, snapshot, seed_submission=55897276, limit=24):
         if path.exists():
             payload = json.loads(path.read_text())
         else:
-            response = requests.post(EPISODE_SERVICE, json={"submissionId": submission}, timeout=30)
+            try:
+                response = requests.post(EPISODE_SERVICE, json={"submissionId": submission}, timeout=30)
+            except requests.RequestException as exc:
+                # Partial metadata remains useful; never log exception strings
+                # that can contain URLs, headers or authentication material.
+                print(f"metadata discovery stopped: {type(exc).__name__}", flush=True)
+                break
             if response.status_code != 200 or "application/json" not in response.headers.get("Content-Type", ""):
-                raise RuntimeError(f"metadata access stopped: HTTP {response.status_code}; no retry or bypass")
+                print(f"metadata discovery stopped: HTTP {response.status_code}; no retry or bypass", flush=True)
+                break
             payload = response.json()
             write_json(path, payload)
             time.sleep(1)
@@ -99,7 +109,13 @@ def qualify_sides(episode, snapshot):
 
 
 def run_pilot(input_root, output, config, metadata):
-    from .player_days import digest, observation, reconstruct_day, validate_replay, write_shard
+    """Compatibility entrypoint: selection -> validation -> reconstruction.
+
+    Used inside the integrated cloud collection run, never a second stage that
+    requires the user to collect raw replays and launch reconstruction later.
+    """
+    from .player_days import SCHEMA_VERSION, digest, reconstruct_day, validate_replay, write_shard
+    from .reference_audit import audit_sample
     from kaggle_environments.envs.kaggriculture import kaggriculture as official
     if importlib.metadata.version("kaggle-environments") != "1.32.7":
         raise RuntimeError("extractor requires kaggle-environments==1.32.7")
@@ -111,7 +127,8 @@ def run_pilot(input_root, output, config, metadata):
     daily_manifest = source / "manifest.csv"
     if hashlib.sha256(daily_manifest.read_bytes()).hexdigest() != config["daily_manifest_sha256"]:
         raise ValueError("daily source version changed")
-    rows = list(csv.DictReader(daily_manifest.open()))
+    with daily_manifest.open() as handle:
+        rows = list(csv.DictReader(handle))
     # Deterministic sample of candidate pool, independent of outcomes/winners.
     rows.sort(key=lambda r: hashlib.sha256((config["sampling_salt"] + r["episode_id"]).encode()).hexdigest())
     rows = rows[:config["candidate_limit"]]
@@ -121,14 +138,20 @@ def run_pilot(input_root, output, config, metadata):
     write_json(output / "episode-metadata.json", metadata)
     report_path = output / "extraction-manifest.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {
-        "schema_version": "player-day-v1", "identity": identity, "episodes": {},
+        "schema_version": SCHEMA_VERSION, "identity": identity, "episodes": {},
         "environment": {"python": platform.python_version(), "kaggle_environments": "1.32.7",
             "official_source_sha256": hashlib.sha256(Path(official.__file__).read_bytes()).hexdigest()},
         "selection": "player-side; no automatic qualification of the other side",
         "cloud_cpu": True, "complete": False}
     if report["identity"] != identity:
         raise ValueError("checkpoint identity differs; use a new version/output")
+    batch_started = time.monotonic()
+    report["complete"] = False
+    write_json(report_path, report)
     for n, row in enumerate(rows):
+        if time.monotonic() - batch_started >= config.get("extraction_seconds", float("inf")):
+            report["stop_reason"] = "bounded runtime; resume from compatible episode checkpoints"
+            break
         eid = row["episode_id"]
         prior = report["episodes"].get(eid)
         if prior and prior.get("shard"):
@@ -165,8 +188,10 @@ def run_pilot(input_root, output, config, metadata):
                     shard = f"episode-{eid}.jsonl.gz"
                     samples = [reconstruct_day(replay, side, day, qualification, replay_hash)
                                for side, qualification in sorted(sides.items()) for day in range(30)]
+                    for sample in samples:
+                        audit_sample(sample)
                     sha = write_shard(output / shard, samples)
-                    report["episodes"][eid] = {"status": "extracted", "sides": sides, "player_days": len(samples),
+                    report["episodes"][eid] = {"status": "extracted", "sides": {str(k): v for k, v in sides.items()}, "player_days": len(samples),
                         "shard": shard, "sha256": sha, "replay_sha256": replay_hash, "validation": validation,
                         "attempt_only_goals": sum(s["diagnostics"]["attempt_only_goals"] for s in samples),
                         "seconds": time.perf_counter()-started}
@@ -175,10 +200,57 @@ def run_pilot(input_root, output, config, metadata):
                     report["episodes"][eid] = {"status": "quarantined", "reason": str(exc), "type": type(exc).__name__}
         write_json(report_path, report)
         print(f"candidate {n+1}/{len(rows)} {eid}: {report['episodes'][eid]['status']}", flush=True)
-    report["complete"] = True
+    report["complete"] = len(report["episodes"]) == len(rows)
     report["completed_utc"] = datetime.now(timezone.utc).isoformat()
     report["player_days"] = sum(r.get("player_days", 0) for r in report["episodes"].values())
     report["status_counts"] = dict(__import__("collections").Counter(r["status"] for r in report["episodes"].values()))
     write_json(report_path, report)
     print(json.dumps({k: report[k] for k in ("player_days", "status_counts", "complete")}), flush=True)
+    return report
+
+
+def run_collection(input_root, output, config, bootstrap_metadata, *, cache, resume=None):
+    """ONE cloud job: metadata collection, side selection, replay reading,
+    official validation, Plan reconstruction, episode checkpointing and audit.
+
+    Official daily Dataset mounts are the raw replay collection source. Only
+    qualifying replays are opened; raw JSON is not copied into the final output.
+    """
+    from .reference_audit import audit_collection
+    from .player_days import digest
+    output, cache = Path(output), Path(cache)
+    collection_identity = digest({"config": config, "bootstrap": bootstrap_metadata})
+    collection_path = output / "collection.json"
+    if resume:
+        resume = Path(resume)
+        prior = json.loads((resume / "collection.json").read_text())
+        if prior["identity"] != collection_identity:
+            raise ValueError("resume collection identity differs; do not mix extractor/source/selection versions")
+        # Copy only dataset artifacts; never arbitrary paths from a manifest.
+        output.mkdir(parents=True, exist_ok=True)
+        for path in resume.iterdir():
+            if path.is_file() and (path.suffix == ".json" or path.name.startswith("episode-") and path.name.endswith(".jsonl.gz")):
+                shutil.copy2(path, output / path.name)
+    if collection_path.exists():
+        if json.loads(collection_path.read_text())["identity"] != collection_identity:
+            raise ValueError("existing collection has incompatible identity")
+        metadata = json.loads((output / "episode-metadata.json").read_text())
+    else:
+        # This is cloud-side collection, not preparation-time local discovery.
+        metadata = discover_metadata(cache, config["leaderboard"],
+            limit=config.get("metadata_queries", 24), initial=bootstrap_metadata)
+        with (Path(input_root) / "manifest.csv").open() as handle:
+            rows = list(csv.DictReader(handle))
+        rows.sort(key=lambda r: hashlib.sha256((config["sampling_salt"] + r["episode_id"]).encode()).hexdigest())
+        ids = {r["episode_id"] for r in rows[:config["candidate_limit"]]}
+        metadata = {**metadata, "episodes": {k: v for k, v in metadata["episodes"].items() if k in ids}}
+        write_json(output / "episode-metadata.json", metadata)
+        write_json(collection_path, {"identity": collection_identity,
+            "bootstrap_metadata_sha256": digest(bootstrap_metadata),
+            "started_utc": datetime.now(timezone.utc).isoformat(),
+            "stages": ["collect metadata", "qualify sides", "read official replays", "validate", "reconstruct", "checkpoint", "audit"],
+            "candidate_count": len(ids), "metadata_joins": len(metadata["episodes"])})
+    report = run_pilot(input_root, output, config, metadata)
+    audit = audit_collection(output)
+    write_json(output / "audit.json", audit)
     return report

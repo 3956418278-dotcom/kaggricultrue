@@ -1,0 +1,5 @@
+# Optional temporal-constraint research runtime; not the submission dependency set.
+# Install in an isolated environment layered over the pinned game environment.
+ortools==9.14.6206
+protobuf==6.31.1
+immutabledict==4.3.1
