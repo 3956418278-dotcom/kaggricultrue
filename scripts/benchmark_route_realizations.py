@@ -26,7 +26,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--exact-candidates", type=int, default=18)
     parser.add_argument("--refinement-candidates", type=int, default=4)
-    parser.add_argument("--repair-rounds", type=int, default=2)
+    parser.add_argument("--repair-rounds", type=int, default=6)
+    parser.add_argument("--compression-rounds", type=int, default=8)
+    parser.add_argument("--compression-candidates", type=int, default=8)
     parser.add_argument("--ruin-probability", type=float, default=.10)
     args = parser.parse_args()
     files = sorted(args.samples.glob("episode-*.jsonl.gz"))
@@ -52,6 +54,8 @@ def main():
                                exact_candidates=args.exact_candidates,
                                refinement_candidates=args.refinement_candidates,
                                repair_rounds=args.repair_rounds,
+                               compression_rounds=args.compression_rounds,
+                               compression_candidates=args.compression_candidates,
                                ruin_probability=args.ruin_probability)
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {

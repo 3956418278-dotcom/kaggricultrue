@@ -19,14 +19,25 @@ class RealizationDecompositionTests(unittest.TestCase):
         target = {"completed_ids": ["a", "b"]}
         faster_but_incomplete = {"completed_ids": ["a"]}
         target_effort = {"used_worker_turns": 10, "movement": 5,
-                         "pickup_drop_place": 1, "available_worker_turns": 20}
+                         "pickup_drop_place": 1, "available_worker_turns": 20,
+                         "peak_workforce": 2, "executed_hires": 1,
+                         "hire_expenditure": 1, "input_expenditure": 10,
+                         "land_expenditure": 0, "sale_revenue": 20,
+                         "ending_cash": 100}
         candidate_effort = {"used_worker_turns": 1, "movement": 0,
-                            "pickup_drop_place": 0, "available_worker_turns": 20}
+                            "pickup_drop_place": 0, "available_worker_turns": 20,
+                            "peak_workforce": 1, "executed_hires": 0,
+                            "hire_expenditure": 0, "input_expenditure": 8,
+                            "land_expenditure": 0, "sale_revenue": 5,
+                            "ending_cash": 90}
         comparison = compare_efficiency(
             target, target_effort, faster_but_incomplete, candidate_effort)
         self.assertEqual(comparison["comparison_status"],
                          "not-comparable-different-goal-set")
         self.assertEqual(comparison["used_worker_turn_difference"], -9)
+        self.assertEqual(comparison["peak_workforce_difference"], -1)
+        self.assertEqual(comparison["hire_expenditure_difference"], -1)
+        self.assertEqual(comparison["ending_cash_difference"], -10)
 
 
 if __name__ == "__main__":

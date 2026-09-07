@@ -9,6 +9,7 @@ from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 
+from src.kaggriculture_agent import rules
 from src.kaggriculture_agent.intent import compile_intent, matches
 from src.kaggriculture_agent.route_structure import selected_paths
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState, reconstruct
@@ -84,7 +85,18 @@ def execute_reference_controlled(start, actions):
     """
     env = oracle_environment(start)
     events, trace, operations = [], [], Counter()
+    transactions = Counter()
+    transaction_breakdowns = {
+        "input_expenditure_by_kind": Counter(),
+        "input_expenditure_by_item": Counter(),
+        "purchased_quantity_by_item": Counter(),
+        "sale_revenue_by_item": Counter(),
+        "sold_quantity_by_item": Counter(),
+    }
+    hire_timing = []
     capacity = 0
+    opening_workforce = len(start.workers)
+    peak_workforce = opening_workforce
     for action in actions:
         obs = deepcopy(dict(env.state[0].observation))
         obs["player"] = 0
@@ -93,13 +105,43 @@ def execute_reference_controlled(start, actions):
         units = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
         current = reconstruct(obs)
         capacity += len(current.workers)
+        peak_workforce = max(peak_workforce, len(current.workers))
         operations.update(a[0] for a in units[:len(current.workers)])
+        worker_actions = units[:len(current.workers)]
+        after_units = rules.advance_owned(current, worker_actions, unit_only=True)
+        turn_ledger = rules.solo_market_ledger(after_units, action.get("market", []))
         result = oracle_step(env, units, action.get("market", []))
+        if turn_ledger["ending_cash"] != result.money:
+            raise AssertionError("controlled replay market-ledger parity mismatch")
+        for key in ("hire_expenditure", "input_expenditure", "land_expenditure",
+                    "sale_revenue", "executed_hires", "executed_land_purchases"):
+            transactions[key] += turn_ledger[key]
+        for key, totals in transaction_breakdowns.items():
+            totals.update(turn_ledger[key])
+        if turn_ledger["executed_hires"]:
+            hire_timing.append({"step": current.step,
+                                "count": turn_ledger["executed_hires"],
+                                "expenditure": turn_ledger["hire_expenditure"]})
+        peak_workforce = max(peak_workforce,
+                             len(current.workers) + turn_ledger["executed_hires"])
         trace.append({"state_before": obs, "action": action, "effects": step_events, "noops": noops})
     return result, events, trace, {"operations": dict(operations), "available_worker_turns": capacity,
         "used_worker_turns": sum(n for op, n in operations.items() if op != "PASS"),
         "movement": sum(operations[o] for o in ("NORTH", "SOUTH", "EAST", "WEST")),
-        "pickup_drop_place": sum(operations[o] for o in ("PICKUP", "DROP", "PLACE"))}
+        "pickup_drop_place": sum(operations[o] for o in ("PICKUP", "DROP", "PLACE")),
+        "opening_workforce": opening_workforce,
+        "peak_workforce": peak_workforce,
+        "ending_workforce": len(result.workers),
+        "executed_hires": transactions["executed_hires"],
+        "hire_timing": hire_timing,
+        "hire_expenditure": transactions["hire_expenditure"],
+        "input_expenditure": transactions["input_expenditure"],
+        "land_expenditure": transactions["land_expenditure"],
+        "sale_revenue": transactions["sale_revenue"],
+        "executed_land_purchases": transactions["executed_land_purchases"],
+        "ending_cash": result.money,
+        **{key: dict(sorted(value.items()))
+           for key, value in transaction_breakdowns.items()}}
 
 
 def goal_set_gap(target, realization):
@@ -200,7 +242,7 @@ def compare_efficiency(target_score, target_effort, realization_score, realizati
         status = "realization-covers-target-with-additional-goals"
     else:
         status = "not-comparable-different-goal-set"
-    return {
+    comparison = {
         "comparison_status": status,
         "used_worker_turn_difference": (realization_effort["used_worker_turns"]
                                         - target_effort["used_worker_turns"]),
@@ -209,6 +251,45 @@ def compare_efficiency(target_score, target_effort, realization_score, realizati
                                  - target_effort["pickup_drop_place"]),
         "available_worker_turn_difference": (realization_effort["available_worker_turns"]
                                              - target_effort["available_worker_turns"]),
+    }
+    for key in ("peak_workforce", "executed_hires", "hire_expenditure",
+                "input_expenditure", "land_expenditure", "sale_revenue",
+                "ending_cash"):
+        comparison[f"{key}_difference"] = (realization_effort.get(key, 0)
+                                              - target_effort.get(key, 0))
+    return comparison
+
+
+def realization_economic_summary(score, effort, state):
+    """Inspectable realization outcome; meaningful comparisons require equal goals."""
+    return {
+        "completed_goal_count": score["completed"],
+        "completed_goal_ids": score["completed_ids"],
+        "workforce": {
+            "opening": effort["opening_workforce"],
+            "peak": effort["peak_workforce"],
+            "ending": effort["ending_workforce"],
+            "hires": effort["executed_hires"],
+            "hire_timing": effort["hire_timing"],
+        },
+        "transactions": {
+            "hire_expenditure": effort["hire_expenditure"],
+            "input_expenditure": effort["input_expenditure"],
+            "input_expenditure_by_kind": effort["input_expenditure_by_kind"],
+            "input_expenditure_by_item": effort["input_expenditure_by_item"],
+            "land_expenditure": effort["land_expenditure"],
+            "sale_revenue": effort["sale_revenue"],
+            "sale_revenue_by_item": effort["sale_revenue_by_item"],
+        },
+        "ending_cash": state.money,
+        "ending_inventory": _physical_inventory(state),
+        "ending_assets": _asset_counts(state),
+        "labor": {
+            "available_worker_turns": effort["available_worker_turns"],
+            "used_worker_turns": effort["used_worker_turns"],
+            "movement": effort["movement"],
+            "logistics": effort["pickup_drop_place"],
+        },
     }
 
 
@@ -405,12 +486,14 @@ def compare_route_sample(sample, config, solver):
         "candidate_vs_representation_witness": compare_farm_states(witness_end, candidate_end),
         "candidate_vs_controlled_reference": compare_farm_states(reference_end, candidate_end),
     }
-    controlled_effort = {key: controlled[key] for key in
-                         ("available_worker_turns", "used_worker_turns", "movement",
-                          "pickup_drop_place")}
-    candidate_effort = {key: candidate[key] for key in
-                        ("available_worker_turns", "used_worker_turns", "movement",
-                         "pickup_drop_place")}
+    effort_keys = ("available_worker_turns", "used_worker_turns", "movement",
+                   "pickup_drop_place", "opening_workforce", "peak_workforce",
+                   "ending_workforce", "executed_hires", "hire_timing",
+                   "hire_expenditure", "input_expenditure", "land_expenditure",
+                   "sale_revenue", "ending_cash", "input_expenditure_by_kind",
+                   "input_expenditure_by_item", "sale_revenue_by_item")
+    controlled_effort = {key: controlled[key] for key in effort_keys}
+    candidate_effort = {key: candidate[key] for key in effort_keys}
     result["efficiency"] = {
         "representation_witness_vs_controlled_reference": compare_efficiency(
             controlled_score, controlled_effort, witness_score, witness_effort),
@@ -418,6 +501,16 @@ def compare_route_sample(sample, config, solver):
             witness_score, witness_effort, candidate_score, candidate_effort),
         "candidate_vs_controlled_reference": compare_efficiency(
             controlled_score, controlled_effort, candidate_score, candidate_effort),
+    }
+    result["equal_goal_set_realization_comparison"] = {
+        "comparison_status": result["efficiency"][
+            "candidate_vs_controlled_reference"]["comparison_status"],
+        "interpretation": ("Workforce and economic-efficiency differences are directly "
+                           "comparable only when achieved goal sets are equal."),
+        "reference": realization_economic_summary(
+            controlled_score, controlled_effort, reference_end),
+        "candidate": realization_economic_summary(
+            candidate_score, candidate_effort, candidate_end),
     }
     result["route_structure_comparison"] = compare_route_structures(
         problem, skeleton, candidate["diagnostics"]["skeleton"],

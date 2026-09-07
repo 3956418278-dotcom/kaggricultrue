@@ -260,6 +260,11 @@ def compile_skeleton(problem: RouteProblem, skeleton: RouteSkeleton) -> RouteCom
     purchase_remaining = {item: list(order) for item, order in purchase_template.items()}
     outstanding_land = [q for q in problem.intent.land if q not in state.unlocked_quadrants]
     used_turns = movement = logistics_actions = 0
+    transaction_totals = Counter()
+    transaction_breakdowns = defaultdict(Counter)
+    hire_timing = []
+    opening_workforce = len(state.workers)
+    peak_workforce = opening_workforce
     horizon = min(state.turns_left_today, state.turns_left)
 
     def current_token(worker):
@@ -440,7 +445,23 @@ def compile_skeleton(problem: RouteProblem, skeleton: RouteSkeleton) -> RouteCom
             # unit state used as the transition oracle instead of trusting the
             # incremental construction.
             micro = after_units
+        turn_ledger = rules.solo_market_ledger(after_units, orders)
         following = rules.advance_owned(state, tuple(actions), orders)
+        if turn_ledger["ending_cash"] != following.money:
+            raise AssertionError("solo market ledger cash parity mismatch")
+        for key in ("hire_expenditure", "input_expenditure", "land_expenditure",
+                    "sale_revenue", "executed_hires", "executed_land_purchases"):
+            transaction_totals[key] += turn_ledger[key]
+        for key in ("input_expenditure_by_kind", "input_expenditure_by_item",
+                    "purchased_quantity_by_item", "sale_revenue_by_item",
+                    "sold_quantity_by_item"):
+            transaction_breakdowns[key].update(turn_ledger[key])
+        if turn_ledger["executed_hires"]:
+            hire_timing.append({"step": state.step,
+                                "count": turn_ledger["executed_hires"],
+                                "expenditure": turn_ledger["hire_expenditure"]})
+        peak_workforce = max(peak_workforce,
+                             len(state.workers)+turn_ledger["executed_hires"])
 
         # Market requirements remain outstanding when cash/capacity rejected
         # them. Compare against the post-unit state, before any later retry.
@@ -509,6 +530,16 @@ def compile_skeleton(problem: RouteProblem, skeleton: RouteSkeleton) -> RouteCom
         "movement": movement,
         "logistics": logistics_actions,
         "workforce": skeleton.workforce,
+        "opening_workforce": opening_workforce,
+        "peak_workforce": peak_workforce,
+        "executed_hires": transaction_totals["executed_hires"],
+        "hire_timing": tuple(hire_timing),
+        "hire_expenditure": transaction_totals["hire_expenditure"],
+        "input_expenditure": transaction_totals["input_expenditure"],
+        "land_expenditure": transaction_totals["land_expenditure"],
+        "sale_revenue": transaction_totals["sale_revenue"],
+        "ending_cash": state.money,
+        **{key: dict(value) for key, value in transaction_breakdowns.items()},
         "compile_failures": tuple(failure.__dict__ for failure in failures),
         "unbought_inputs": {purchase: order[2] for purchase, order in purchase_remaining.items()},
         "unlocked_land_missing": tuple(outstanding_land),

@@ -185,6 +185,91 @@ def fibonacci_hire_cost(index: int) -> int:
     return a
 
 
+def hire_expenditure(hires_today: int, additional_hires: int) -> int:
+    """Exact default-contract expenditure for a consecutive hire sequence."""
+    return sum(fibonacci_hire_cost(hires_today + offset)
+               for offset in range(max(0, additional_hires)))
+
+
+def solo_market_ledger(state, orders):
+    """Replay one player's market orders for inspectable cash attribution.
+
+    This is exact when the other player submits no market order, which is the
+    route compiler and controlled realization-benchmark condition. It shares
+    the same constants and price function as ``advance_owned`` and does not
+    prescribe selling behavior.
+    """
+    money = state.money
+    hires = state.hires_today
+    unlocked = list(state.unlocked_quadrants)
+    shed = dict(state.shed)
+    seeds = dict(state.seeds)
+    market = dict(state.market_inventory)
+    ledger = {
+        "hire_expenditure": 0,
+        "input_expenditure": 0,
+        "land_expenditure": 0,
+        "sale_revenue": 0,
+        "executed_hires": 0,
+        "executed_land_purchases": 0,
+        "input_expenditure_by_kind": {},
+        "input_expenditure_by_item": {},
+        "purchased_quantity_by_item": {},
+        "sale_revenue_by_item": {},
+        "sold_quantity_by_item": {},
+    }
+
+    def add(mapping, key, amount):
+        mapping[key] = mapping.get(key, 0) + amount
+
+    for order in orders[:MAX_MARKET_ORDERS]:
+        op = order[0]
+        if op == "HIRE":
+            cost = fibonacci_hire_cost(hires)
+            if money >= cost:
+                money -= cost
+                hires += 1
+                ledger["hire_expenditure"] += cost
+                ledger["executed_hires"] += 1
+        elif op == "BUY_LAND":
+            if len(unlocked) < 4:
+                cost = LAND_PRICES[len(unlocked)-1]
+                if money >= cost:
+                    money -= cost
+                    new_quadrant = LAND_ORDER[len(unlocked)-1]
+                    unlocked.append(new_quadrant)
+                    ledger["land_expenditure"] += cost
+                    ledger["executed_land_purchases"] += 1
+        else:
+            item = order[1]
+            for _ in range(max(0, int(order[2]) if len(order) > 2 else 1)):
+                if op == "SELL" and shed.get(item, 0):
+                    price = market_price(item, market[item])
+                    shed[item] -= 1
+                    money += price
+                    market[item] += price > PRICE_FLOOR
+                    ledger["sale_revenue"] += price
+                    add(ledger["sale_revenue_by_item"], item, price)
+                    add(ledger["sold_quantity_by_item"], item, 1)
+                elif op in ("BUY_PRODUCT", "BUY_ANIMAL", "BUY_SEED"):
+                    price = (market_price(item, market[item]-1) if op == "BUY_PRODUCT"
+                             else ANIMALS[item].cost if op == "BUY_ANIMAL"
+                             else CROPS[item].seed_cost)
+                    if money < price or (op != "BUY_SEED" and sum(shed.values()) >= SHED_CAPACITY):
+                        break
+                    money -= price
+                    destination = seeds if op == "BUY_SEED" else shed
+                    destination[item] = destination.get(item, 0) + 1
+                    if op == "BUY_PRODUCT":
+                        market[item] -= 1
+                    ledger["input_expenditure"] += price
+                    add(ledger["input_expenditure_by_kind"], op, price)
+                    add(ledger["input_expenditure_by_item"], item, price)
+                    add(ledger["purchased_quantity_by_item"], item, 1)
+    ledger["ending_cash"] = money
+    return ledger
+
+
 def one_time_water_gain(
     crop: str,
     *,

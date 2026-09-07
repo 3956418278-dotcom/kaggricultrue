@@ -15,7 +15,8 @@ from src.kaggriculture_agent.route_structure import (
     initial_skeleton, selected_paths, with_initial_logistics,
 )
 from src.kaggriculture_agent.route_search import (
-    RouteSearchConfig, _ruin_recreate, normalize, solve_routes,
+    RouteSearchConfig, _compress_workforce_frontier,
+    _reconstruct_open_placement_matching, _ruin_recreate, normalize, solve_routes,
 )
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState
 
@@ -53,6 +54,22 @@ def action_goals(problem, entity):
 
 
 class RouteCompilerTests(unittest.TestCase):
+    def test_market_ledger_attributes_real_hire_input_land_and_sale_cash(self):
+        state = replace(state_at(hour=20, money=2000, shed={"FERTILIZER": 1}),
+                        unlocked_quadrants=("NW",))
+        orders = (["SELL", "FERTILIZER", 1], ["HIRE"], ["HIRE"],
+                  ["BUY_SEED", "WHEAT", 2], ["BUY_LAND"])
+        ledger = rules.solo_market_ledger(state, orders)
+        following = rules.advance_owned(state, (["PASS"],), orders)
+        self.assertEqual(rules.hire_expenditure(0, 2), 2)
+        self.assertEqual(rules.hire_expenditure(3, 2), 8)
+        self.assertEqual(ledger["hire_expenditure"], 2)
+        self.assertEqual(ledger["input_expenditure"], 20)
+        self.assertEqual(ledger["land_expenditure"], 1000)
+        self.assertEqual(ledger["sale_revenue"], 100)
+        self.assertEqual(ledger["executed_hires"], 2)
+        self.assertEqual(ledger["ending_cash"], following.money)
+
     def test_same_turn_ordered_workers_can_build_then_place(self):
         state = state_at(hour=23, workers=[((3, 4), {}), ((3, 4), {"GOOSE": 1})])
         plan = work_plan(state, [("asset", (3, 4), ("BUILD", "PICKUP_PLACE"),
@@ -134,6 +151,7 @@ class RouteCompilerTests(unittest.TestCase):
         self.assertEqual(first.executions, second.executions)
         self.assertEqual(first.final_state, second.final_state)
         self.assertEqual(first.diagnostics["workforce"], 1)
+        self.assertEqual(first.diagnostics["hire_expenditure"], 0)
         self.assertEqual(len(first.completed), 3)
 
     def test_hire_spawn_layout_can_defer_logistics_without_losing_it(self):
@@ -170,6 +188,10 @@ class RouteCompilerTests(unittest.TestCase):
         orders = result.executions[0].market_orders
         self.assertEqual(sum(order[0] == "HIRE" for order in orders), 8)
         self.assertEqual(sum(order[0] == "SELL" for order in orders), 1)
+        self.assertEqual(result.diagnostics["executed_hires"], 9)
+        self.assertEqual(result.diagnostics["hire_expenditure"], 88)
+        self.assertEqual(result.diagnostics["hire_timing"][0],
+                         {"step": state.step, "count": 8, "expenditure": 54})
         staged = compile_skeleton(problem, replace(skeleton, hire_caps=(3,)))
         self.assertEqual(sum(order[0] == "HIRE"
                              for order in staged.executions[0].market_orders), 3)
@@ -206,6 +228,40 @@ class RouteCompilerTests(unittest.TestCase):
         goal = next(goal for goal, owner in problem.goal_entity.items() if owner == entity)
         rebuilt = _ruin_recreate(problem, incomplete, Random(0), focus_goals=(goal,))
         self.assertEqual(sum(goal in route for route in rebuilt.routes), 1)
+
+    def test_open_placement_reconstruction_uses_augmenting_displacement(self):
+        state = state_at(hour=20, money=100, seeds={"WHEAT": 3})
+        plan = work_plan(state, [
+            ("broad", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+            ("medium", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+            ("narrow", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+        ], {"broad": ((4, 4), (3, 4), (5, 4)),
+            "medium": ((4, 4), (3, 4)), "narrow": ((4, 4),)})
+        plan = replace(plan, selected=tuple(replace(item, kind="CROP")
+                                            for item in plan.obligations), obligations=())
+        problem = build_route_problem(state, plan)
+        skeleton = initial_skeleton(problem, workforce=2)
+        self.assertLess(len(skeleton.placements), len(problem.intent.entities))
+        rebuilt = _reconstruct_open_placement_matching(problem, skeleton, Random(0))
+        self.assertEqual(len(rebuilt.placements), len(problem.intent.entities))
+        self.assertEqual(len(set(rebuilt.placements.values())), 3)
+
+    def test_staffing_compression_preserves_identical_goal_set(self):
+        positions = ((4, 4), (4, 5), (5, 4))
+        state = state_at(hour=18, money=20,
+                         tiles={position: crop() for position in positions})
+        plan = work_plan(state, [(f"crop-{n}", position, ("WATER",), {})
+                                 for n, position in enumerate(positions)])
+        problem = build_route_problem(state, plan)
+        skeleton = initial_skeleton(problem, workforce=2)
+        original = compile_skeleton(problem, skeleton)
+        compressed = [compile_skeleton(problem, candidate)
+                      for candidate in _compress_workforce_frontier(
+                          problem, skeleton, limit=6)]
+        self.assertTrue(any(result.completed == original.completed
+                            and result.diagnostics["workforce"] == 1
+                            and result.diagnostics["hire_expenditure"] == 0
+                            for result in compressed))
 
 
 if __name__ == "__main__":

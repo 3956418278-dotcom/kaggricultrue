@@ -417,8 +417,8 @@ def with_initial_logistics(problem: RouteProblem, skeleton: RouteSkeleton) -> Ro
 
 def _required_operating_cash(problem: RouteProblem, skeleton: RouteSkeleton):
     state = problem.intent.state
-    cost = sum(rules.fibonacci_hire_cost(state.hires_today+n)
-               for n in range(max(0, skeleton.workforce-len(state.workers))))
+    cost = rules.hire_expenditure(
+        state.hires_today, max(0, skeleton.workforce-len(state.workers)))
     for order in skeleton.acquisitions.values():
         operation, item, quantity = order
         if operation == "BUY_SEED":
@@ -521,7 +521,7 @@ def initial_skeleton(problem: RouteProblem, workforce: int | None = None) -> Rou
                       *(f"BUY:{item}" for item in purchases),
                       *(f"LAND:{quadrant}" for quadrant in problem.intent.land)])
     hire_count = max(0, workforce-len(state.workers))
-    hire_cost = sum(rules.fibonacci_hire_cost(state.hires_today+n) for n in range(hire_count))
+    hire_cost = rules.hire_expenditure(state.hires_today, hire_count)
     sellable = any(state.shed.get(item, 0) for item in rules.SELLABLE_PRODUCTS)
     # Selling remains market-owned. Reserve one entry only when opening cash
     # cannot finance the selected staffing and an actual sale can change that.

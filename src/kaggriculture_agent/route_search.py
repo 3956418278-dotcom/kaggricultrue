@@ -23,7 +23,9 @@ class RouteSearchConfig:
     population: int = 48
     exact_candidates: int = 18
     refinement_candidates: int = 4
-    repair_rounds: int = 2
+    repair_rounds: int = 6
+    compression_rounds: int = 8
+    compression_candidates: int = 8
     ruin_probability: float = .10
     random_seed: int = 0
 
@@ -110,7 +112,7 @@ def _liquid_value(state):
 
 def result_score(result):
     d = result.diagnostics
-    return (len(result.completed), _liquid_value(result.final_state),
+    return (len(result.completed), -d["hire_expenditure"], _liquid_value(result.final_state),
             -d["used_worker_turns"], -d["movement"], -d["logistics"], -d["workforce"])
 
 
@@ -206,8 +208,15 @@ def _abstract_schedule(problem, skeleton):
             lateness += finish[goal]-deadline
     completed += sum(q in problem.intent.state.unlocked_quadrants for q in problem.intent.land)
     makespan = max(finish.values(), default=0)
+    hire_cost = rules.hire_expenditure(
+        problem.intent.state.hires_today,
+        max(0, skeleton.workforce-len(problem.intent.state.workers)))
+    # Lateness/overrun describe unrealized Plan feasibility, so they remain
+    # part of the primary completion tier. This approximation must preserve
+    # route basins for exact economic evaluation; putting Fibonacci cost ahead
+    # of its imperfect movement estimate can prune a reachable full Plan.
     return (-int(cycle), completed, -lateness, -max(0, makespan-(horizon-1)),
-            -total_movement, -logistics_count, -skeleton.workforce)
+            -total_movement, -logistics_count, -hire_cost, -skeleton.workforce)
 
 
 def _relocate_event(skeleton, rng):
@@ -275,13 +284,17 @@ def _resize_workforce(problem, skeleton, rng):
         for goal in abandoned:
             target = min(range(len(routes)), key=lambda w: (len(routes[w]), w))
             routes[target].insert(rng.randrange(len(routes[target])+1), goal)
+        preference = remove-len(state.workers)
+        preferences = list(skeleton.spawn_preferences)
+        if 0 <= preference < len(preferences):
+            preferences.pop(preference)
         return replace(skeleton, workforce=skeleton.workforce-1,
                        routes=tuple(tuple(r) for r in routes),
-                       spawn_preferences=skeleton.spawn_preferences[:-1])
+                       spawn_preferences=tuple(preferences))
     event_count = sum(map(len, skeleton.routes))
     if skeleton.workforce >= max(len(state.workers), event_count): return skeleton
     hires = skeleton.workforce-len(state.workers)
-    spent = sum(rules.fibonacci_hire_cost(state.hires_today+n) for n in range(max(0, hires+1)))
+    spent = rules.hire_expenditure(state.hires_today, max(0, hires+1))
     if spent > realizable_opening_cash(state): return skeleton
     routes = [list(r) for r in skeleton.routes] + [[]]
     source = max(range(len(routes)-1), key=lambda w: len(routes[w]))
@@ -331,7 +344,7 @@ def _change_spawn_preference(problem, skeleton, rng):
 def _change_market_cap(problem, skeleton, rng):
     state = problem.intent.state
     hire_count = max(0, skeleton.workforce-len(state.workers))
-    hire_cost = sum(rules.fibonacci_hire_cost(state.hires_today+n) for n in range(hire_count))
+    hire_cost = rules.hire_expenditure(state.hires_today, hire_count)
     if hire_cost <= state.money or not any(state.shed.get(item, 0) for item in rules.SELLABLE_PRODUCTS):
         return skeleton
     current = skeleton.required_entry_caps[0] if skeleton.required_entry_caps else rules.MAX_MARKET_ORDERS
@@ -411,7 +424,7 @@ def _route_service_cost(start, route, positions):
     return cost
 
 
-def _ruin_recreate(problem, skeleton, rng, focus_goals=()):
+def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
     """Remove a related set of work and jointly rebuild its assignment/order.
 
     The ordinary mutations change one event, one entity, or two suffixes.  That
@@ -489,7 +502,7 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=()):
 
     # Entity blocks preserve cheap coherent visits; atomic rounds deliberately
     # admit split service chains and same-turn multiworker realization.
-    atomic = rng.random() < .4
+    atomic = rng.random() < .4 if atomic is None else atomic
     if atomic:
         units = [(event.goal,) for entity in sorted(ruined_entities) for event in paths[entity]]
     else:
@@ -593,6 +606,112 @@ def _worker_starts(problem, skeleton):
     return tuple(starts[:skeleton.workforce])
 
 
+def _reconstruct_open_placement_matching(problem, skeleton, rng):
+    """Find a complete matching for coupled open placement domains.
+
+    Greedily moving one asset cannot repair nested domains: the desired tile
+    may be occupied by another new asset which itself has alternatives. This
+    augmenting-path reconstruction considers every domain edge and displaces
+    earlier assignments when necessary. Existing assets that are not released
+    by today's selected path remain fixed.
+    """
+    paths = selected_paths(problem, skeleton)
+    entities = {entity.identifier: entity for entity in problem.intent.entities}
+    new = [entity for entity in problem.intent.entities
+           if not entity.existing and paths[entity.identifier]]
+    fixed = set()
+    for entity in problem.intent.entities:
+        if not entity.existing or entity.identifier not in skeleton.placements:
+            continue
+        if _released_by(paths[entity.identifier]) is None:
+            fixed.add(skeleton.placements[entity.identifier])
+
+    candidates = {}
+    for entity in new:
+        positions = [position for position in entity.positions if position not in fixed]
+        positions.sort(key=lambda position: (
+            int(position != skeleton.placements.get(entity.identifier)),
+            rules.distance_to_shed(position)*max(1, entity.future_service_days),
+            rng.random(), position))
+        candidates[entity.identifier] = positions
+    order = sorted((entity for entity in new
+                    if entity.identifier not in skeleton.placements), key=lambda entity: (
+        len(candidates[entity.identifier]), -entity.future_service_days,
+        -len(entity.goals), entity.identifier))
+    occupant = {position: entity.identifier for entity in new
+                for position in (skeleton.placements.get(entity.identifier),)
+                if position is not None and position not in fixed}
+
+    def assign(identifier, seen):
+        for position in candidates[identifier]:
+            if position in seen:
+                continue
+            seen.add(position)
+            other = occupant.get(position)
+            if other is None or assign(other, seen):
+                occupant[position] = identifier
+                return True
+        return False
+
+    for entity in order:
+        if not assign(entity.identifier, set()):
+            return skeleton
+    placements = dict(skeleton.placements)
+    placements.update({identifier: position for position, identifier in occupant.items()})
+    routes = tuple(tuple(token for token in route if token not in skeleton.logistics)
+                   for route in skeleton.routes)
+    return replace(skeleton, placements=placements, routes=routes, logistics={})
+
+
+def _compress_workforce_frontier(problem, skeleton, limit):
+    """Reconstruct hired-worker routes after removing one paid hand.
+
+    A full realization used to be terminal for exact repair, so excess hands
+    survived even when their work could be absorbed by a different assignment
+    and ordering.  Each candidate here removes a real hired worker and lets the
+    same regret-based ruin/recreate machinery jointly rebuild that worker's
+    entities with neighboring work. Exact transition replay decides whether
+    Plan quality was preserved.
+    """
+    state = problem.intent.state
+    if skeleton.workforce <= len(state.workers) or not limit:
+        return []
+    proposals = {}
+    hired = range(len(state.workers), skeleton.workforce)
+    # Least loaded hands are the obvious compression basins, but every hired
+    # worker remains reachable when the limit permits it.
+    ranked_hands = sorted(hired, key=lambda worker: (
+        sum(token in problem.goals for token in skeleton.routes[worker]),
+        len(skeleton.routes[worker]), worker))[:max(4, limit*2)]
+    for remove in ranked_hands:
+        removed_goals = tuple(token for token in skeleton.routes[remove]
+                              if token in problem.goals)
+        routes = [tuple(token for token in route if token not in skeleton.logistics)
+                  for route in skeleton.routes]
+        routes.pop(remove)
+        preferences = list(skeleton.spawn_preferences)
+        preference = remove-len(state.workers)
+        if 0 <= preference < len(preferences):
+            preferences.pop(preference)
+        reduced = replace(skeleton, workforce=skeleton.workforce-1,
+                          routes=tuple(routes), spawn_preferences=tuple(preferences),
+                          logistics={})
+        repair_seed = (state.step*1_000_003 + remove*1009
+                       + sum(sum(map(ord, goal)) for goal in removed_goals))
+        # Distinct regret tie-break basins matter: on dense development days
+        # the first successful ejection chains occur beyond offsets 0/1.
+        trials = 4
+        for offset in range(trials):
+            try:
+                trial = _ruin_recreate(problem, reduced,
+                    Random(repair_seed+offset), focus_goals=removed_goals)
+                trial = normalize(problem, trial)
+                proposals[skeleton_key(trial)] = (_abstract_schedule(problem, trial), trial)
+            except (ValueError, IndexError):
+                continue
+    return [trial for _, trial in sorted(proposals.values(), key=lambda row: row[0], reverse=True)[:limit]]
+
+
 MUTATIONS = (_relocate_event, _relocate_entity, _cross_exchange, _change_path,
              _change_placement, _resize_workforce, _change_sync,
              _change_market_priority, _change_resource_source, _move_logistics,
@@ -633,6 +752,7 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
     paths = selected_paths(problem, skeleton)
     entities = {work.identifier: work for work in problem.intent.entities}
     proposals = {}
+    placement_proposals = {}
     market_repairs = []
     for purchase, missing_quantity in result.diagnostics.get("unbought_inputs", {}).items():
         token = f"BUY:{purchase}"
@@ -668,14 +788,37 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
         # day-start state, so every selected effect must remain represented.
         block = [event.goal for event in path]
         unfinished_blocks.append(tuple(block))
+        work = entities[entity]
         source = next((worker for worker, route in enumerate(skeleton.routes)
                        if any(goal in route for goal in block)), None)
-        if source is None: continue
-        work = entities[entity]
-        if not work.existing and len(work.positions) > 1:
+        # An open lifecycle can be absent from both placement and routes when
+        # nested placement domains defeated a greedy binding. Reconstruct the
+        # whole open-asset matching, then jointly rebuild the missing lifecycle
+        # and its neighboring assignments. This searches coupled displacements
+        # instead of repeatedly colliding with the same occupied tile.
+        if not work.existing and entity not in skeleton.placements:
+            placement_seed = (problem.intent.state.step*1_000_003
+                              + sum(map(ord, entity)))
+            for offset in range(max(4, limit*2)):
+                placement_rng = Random(placement_seed+offset)
+                try:
+                    placed = _reconstruct_open_placement_matching(
+                        problem, skeleton, placement_rng)
+                    trial = _ruin_recreate(
+                        problem, placed, placement_rng, focus_goals=block)
+                    trial = normalize(problem, trial)
+                    key = skeleton_key(trial)
+                    row = (_abstract_schedule(problem, trial), trial)
+                    proposals[key] = row
+                    placement_proposals[key] = row
+                except (ValueError, IndexError):
+                    continue
+        elif not work.existing and len(work.positions) > 1:
             for position in work.positions:
-                if position == skeleton.placements.get(entity): continue
-                placements = dict(skeleton.placements); placements[entity] = position
+                if position == skeleton.placements.get(entity):
+                    continue
+                placements = dict(skeleton.placements)
+                placements[entity] = position
                 try:
                     trial = normalize(problem, replace(
                         skeleton, placements=placements,
@@ -686,6 +829,8 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                     proposals[key] = (_abstract_schedule(problem, trial), trial)
                 except (ValueError, IndexError):
                     continue
+        if source is None:
+            continue
         base_routes = [[token for token in route
                         if token not in skeleton.logistics and token not in block]
                        for route in skeleton.routes]
@@ -793,7 +938,12 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
     # observed deficits are primarily route tails, and those alternatives must
     # still receive exact transition evaluation.
     result_frontier = list(market_repairs[:min(2, max(1, limit//3))])
-    if redistributed is not None:
+    placement_ranked = sorted(placement_proposals.values(),
+                              key=lambda row: row[0], reverse=True)
+    result_frontier.extend(trial for _, trial in placement_ranked[:limit]
+                           if skeleton_key(trial) not in {
+                               skeleton_key(item) for item in result_frontier})
+    if redistributed is not None and len(result_frontier) < limit:
         result_frontier.append(redistributed)
     present = {skeleton_key(trial) for trial in result_frontier}
     result_frontier.extend(trial for _, trial in ranked
@@ -910,6 +1060,7 @@ def solve_routes(state, plan, config=None, progress=None):
         result = compile_skeleton(problem, base)
         exact_rows = [(result_score(result), skeleton_key(base), base, result)]
     exact_rows.sort(key=lambda row: row[0], reverse=True)
+    exact_evaluated = {row[1] for row in exact_rows}
     initial_exact_score = next(row[0] for row in exact_rows if row[1] == skeleton_key(base))
 
     # One exact-feedback neighborhood lets approximation errors be repaired
@@ -926,14 +1077,18 @@ def solve_routes(state, plan, config=None, progress=None):
             basins.append(row); basin_workforces.add(workforce)
             if len(basins) >= min(5, len(exact_rows)):
                 break
-        per_basin = max(2, (config.refinement_candidates+len(basins)-1)//len(basins))
+        # The diagnosed dense-day tails require several distinct ejection and
+        # ordering basins; two candidates repeatedly excluded feasible repairs.
+        per_basin = max(4, (config.refinement_candidates+len(basins)-1)//len(basins))
         for _, _, basin, basin_result in basins:
-            for candidate in _exact_repair_frontier(
-                    problem, basin, basin_result, per_basin):
+            candidates = _exact_repair_frontier(
+                problem, basin, basin_result, per_basin)
+            for candidate in candidates:
                 try:
                     key = skeleton_key(candidate)
-                    if key in seen: continue
+                    if key in exact_evaluated: continue
                     seen.add(key)
+                    exact_evaluated.add(key)
                     repaired = compile_skeleton(problem, candidate)
                     added.append((result_score(repaired), key, candidate, repaired))
                 except (ValueError, IndexError):
@@ -941,12 +1096,54 @@ def solve_routes(state, plan, config=None, progress=None):
         if not added: break
         refinement.extend(added); exact_rows.extend(added)
         exact_rows.sort(key=lambda row: row[0], reverse=True)
+        if (not exact_rows[0][3].unfulfilled
+                and not exact_rows[0][3].diagnostics.get("unlocked_land_missing")):
+            break
+
+    # Staffing economics is optimized only inside the best realized Plan
+    # quality. Removing a hand triggers joint reconstruction of its work; a
+    # cheaper result is retained only when it realizes the identical goal set
+    # and land objective, so capacity savings can never buy silent Plan loss.
+    compression = []
+    compression_attempted = 0
+    incumbent = exact_rows[0]
+    for _ in range(config.compression_rounds):
+        _, _, incumbent_skeleton, incumbent_result = incumbent
+        added = []
+        for candidate in _compress_workforce_frontier(
+                problem, incumbent_skeleton, config.compression_candidates):
+            try:
+                key = skeleton_key(candidate)
+                if key in exact_evaluated:
+                    continue
+                seen.add(key)
+                exact_evaluated.add(key)
+                compression_attempted += 1
+                compressed = compile_skeleton(problem, candidate)
+                if (compressed.completed != incumbent_result.completed
+                        or compressed.diagnostics.get("unlocked_land_missing")
+                           != incumbent_result.diagnostics.get("unlocked_land_missing")):
+                    continue
+                row = (result_score(compressed), key, candidate, compressed)
+                if row[0] > incumbent[0]:
+                    added.append(row)
+            except (ValueError, IndexError):
+                invalid += 1
+        if not added:
+            break
+        incumbent = max(added, key=lambda row: row[0])
+        compression.extend(added)
+        exact_rows.extend(added)
+        exact_rows.sort(key=lambda row: row[0], reverse=True)
     score, _, skeleton, result = exact_rows[0]
     diagnostics = {**result.diagnostics,
         "search_iterations": config.iterations, "search_generated": generated,
         "search_accepted": accepted, "search_invalid": invalid,
-        "search_exact_evaluations": len(exact_pool)+len(refinement),
+        "search_exact_evaluations": len(exact_pool)+len(refinement)+compression_attempted,
         "search_refinement_scores": tuple(row[0] for row in refinement),
+        "staffing_compression_evaluations": len(compression),
+        "staffing_compression_attempts": compression_attempted,
+        "staffing_compression_rounds": len({row[2].workforce for row in compression}),
         "search_seconds": perf_counter()-started,
         "search_improved_start": score > initial_exact_score,
         "search_score": score,
