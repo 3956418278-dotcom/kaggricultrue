@@ -17,6 +17,15 @@ Official executable source outranks prose when they disagree about game behavior
 
 ## Selected public references
 
+### Operations-research formulation sources
+
+| Source | Exact identity inspected | Role and limitations |
+| --- | --- | --- |
+| [Ropke and Pisinger, “An Adaptive Large Neighborhood Search Heuristic for the Pickup and Delivery Problem with Time Windows”](https://doi.org/10.1287/trsc.1050.0135) | *Transportation Science* 40(4), 2006 | Established destroy/recreate and adaptive LNS organization for integrated assignment and route order. It supplies a formulation pattern, not evidence for this game solver. |
+| [Hojabri et al., “Large neighborhood search with constraint programming for a vehicle routing problem with synchronization constraints”](https://doi.org/10.1016/j.cor.2017.11.011) | *Computers & Operations Research* 92, 2018 | Established LNS plus constraint-based synchronization pattern for coupled routes. Game semantics still come only from the pinned executable environment. |
+| [OR-Tools minimum-cost flow guide](https://developers.google.com/optimization/flow/mincostflow) | Official OR-Tools documentation inspected 2026-09-08 | Reference for retaining node-arc conservation structure in the conditional material model. Fixed-charge and timing couplings require a mixed-integer extension. |
+| [Hooker, “Planning and Scheduling by Logic-Based Benders Decomposition”](https://doi.org/10.1287/opre.1060.0371) | *Operations Research* 55(3), 2007 | Decomposition precedent for a structural master and a scheduling/feasibility subproblem with conflict information. It does not imply convergence or optimality of the bounded LNS implementation. |
+
 ### Player-day reference sources
 
 | Source | Inspected identity | Role and limitations |

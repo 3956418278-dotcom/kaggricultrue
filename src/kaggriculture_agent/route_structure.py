@@ -1,7 +1,9 @@
-"""Event-route representation for one fixed Daily Plan.
+"""Event-route representations for one fixed Daily Plan.
 
-This module owns combinatorial realization choices.  It deliberately contains
-no turn-by-turn movement expansion: that belongs to ``route_compiler``.
+``RouteStructure`` is the optimization state: workforce, assignment/order, and
+open placement only. ``RouteSkeleton`` is the compiler input after the
+conditional support solver has derived local service modes, resources, market
+support, synchronization, and logistics.
 """
 from __future__ import annotations
 
@@ -62,8 +64,17 @@ class LogisticsEvent:
 
 
 @dataclass(frozen=True)
+class RouteStructure:
+    """The variables owned by fixed-workforce structural search."""
+
+    workforce: int
+    routes: tuple[tuple[str, ...], ...]
+    placements: Mapping[str, tuple[int, int]]
+
+
+@dataclass(frozen=True)
 class RouteSkeleton:
-    """All choices that can materially alter the executable realization."""
+    """A complete support realization accepted by the exact compiler."""
 
     workforce: int
     routes: tuple[tuple[str, ...], ...]

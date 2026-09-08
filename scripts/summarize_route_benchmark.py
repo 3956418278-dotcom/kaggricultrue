@@ -51,13 +51,11 @@ def main():
                 "candidate_vs_controlled_reference"],
             "equal_goal_set_realization_comparison": result.get(
                 "equal_goal_set_realization_comparison"),
-            "search_seconds": result["candidate"]["diagnostics"]["search_seconds"],
+            "search_seconds": result["candidate"]["diagnostics"]["elapsed_seconds"],
             "exact_compilations": result["candidate"]["diagnostics"].get(
-                "search_exact_evaluations", 0),
+                "structural_evaluations", 0),
             "workforce_basins": result["candidate"]["diagnostics"].get(
-                "search_workforce_basins", []),
-            "exact_feedback_evaluations": result["candidate"]["diagnostics"].get(
-                "search_feedback_evaluations", 0),
+                "workforce_basins", {}),
             "patterns": present,
         })
     equal_rows = [row for row in rows if row["same_reference_goal_set"]]
@@ -120,8 +118,6 @@ def main():
                                          / len(rows)),
             "max_exact_compilations": max(row["exact_compilations"] for row in rows),
             "total_exact_compilations": sum(row["exact_compilations"] for row in rows),
-            "exact_feedback_evaluations": sum(
-                row["exact_feedback_evaluations"] for row in rows),
             "equal_goal_same_asset_multiset": sum(
                 row["candidate_vs_reference_state"]["same_asset_multiset"]
                 for row in equal_rows),

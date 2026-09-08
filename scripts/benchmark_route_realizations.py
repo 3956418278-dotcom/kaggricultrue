@@ -23,11 +23,12 @@ def main():
     parser.add_argument("--episode-ids", nargs="+",
                         help="explicit development episode ids (overrides --episode-limit)")
     parser.add_argument("--days", type=int, nargs="+", default=[0, 8, 16, 24, 29])
-    parser.add_argument("--iterations", type=int, default=300)
-    parser.add_argument("--exact-candidates", type=int, default=18)
-    parser.add_argument("--refinement-candidates", type=int, default=4)
-    parser.add_argument("--max-exact-evaluations", type=int, default=32)
-    parser.add_argument("--ruin-probability", type=float, default=.35)
+    parser.add_argument("--structural-evaluations", type=int, default=96)
+    parser.add_argument("--basin-probe-evaluations", type=int, default=16)
+    parser.add_argument("--basin-refinement-evaluations", type=int, default=32)
+    parser.add_argument("--max-workforce-challengers", type=int, default=3)
+    parser.add_argument("--destroy-fraction", type=float, default=.30)
+    parser.add_argument("--support-time-limit-seconds", type=float, default=.20)
     args = parser.parse_args()
     files = sorted(args.samples.glob("episode-*.jsonl.gz"))
     if not files:
@@ -48,17 +49,20 @@ def main():
                          if member["partition"] == "development"),
                         key=lambda episode: sha256(
                             f"temporal-development-order:{episode}".encode()).hexdigest())[:args.episode_limit]
-    config = RouteSearchConfig(iterations=args.iterations,
-                               exact_candidates=args.exact_candidates,
-                               refinement_candidates=args.refinement_candidates,
-                               max_exact_evaluations=args.max_exact_evaluations,
-                               ruin_probability=args.ruin_probability)
+    config = RouteSearchConfig(
+        structural_evaluations=args.structural_evaluations,
+        basin_probe_evaluations=args.basin_probe_evaluations,
+        basin_refinement_evaluations=args.basin_refinement_evaluations,
+        max_workforce_challengers=args.max_workforce_challengers,
+        destroy_fraction=args.destroy_fraction,
+        support_time_limit_seconds=args.support_time_limit_seconds,
+    )
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {
         "split_rule": "sha256(temporal-reference-split-20260906:<episode>) mod 5; zero held-out",
         "chosen_episodes": chosen, "members": members, "days": args.days,
         "configuration": asdict(config), "evidence": "development-only",
-        "candidate": "event-route structural search plus exact transition compilation",
+        "candidate": "fixed-workforce event LNS plus conditional resource flow and exact compilation",
         "sources": source_identity(),
     }
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2)+"\n")
@@ -76,9 +80,8 @@ def main():
                    "candidate_completion": result["candidate"]["completed"],
                    "structural_patterns": result["structural_patterns"],
                    "diagnostics": {key: result["candidate"]["diagnostics"].get(key)
-                                   for key in ("search_seconds", "search_generated",
-                                               "search_exact_evaluations", "search_improved_start",
-                                               "search_economic_state_value")}}
+                                   for key in ("elapsed_seconds", "structural_evaluations",
+                                               "selected_workforce", "workforce_basins")}}
             rows.append(row)
             print(json.dumps(row), flush=True)
     patterns = sorted({pattern for row in rows
@@ -125,7 +128,7 @@ def main():
                 for row in rows),
         },
         "structural_pattern_frequency_and_representation_impact": pattern_summary,
-        "max_search_seconds": max((row["diagnostics"]["search_seconds"] for row in rows), default=0),
+        "max_search_seconds": max((row["diagnostics"]["elapsed_seconds"] for row in rows), default=0),
     }
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2)+"\n")
     print(json.dumps(summary))

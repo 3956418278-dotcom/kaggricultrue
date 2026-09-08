@@ -3,6 +3,13 @@
 Status: development decision record. This document compares representations; it
 does not establish planner quality or promote a submission path.
 
+The original Candidate A search decomposition below has been superseded by
+[`route-solver-decomposition.md`](route-solver-decomposition.md).  The retained
+representation findings still apply, but resource sources and logistics are now
+a conditional compact flow/scheduling subproblem rather than peer LNS mutation
+variables.  Workforce is solved in independent outer basins, and structural
+candidate admission uses exact compilation rather than an abstract population.
+
 ## Fixed problem boundary
 
 The runtime direction is:
