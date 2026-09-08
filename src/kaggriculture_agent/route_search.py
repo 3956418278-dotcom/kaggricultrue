@@ -13,7 +13,8 @@ from .route_structure import (
     ResourceLink, RouteSkeleton, SyncBundle, TileLease, build_route_problem,
     event_positions, event_predecessors, initial_resources, initial_routes,
     initial_skeleton,
-    realizable_opening_cash, selected_events, selected_paths, with_initial_logistics,
+    realizable_opening_cash, route_precedence_feasible, selected_events,
+    selected_paths, validate_skeleton, with_initial_logistics,
     with_financing_logistics,
 )
 
@@ -76,19 +77,150 @@ def _market_priority(problem, skeleton):
 
 
 def normalize(problem, skeleton):
-    """Recompute consequences of changed routes without changing their choices."""
-    routes = tuple(tuple(token for token in route if token not in skeleton.logistics)
-                   for route in skeleton.routes)
-    shell = replace(skeleton, routes=routes, logistics={})
-    leases = rebuild_leases(problem, shell)
-    shell = replace(shell, leases=leases, resources=())
-    resources = initial_resources(problem, shell)
+    """Refresh only derived tile leases; preserve realization choices verbatim.
+
+    Resource sources, acquisition batches, logistics placement and market order
+    are searched decisions.  Reconstructing those fields here made an unrelated
+    mutation evaluate a different candidate.  Route-changing operators use the
+    explicit ``_rebuild_route_support`` boundary below when their edit really
+    invalidates dependent execution structure.
+    """
+    return replace(skeleton, leases=rebuild_leases(problem, skeleton))
+
+
+def _acquisition_item(order):
+    operation, item, _ = order
+    return f"{item}_SEED" if operation == "BUY_SEED" else item
+
+
+def _reconcile_acquisitions(resources, acquisitions):
+    """Preserve purchase batching/order while matching current resource links."""
+    from .route_compiler import purchase_orders_for_links
+
+    required = purchase_orders_for_links(resources)
+    remaining = {item: int(order[2]) for item, order in required.items()}
+    result = {}
+    for key, order in acquisitions.items():
+        item = _acquisition_item(order)
+        quantity = min(int(order[2]), remaining.get(item, 0))
+        if quantity <= 0:
+            continue
+        result[key] = (order[0], order[1], quantity)
+        remaining[item] -= quantity
+    for item, quantity in remaining.items():
+        if quantity <= 0:
+            continue
+        operation, product, _ = required[item]
+        key = item
+        suffix = 1
+        while key in result:
+            key = f"{item}:remainder:{suffix}"
+            suffix += 1
+        result[key] = (operation, product, quantity)
+    return result
+
+
+def _reconcile_market_priority(problem, before, skeleton):
+    """Keep the searched relative order and append only newly required tokens."""
+    state = problem.intent.state
+    required = tuple([
+        *(f"HIRE:{n}" for n in range(max(0, skeleton.workforce-len(state.workers)))),
+        *(f"BUY:{key}" for key in skeleton.acquisitions),
+        *(f"LAND:{quadrant}" for quadrant in problem.intent.land),
+    ])
+    needed = set(required)
+    retained = [token for token in before.market_priority if token in needed]
+    retained.extend(token for token in required if token not in retained)
+    return tuple(retained)
+
+
+def _resource_choices_compatible(problem, before, skeleton):
+    """Whether all previous source choices remain meaningful after a route edit."""
+    events = selected_events(problem, skeleton)
+    routed = {token for route in skeleton.routes for token in route}
+    route_of = {token: worker for worker, route in enumerate(skeleton.routes)
+                for token in route}
+    order = {token: at for route in skeleton.routes for at, token in enumerate(route)}
+    needs = Counter()
+    for goal, event in events.items():
+        if goal not in routed:
+            continue
+        for item, quantity in event.delta.items():
+            if quantity < 0:
+                needs[goal, item] += -quantity
+    supplied = Counter()
+    for link in before.resources:
+        if link.consumer not in routed or link.consumer not in events:
+            return False
+        supplied[link.consumer, link.item] += link.quantity
+        if link.kind == "CARRY" and link.source_worker != route_of[link.consumer]:
+            return False
+        if link.kind == "EVENT":
+            producer = events.get(link.producer)
+            if producer is None or producer.delta.get(link.item, 0) <= 0:
+                return False
+            if (not link.via_shed
+                    and (route_of.get(link.producer) != route_of[link.consumer]
+                         or order.get(link.producer, 10**9) >= order[link.consumer])):
+                return False
+    if supplied != needs:
+        return False
+    trial = replace(skeleton, resources=before.resources)
+    return route_precedence_feasible(problem, trial)
+
+
+def _restore_compatible_logistics(problem, before, rebuilt):
+    """Retain explicit logistics ordering when its semantic event is unchanged."""
+    common = {token for token, event in rebuilt.logistics.items()
+              if before.logistics.get(token) == event}
+    if not common:
+        return rebuilt
+    old_worker = {token: worker for worker, route in enumerate(before.routes)
+                  for token in route}
+    routes = [list(route) for route in rebuilt.routes]
+    new_worker = {token: worker for worker, route in enumerate(routes) for token in route}
+    for token in sorted(common, key=lambda item: (
+            old_worker.get(item, 10**9),
+            before.routes[old_worker[item]].index(item) if item in old_worker else 10**9,
+            item)):
+        worker = new_worker.get(token)
+        if worker is None or worker != old_worker.get(token):
+            continue
+        routes[worker].remove(token)
+        old_route = before.routes[worker]
+        old_at = old_route.index(token)
+        following = next((item for item in old_route[old_at+1:]
+                          if item in routes[worker] and item not in before.logistics), None)
+        prior = next((item for item in reversed(old_route[:old_at])
+                      if item in routes[worker] and item not in before.logistics), None)
+        if following is not None:
+            at = routes[worker].index(following)
+        elif prior is not None:
+            at = routes[worker].index(prior)+1
+        else:
+            at = len(routes[worker])
+        routes[worker].insert(at, token)
+        new_worker[token] = worker
+    candidate = replace(rebuilt, routes=tuple(tuple(route) for route in routes))
+    return candidate if route_precedence_feasible(problem, candidate) else rebuilt
+
+
+def _rebuild_route_support(problem, before, candidate):
+    """Reconcile only choices that depend on a changed route/path/workforce."""
+    service_routes = tuple(tuple(token for token in route
+                                 if token not in before.logistics)
+                           for route in candidate.routes)
+    shell = replace(candidate, routes=service_routes, logistics={})
+    shell = replace(shell, leases=rebuild_leases(problem, shell))
+    resources = (before.resources if _resource_choices_compatible(problem, before, shell)
+                 else initial_resources(problem, shell))
     shell = replace(shell, resources=resources)
     shell = with_initial_logistics(problem, shell)
-    from .route_compiler import purchase_orders_for_links
-    shell = replace(shell, acquisitions=purchase_orders_for_links(resources))
-    shell = replace(shell, market_priority=_market_priority(problem, shell))
-    return with_financing_logistics(problem, shell)
+    acquisitions = _reconcile_acquisitions(resources, before.acquisitions)
+    shell = replace(shell, acquisitions=acquisitions)
+    shell = replace(shell, market_priority=_reconcile_market_priority(problem, before, shell))
+    shell = with_financing_logistics(problem, shell)
+    return _restore_compatible_logistics(problem, before, shell)
 
 
 def skeleton_key(skeleton):
@@ -231,17 +363,17 @@ def _abstract_schedule(problem, skeleton):
             -total_movement, -logistics_count)
 
 
-def _relocate_event(skeleton, rng):
+def _relocate_event(problem, skeleton, rng):
     nonempty = [w for w, route in enumerate(skeleton.routes)
                 if any(token not in skeleton.logistics for token in route)]
     if not nonempty: return skeleton
     source = rng.choice(nonempty); route = list(skeleton.routes[source])
     choices = [n for n, token in enumerate(route) if token not in skeleton.logistics]
     goal = route.pop(rng.choice(choices))
-    target = rng.randrange(skeleton.workforce); other = list(skeleton.routes[target])
-    other.insert(rng.randrange(len(other)+1), goal)
     routes = [list(r) for r in skeleton.routes]
-    routes[source], routes[target] = route, other
+    routes[source] = route
+    target = rng.randrange(skeleton.workforce)
+    routes[target].insert(rng.randrange(len(routes[target])+1), goal)
     return replace(skeleton, routes=tuple(tuple(r) for r in routes))
 
 
@@ -256,7 +388,7 @@ def _relocate_entity(problem, skeleton, rng):
     return replace(skeleton, routes=tuple(tuple(r) for r in routes))
 
 
-def _cross_exchange(skeleton, rng):
+def _cross_exchange(problem, skeleton, rng):
     if skeleton.workforce < 2: return skeleton
     a, b = rng.sample(range(skeleton.workforce), 2)
     ra, rb = list(skeleton.routes[a]), list(skeleton.routes[b])
@@ -272,8 +404,21 @@ def _change_path(problem, skeleton, rng):
     entity = rng.choice(candidates); old = skeleton.path_choices.get(entity, 0)
     choices = [n for n in range(len(problem.complete_paths[entity])) if n != old]
     selected = rng.choice(choices)
+    old_goals = {event.goal for event in problem.complete_paths[entity][old]}
+    new_goals = tuple(event.goal for event in problem.complete_paths[entity][selected])
+    routes = [[token for token in route
+               if token not in old_goals and token not in skeleton.logistics]
+              for route in skeleton.routes]
+    old_workers = [worker for worker, route in enumerate(skeleton.routes)
+                   if any(goal in route for goal in old_goals)]
+    target = old_workers[0] if old_workers else rng.randrange(skeleton.workforce)
+    routes[target].extend(new_goals)
     path_choices = dict(skeleton.path_choices); path_choices[entity] = selected
-    return replace(skeleton, path_choices=path_choices)
+    synchronizations = tuple(bundle for bundle in skeleton.synchronizations
+                             if not (set(bundle.goals) & old_goals))
+    return replace(skeleton, routes=tuple(tuple(route) for route in routes),
+                   path_choices=path_choices, synchronizations=synchronizations,
+                   logistics={})
 
 
 def _change_placement(problem, skeleton, rng):
@@ -336,7 +481,7 @@ def _change_sync(problem, skeleton, rng):
     return replace(skeleton, synchronizations=tuple(bundles))
 
 
-def _change_market_priority(skeleton, rng):
+def _change_market_priority(problem, skeleton, rng):
     tokens = list(skeleton.market_priority)
     if len(tokens) < 2: return skeleton
     a, b = rng.sample(range(len(tokens)), 2); tokens[a], tokens[b] = tokens[b], tokens[a]
@@ -373,6 +518,7 @@ def _change_resource_source(problem, skeleton, rng):
     route_of = {goal: worker for worker, route in enumerate(skeleton.routes) for goal in route}
     order = {goal: n for route in skeleton.routes for n, goal in enumerate(route)}
     producers = [goal for goal, event in events.items() if event.delta.get(link.item, 0) > 0
+                 and event.delta.get(link.item, 0) >= link.quantity
                  and goal != link.consumer]
     if link.kind == "PURCHASE" and producers:
         producer = rng.choice(producers)
@@ -384,24 +530,33 @@ def _change_resource_source(problem, skeleton, rng):
                    for route in skeleton.routes)
     shell = replace(skeleton, routes=routes, logistics={}, resources=tuple(links))
     shell = with_initial_logistics(problem, shell)
-    from .route_compiler import purchase_orders_for_links
-    shell = replace(shell, acquisitions=purchase_orders_for_links(links))
-    shell = replace(shell, market_priority=_market_priority(problem, shell))
-    return with_financing_logistics(problem, shell)
+    shell = replace(shell, acquisitions=_reconcile_acquisitions(
+        links, skeleton.acquisitions))
+    shell = replace(shell, market_priority=_reconcile_market_priority(
+        problem, skeleton, shell))
+    shell = with_financing_logistics(problem, shell)
+    shell = _restore_compatible_logistics(problem, skeleton, shell)
+    return shell if route_precedence_feasible(problem, shell) else skeleton
 
 
-def _move_logistics(skeleton, rng):
+def _move_logistics(problem, skeleton, rng):
     workers = [worker for worker, route in enumerate(skeleton.routes)
                if any(token in skeleton.logistics for token in route)]
     if not workers: return skeleton
     worker = rng.choice(workers); route = list(skeleton.routes[worker])
     choices = [n for n, token in enumerate(route) if token in skeleton.logistics]
-    token = route.pop(rng.choice(choices)); route.insert(rng.randrange(len(route)+1), token)
-    routes = list(skeleton.routes); routes[worker] = tuple(route)
-    return replace(skeleton, routes=tuple(routes))
+    token = route.pop(rng.choice(choices))
+    alternatives = list(range(len(route)+1)); rng.shuffle(alternatives)
+    for at in alternatives:
+        trial_route = list(route); trial_route.insert(at, token)
+        routes = list(skeleton.routes); routes[worker] = tuple(trial_route)
+        trial = replace(skeleton, routes=tuple(routes))
+        if route_precedence_feasible(problem, trial):
+            return trial
+    return skeleton
 
 
-def _relocate_segment(skeleton, rng):
+def _relocate_segment(problem, skeleton, rng):
     candidates = [w for w, route in enumerate(skeleton.routes) if route]
     if not candidates: return skeleton
     source = rng.choice(candidates); route = list(skeleton.routes[source])
@@ -413,7 +568,7 @@ def _relocate_segment(skeleton, rng):
     return replace(skeleton, routes=tuple(tuple(r) for r in routes))
 
 
-def _reverse_segment(skeleton, rng):
+def _reverse_segment(problem, skeleton, rng):
     candidates = [w for w, route in enumerate(skeleton.routes) if len(route) >= 2]
     if not candidates: return skeleton
     worker = rng.choice(candidates); route = list(skeleton.routes[worker])
@@ -526,10 +681,11 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
     horizon = min(problem.intent.state.turns_left_today, problem.intent.state.turns_left)
 
     def capacity(worker):
+        support_margin = max(1, horizon//8)
         if worker < len(problem.intent.state.workers):
-            return horizon
+            return max(1, horizon-support_margin)
         hire_rank = worker-len(problem.intent.state.workers)
-        return max(0, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS)
+        return max(0, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS-support_margin)
 
     predecessor = event_predecessors(problem, skeleton)
     successors = defaultdict(set)
@@ -544,7 +700,6 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
         for worker in range(skeleton.workforce):
             route = routes[worker]
             indices = {goal: n for n, goal in enumerate(route)}
-            other_max = max((cost for w, cost in enumerate(current) if w != worker), default=0)
             other_overrun_max = max((value for w, value in enumerate(current_overruns) if w != worker),
                                     default=0)
             other_overrun_sum = sum(current_overruns)-current_overruns[worker]
@@ -567,14 +722,22 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
                                  if required in indices and indices[required] >= at)
                 inversions += sum(1 for goal in unit for following in successors.get(goal, ())
                                   if following in indices and indices[following] < at)
+                if inversions:
+                    continue
                 latest = max((problem.goals[goal].deadline for goal in unit),
                              default=problem.intent.state.step+horizon-1)
                 finish = problem.intent.state.step + trial_cost - 1
                 lateness = max(0, finish-latest)
-                key = (int(bool(inversions)), max(other_overrun_max, overrun),
-                       other_overrun_sum+overrun, lateness,
-                       max(other_max, trial_cost), total_cost-current[worker]+trial_cost,
-                       trial_cost-current[worker], worker, at)
+                revised_total = total_cost-current[worker]+trial_cost
+                revised_max = max((cost for w, cost in enumerate(current)
+                                   if w != worker), default=0)
+                revised_max = max(revised_max, trial_cost)
+                # Feasibility and deadlines come first. Among equally feasible
+                # insertions, total route cost—not artificial load balance—owns
+                # assignment; peak load is only a late tie-break.
+                key = (int(bool(max(other_overrun_max, overrun))),
+                       other_overrun_sum+overrun, lateness, revised_total,
+                       trial_cost-current[worker], revised_max, worker, at)
                 options.append((key, worker, at))
         options.sort()
         return options
@@ -585,11 +748,13 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
         choices = []
         for unit in units:
             options = insertion_options(unit, current)
+            if not options:
+                return skeleton
             best = options[0][0]
-            feasible = sum(option[0][:4] == best[:4] for option in options)
+            feasible = sum(option[0][:3] == best[:3] for option in options)
             second = options[1][0] if len(options) > 1 else best
             # Most constrained and highest-regret work is committed first.
-            regret = (second[4]-best[4], second[5]-best[5], second[6]-best[6])
+            regret = (second[3]-best[3], second[4]-best[4], second[5]-best[5])
             deadline = min(problem.goals[goal].deadline for goal in unit)
             choices.append(((feasible, deadline, tuple(-value for value in regret),
                              -len(unit), unit), unit, options))
@@ -597,7 +762,7 @@ def _ruin_recreate(problem, skeleton, rng, focus_goals=(), atomic=None):
         # Mostly steepest insertion, with deterministic seeded breadth among
         # structurally close choices. Exact abstract/replay scoring follows.
         near = [option for option in options
-                if option[0][:4] == options[0][0][:4]][:4]
+                if option[0][:3] == options[0][0][:3]][:4]
         selected = near[0] if len(near) == 1 or rng.random() < .8 else rng.choice(near[1:])
         _, worker, at = selected
         routes[worker][at:at] = unit
@@ -717,7 +882,9 @@ def _compress_workforce_frontier(problem, skeleton, limit):
             try:
                 trial = _ruin_recreate(problem, reduced,
                     Random(repair_seed+offset), focus_goals=removed_goals)
-                trial = normalize(problem, trial)
+                trial = _construct_route_candidate(problem, skeleton, trial)
+                if trial is None:
+                    continue
                 proposals[skeleton_key(trial)] = (_abstract_schedule(problem, trial), trial)
             except (ValueError, IndexError):
                 continue
@@ -753,7 +920,44 @@ def _project_adjacent_workforce(problem, skeleton, rng):
                       routes=tuple(routes), spawn_preferences=tuple(preferences),
                       logistics={})
     rebuilt = _ruin_recreate(problem, reduced, rng, focus_goals=abandoned)
-    return normalize(problem, rebuilt)
+    candidate = _construct_route_candidate(problem, skeleton, rebuilt)
+    if candidate is None:
+        raise ValueError("adjacent workforce reconstruction is not causal")
+    return candidate
+
+
+def _reconcile_synchronizations(problem, skeleton):
+    events = selected_events(problem, skeleton)
+    route_of = {goal: worker for worker, route in enumerate(skeleton.routes)
+                for goal in route}
+    predecessors = event_predecessors(problem, skeleton)
+    retained = []
+    for bundle in skeleton.synchronizations:
+        workers = [route_of.get(goal) for goal in bundle.goals]
+        if (all(goal in events for goal in bundle.goals)
+                and None not in workers and len(set(workers)) == len(workers)
+                and workers == sorted(workers)
+                and all(before in predecessors.get(after, ())
+                        for before, after in zip(bundle.goals, bundle.goals[1:]))):
+            retained.append(bundle)
+    return replace(skeleton, synchronizations=tuple(retained))
+
+
+def _construct_route_candidate(problem, before, candidate):
+    """Make a route edit complete and causal before it enters search."""
+    old_logistics = set(before.logistics)
+    routes = tuple(tuple(token for token in route if token not in old_logistics)
+                   for route in candidate.routes)
+    shell = replace(candidate, routes=routes, logistics={}, resources=())
+    shell = replace(shell, leases=rebuild_leases(problem, shell))
+    if not route_precedence_feasible(problem, shell):
+        return None
+    shell = _reconcile_synchronizations(problem, shell)
+    shell = _rebuild_route_support(problem, before, shell)
+    if not route_precedence_feasible(problem, shell):
+        return None
+    validate_skeleton(problem, shell)
+    return shell
 
 
 MUTATIONS = (_relocate_event, _relocate_entity, _cross_exchange, _change_path,
@@ -770,15 +974,33 @@ def _mutate(problem, skeleton, rng, ruin_probability=.10, fixed_workforce=False)
     # valleys that single-event moves cannot cross.
     choices = WITHIN_WORKFORCE_MUTATIONS if fixed_workforce else MUTATIONS
     mutation = _ruin_recreate if rng.random() < ruin_probability else rng.choice(choices)
-    trial = mutation(skeleton, rng) if mutation in (_relocate_event, _cross_exchange,
-        _change_market_priority, _move_logistics, _relocate_segment,
-        _reverse_segment) else mutation(problem, skeleton, rng)
-    # Explicit resource-source mutations must survive normalization. Other
-    # structural changes re-solve finite stock/output allocation conditionally.
-    if mutation in (_change_resource_source, _move_logistics, _change_sync):
-        return trial
-    normalized = normalize(problem, trial)
-    return replace(normalized, market_priority=trial.market_priority) if mutation is _change_market_priority else normalized
+    route_mutations = {_relocate_event, _relocate_entity, _cross_exchange,
+                       _change_path, _resize_workforce, _relocate_segment,
+                       _reverse_segment, _ruin_recreate}
+    preserving_mutations = {_change_sync, _change_market_priority,
+                            _change_spawn_preference, _change_market_cap,
+                            _change_resource_source, _move_logistics}
+    # Sampling retries are internal to candidate construction: malformed
+    # lifecycle orders never consume a population/evaluation proposal.
+    for _ in range(8):
+        trial = mutation(problem, skeleton, rng)
+        if mutation in route_mutations:
+            trial = _construct_route_candidate(problem, skeleton, trial)
+            if trial is None:
+                continue
+        elif mutation is _change_placement:
+            trial = normalize(problem, trial)
+            if len(trial.placements) < len(
+                    [entity for entity in problem.intent.entities
+                     if problem.complete_paths[entity.identifier]]):
+                trial = normalize(problem, _reconstruct_open_placement_matching(
+                    problem, trial, rng))
+        elif mutation not in preserving_mutations:
+            trial = normalize(problem, trial)
+        if route_precedence_feasible(problem, trial):
+            validate_skeleton(problem, trial)
+            return trial
+    return skeleton
 
 
 def _exact_repair_frontier(problem, skeleton, result, limit):
@@ -854,7 +1076,9 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                         problem, skeleton, placement_rng)
                     trial = _ruin_recreate(
                         problem, placed, placement_rng, focus_goals=block)
-                    trial = normalize(problem, trial)
+                    trial = _construct_route_candidate(problem, skeleton, trial)
+                    if trial is None:
+                        continue
                     key = skeleton_key(trial)
                     row = (_abstract_schedule(problem, trial), trial)
                     proposals[key] = row
@@ -872,10 +1096,10 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                 placements[entity] = position
                 try:
                     trial = normalize(problem, replace(
-                        skeleton, placements=placements,
-                        routes=tuple(tuple(token for token in route
-                                           if token not in skeleton.logistics)
-                                     for route in skeleton.routes), logistics={}))
+                        skeleton, placements=placements))
+                    if not route_precedence_feasible(problem, trial):
+                        continue
+                    validate_skeleton(problem, trial)
                     key = skeleton_key(trial)
                     proposals[key] = (_abstract_schedule(problem, trial), trial)
                 except (ValueError, IndexError):
@@ -896,14 +1120,16 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                 costs = tuple(_route_service_cost(starts[worker], route, positions)
                               for worker, route in enumerate(routes))
                 relocation_choices.append(
-                    ((max(costs), sum(costs), costs[target], target, at), routes))
+                    ((sum(costs), max(costs), costs[target], target, at), routes))
         # Keep the real insertion domain, but only normalize its strongest
         # capacity/route-cost representatives. Exhaustively rebuilding resource
         # links for every insertion point overwhelmed the bounded search.
         for _, routes in sorted(relocation_choices, key=lambda row: row[0])[:max(4, limit*2)]:
             try:
-                trial = normalize(problem, replace(
+                trial = _construct_route_candidate(problem, skeleton, replace(
                     skeleton, routes=tuple(tuple(route) for route in routes), logistics={}))
+                if trial is None:
+                    continue
                 key = skeleton_key(trial)
                 proposals[key] = (_abstract_schedule(problem, trial), trial)
             except (ValueError, IndexError):
@@ -935,11 +1161,13 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                 routes[target][target_at:target_at] = block
                 costs = tuple(_route_service_cost(starts[worker], route, positions)
                               for worker, route in enumerate(routes))
-                ejection_choices.append(((max(costs), sum(costs), target, other), routes))
+                ejection_choices.append(((sum(costs), max(costs), target, other), routes))
         for _, routes in sorted(ejection_choices, key=lambda row: row[0])[:max(4, limit*2)]:
             try:
-                trial = normalize(problem, replace(
+                trial = _construct_route_candidate(problem, skeleton, replace(
                     skeleton, routes=tuple(tuple(route) for route in routes), logistics={}))
+                if trial is None:
+                    continue
                 key = skeleton_key(trial)
                 proposals[key] = (_abstract_schedule(problem, trial), trial)
             except (ValueError, IndexError):
@@ -952,8 +1180,10 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                             + sum(sum(map(ord, goal)) for goal in sorted(unfinished_plan)))
         for _ in range(max(8, limit*3)):
             try:
-                trial = normalize(problem, _ruin_recreate(
+                trial = _construct_route_candidate(problem, skeleton, _ruin_recreate(
                     problem, skeleton, repair_rng, focus_goals=unfinished_plan))
+                if trial is None:
+                    continue
                 key = skeleton_key(trial)
                 proposals[key] = (_abstract_schedule(problem, trial), trial)
             except (ValueError, IndexError):
@@ -993,13 +1223,15 @@ def _exact_repair_frontier(problem, skeleton, result, limit):
                 for at in range(len(routes[worker])+1):
                     trial = routes[worker][:at]+list(block)+routes[worker][at:]
                     cost = route_cost(worker, trial)
-                    candidate = (max(costs[:worker]+[cost]+costs[worker+1:]),
-                                 cost, -(available[worker]-used[worker]), worker, at)
+                    revised = costs[:worker]+[cost]+costs[worker+1:]
+                    candidate = (sum(revised), cost-costs[worker],
+                                 max(revised), -(available[worker]-used[worker]),
+                                 worker, at)
                     if best is None or candidate < best[0]: best = candidate, worker, at
             _, worker, at = best
             routes[worker][at:at] = block
         try:
-            redistributed = normalize(problem, replace(
+            redistributed = _construct_route_candidate(problem, skeleton, replace(
                 skeleton, routes=tuple(tuple(route) for route in routes), logistics={}))
         except (ValueError, IndexError):
             redistributed = None
@@ -1037,8 +1269,9 @@ def _complete_initial_placement(problem, skeleton, seed):
     # Rebuild all route blocks once from the complete matching so search never
     # optimizes or benchmarks a silently reduced Plan.
     routes = initial_routes(problem, placed, placed.workforce)
-    return normalize(problem, replace(placed, routes=routes, resources=(),
-                                      logistics={}, acquisitions={}))
+    rebuilt = _construct_route_candidate(problem, skeleton, replace(
+        placed, routes=routes, logistics={}))
+    return rebuilt or skeleton
 
 
 def _workforce_levels(problem, base, maximum):
@@ -1269,6 +1502,17 @@ def solve_routes(state, plan, config=None, progress=None):
     base_rows = [row for row in exact_rows if row[1] == skeleton_key(base)]
     initial_exact_score = base_rows[0][0] if base_rows else exact_rows[0][0]
 
+    # Preserve exact-replay capacity for the realization that survives basin
+    # selection and workforce reconstruction. Early broad feedback is useful,
+    # but spending the cap before the final structure exists can leave a known
+    # causal tail unrepaired. This reallocates, rather than increases, budget.
+    final_feedback_reserve = min(
+        config.max_exact_evaluations,
+        max(8, config.refinement_candidates*3))
+    search_phase_limit = max(
+        exact_compilations,
+        config.max_exact_evaluations-final_feedback_reserve)
+
     # A multilevel neighborhood lets a coherent high-capacity structure seed an
     # adjacent workforce island. The target island reconstructs the removed
     # hand's causal district and competes through exact reached states; staffing
@@ -1277,7 +1521,7 @@ def solve_routes(state, plan, config=None, progress=None):
     cross_basin = []
     cross_basin_attempts = 0
     descent_source = exact_rows[0]
-    descent_budget = min(config.max_exact_evaluations,
+    descent_budget = min(search_phase_limit,
                          exact_compilations+max(8, config.refinement_candidates*10))
     while (descent_source[2].workforce-1 in populations
            and exact_compilations < descent_budget):
@@ -1341,7 +1585,7 @@ def solve_routes(state, plan, config=None, progress=None):
     for _ in range(config.repair_rounds):
         added = []
         for workforce in repair_workforces:
-            if exact_compilations >= config.max_exact_evaluations:
+            if exact_compilations >= search_phase_limit:
                 break
             basin_rows = [row for row in exact_rows if row[2].workforce == workforce]
             if not basin_rows:
@@ -1368,7 +1612,7 @@ def solve_routes(state, plan, config=None, progress=None):
     # source, within the same hard exact-evaluation cap, before any cleanup.
     reconstruction_limit = max(
         exact_compilations,
-        config.max_exact_evaluations-config.compression_rounds*config.compression_candidates)
+        search_phase_limit-config.compression_rounds*config.compression_candidates)
     descent_source = exact_rows[0]
     while (descent_source[2].workforce-1 in populations
            and exact_compilations < reconstruction_limit):
@@ -1417,13 +1661,13 @@ def solve_routes(state, plan, config=None, progress=None):
     direct_incumbent = exact_rows[0]
     incumbent = exact_rows[0]
     for _ in range(config.compression_rounds):
-        if exact_compilations >= config.max_exact_evaluations:
+        if exact_compilations >= search_phase_limit:
             break
         _, _, incumbent_skeleton, incumbent_result = incumbent
         added = []
         for candidate in _compress_workforce_frontier(
                 problem, incumbent_skeleton, config.compression_candidates):
-            if exact_compilations >= config.max_exact_evaluations:
+            if exact_compilations >= search_phase_limit:
                 break
             key = skeleton_key(candidate)
             if key in exact_evaluated:
@@ -1448,6 +1692,29 @@ def solve_routes(state, plan, config=None, progress=None):
         exact_rows.sort(key=lambda row: (row[0], repr(row[1])), reverse=True)
         compression_rounds_completed += 1
 
+    # Workforce reconstruction can expose a new causal tail even when it
+    # preserves the incumbent's previously achieved set. Give that resulting
+    # basin one ordinary compiler-feedback neighborhood before final selection;
+    # this uses the existing exact cap and the general repair mechanism.
+    final_feedback = []
+    for _ in range(config.repair_rounds):
+        incumbent = exact_rows[0]
+        remaining_exact = config.max_exact_evaluations-exact_compilations
+        if not incumbent[3].unfulfilled or remaining_exact <= 0:
+            break
+        added = []
+        for candidate in _exact_repair_frontier(
+                problem, incumbent[2], incumbent[3],
+                min(config.refinement_candidates, remaining_exact)):
+            row = compile_exact(candidate)
+            if row is not None:
+                added.append(row)
+        if not added:
+            break
+        final_feedback.extend(added)
+        exact_rows.extend(added)
+        exact_rows.sort(key=lambda row: (row[0], repr(row[1])), reverse=True)
+
     score, _, skeleton, result = exact_rows[0]
     best_exact_by_workforce = {}
     for row in exact_rows:
@@ -1471,7 +1738,9 @@ def solve_routes(state, plan, config=None, progress=None):
         "search_accepted": accepted, "search_invalid": invalid,
         "search_exact_evaluations": exact_compilations,
         "search_max_exact_evaluations": config.max_exact_evaluations,
+        "search_final_feedback_reserve": final_feedback_reserve,
         "search_refinement_scores": tuple(row[0] for row in refinement),
+        "search_final_feedback_scores": tuple(row[0] for row in final_feedback),
         "cross_basin_reconstruction_evaluations": len(cross_basin),
         "cross_basin_reconstruction_attempts": cross_basin_attempts,
         "cross_basin_reconstruction_workforces": tuple(sorted(

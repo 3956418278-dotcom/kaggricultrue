@@ -235,7 +235,7 @@ def realizable_opening_cash(state):
 
 
 def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: int):
-    """Build balanced spatial routes from causal same-location visit blocks.
+    """Build spatially coherent feasible routes from causal visit blocks.
 
     The block is only a construction device: returned routes still contain
     atomic events and later search may split them for same-turn coordination.
@@ -256,9 +256,15 @@ def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: in
         return [goal for block in blocks for goal in block]
 
     def capacity(worker):
-        if worker < len(problem.intent.state.workers): return horizon
+        # Service-only route cost omits at least the route's material pickup and
+        # synchronization slack. Reserving a small physical margin prevents a
+        # spatially compact route from being declared feasible only because its
+        # necessary logistics were ignored; it is not a load-balancing target.
+        support_margin = max(1, horizon // 8)
+        if worker < len(problem.intent.state.workers):
+            return max(1, horizon-support_margin)
         hire_rank = worker-len(problem.intent.state.workers)
-        return max(1, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS)
+        return max(1, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS-support_margin)
 
     while pending:
         ready = [(min(problem.goals[goal].deadline for goal in block), -len(block), entity, block)
@@ -282,8 +288,13 @@ def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: in
                 trial_cost = _route_cost(starts[worker], flattened(trial_blocks), positions)
                 costs = list(current_costs); costs[worker] = trial_cost
                 overruns = [max(0, cost-capacity(w)) for w, cost in enumerate(costs)]
-                candidate = (max(overruns), sum(overruns), max(costs),
-                             trial_cost-current_costs[worker], current_costs[worker], worker, at)
+                # Capacity violations are infeasibility, but among feasible
+                # insertions total route cost owns the decision.  Peak load is
+                # deliberately late: using it first fragments natural spatial
+                # districts merely to make route lengths look alike.
+                candidate = (int(any(overruns)), sum(overruns), sum(costs),
+                             trial_cost-current_costs[worker], max(costs),
+                             current_costs[worker], worker, at)
                 if best is None or candidate < best[0]:
                     best = candidate, worker, at
         _, worker, at = best
@@ -584,6 +595,8 @@ def validate_skeleton(problem: RouteProblem, skeleton: RouteSkeleton):
     for item, order in skeleton.acquisitions.items():
         if not order or not str(order[0]).startswith("BUY_") or int(order[2]) <= 0:
             errors.append(f"invalid acquisition: {item}")
+    if not route_precedence_feasible(problem, skeleton):
+        errors.append("route order contains a causal cycle")
     if any(cap < 0 or cap > rules.MAX_MARKET_ORDERS for cap in skeleton.required_entry_caps):
         errors.append("invalid required market-entry cap")
     if any(cap < 0 or cap > rules.MAX_MARKET_ORDERS for cap in skeleton.hire_caps):
@@ -591,3 +604,62 @@ def validate_skeleton(problem: RouteProblem, skeleton: RouteSkeleton):
     if errors:
         raise ValueError("; ".join(errors))
     return True
+
+
+def route_precedence_edges(problem: RouteProblem, skeleton: RouteSkeleton):
+    """Return semantic precedence edges for the selected realization.
+
+    Worker-route order itself is added by :func:`route_precedence_feasible`.
+    Keeping this graph with the representation gives constructors, mutations,
+    validation and compilation one causal contract.
+    """
+    routed = {token for route in skeleton.routes for token in route}
+    edges = set()
+    for successor, predecessors in event_predecessors(problem, skeleton).items():
+        if successor not in routed:
+            continue
+        edges.update((predecessor, successor) for predecessor in predecessors
+                     if predecessor in routed)
+    for link in skeleton.resources:
+        if (link.kind == "EVENT" and link.producer in routed
+                and link.consumer in routed):
+            edges.add((link.producer, link.consumer))
+    for identifier, event in skeleton.logistics.items():
+        if identifier not in routed:
+            continue
+        edges.update((required, identifier) for required in event.requires
+                     if required in routed)
+        edges.update((identifier, consumer) for consumer in event.consumers
+                     if consumer in routed)
+    return frozenset(edges)
+
+
+def route_precedence_feasible(problem: RouteProblem, skeleton: RouteSkeleton):
+    """Whether route order and semantic dependencies form one causal DAG."""
+    nodes = {token for route in skeleton.routes for token in route}
+    successor = defaultdict(set)
+    indegree = Counter({token: 0 for token in nodes})
+
+    def add_edge(before, after):
+        if before == after or before not in nodes or after not in nodes:
+            return
+        if after not in successor[before]:
+            successor[before].add(after)
+            indegree[after] += 1
+
+    for route in skeleton.routes:
+        for before, after in zip(route, route[1:]):
+            add_edge(before, after)
+    for before, after in route_precedence_edges(problem, skeleton):
+        add_edge(before, after)
+
+    ready = [token for token in nodes if not indegree[token]]
+    visited = 0
+    while ready:
+        token = ready.pop()
+        visited += 1
+        for following in successor[token]:
+            indegree[following] -= 1
+            if not indegree[following]:
+                ready.append(following)
+    return visited == len(nodes)

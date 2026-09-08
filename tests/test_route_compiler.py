@@ -13,11 +13,12 @@ from src.kaggriculture_agent.planner import Plan
 from src.kaggriculture_agent.route_compiler import compile_skeleton
 from src.kaggriculture_agent.route_structure import (
     LogisticsEvent, ResourceLink, RouteSkeleton, SyncBundle, TileLease, build_route_problem,
-    initial_skeleton, selected_paths, with_initial_logistics,
+    initial_skeleton, route_precedence_feasible, selected_paths,
+    validate_skeleton, with_initial_logistics,
 )
 from src.kaggriculture_agent.route_search import (
     RouteSearchConfig, _complete_initial_placement, _compress_workforce_frontier,
-    _reconstruct_open_placement_matching,
+    _mutate, _reconstruct_open_placement_matching,
     _ruin_recreate, normalize, result_score, solve_routes,
 )
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState
@@ -229,14 +230,67 @@ class RouteCompilerTests(unittest.TestCase):
                                  for n, position in enumerate(positions)])
         problem = build_route_problem(state, plan)
         opening = initial_skeleton(problem, workforce=3)
-        first = normalize(problem, _ruin_recreate(problem, opening, Random(0)))
-        second = normalize(problem, _ruin_recreate(problem, opening, Random(0)))
+        first = normalize(problem, _ruin_recreate(problem, opening, Random(16)))
+        second = normalize(problem, _ruin_recreate(problem, opening, Random(16)))
         self.assertEqual(first.routes, second.routes)
         before = {goal: worker for worker, route in enumerate(opening.routes) for goal in route}
         after = {goal: worker for worker, route in enumerate(first.routes)
                  for goal in route if goal in before}
         self.assertEqual(set(after), set(before))
         self.assertGreaterEqual(sum(before[goal] != after[goal] for goal in before), 2)
+
+    def test_normalize_preserves_first_class_realization_choices(self):
+        animal = dict(kind="COOP", animal="GOOSE", placed_day=0, fed_today=False,
+            cared_today=False, consecutive_unfed=0, fertilizer_available=False,
+            pending_care_bonus=0, yield_units=0)
+        state = state_at(hour=18, money=20, tiles={(4, 4): animal})
+        plan = work_plan(state, [("animal", (4, 4), ("FEED",), {})])
+        problem = build_route_problem(state, plan)
+        opening = initial_skeleton(problem, workforce=1)
+        pickup = next(token for token in opening.logistics
+                      if opening.logistics[token].operation == "PICKUP")
+        custom = replace(
+            opening,
+            acquisitions={"custom-batch": ("BUY_PRODUCT", "WHEAT", 1)},
+            market_priority=("BUY:custom-batch",),
+            required_entry_caps=(7,), hire_caps=(2,),
+            logistics={**opening.logistics,
+                       "pause": LogisticsEvent("pause", "PASS")},
+            routes=((pickup, "pause", *tuple(token for token in opening.routes[0]
+                                               if token != pickup)),),
+        )
+        normalized = normalize(problem, custom)
+        for field in ("resources", "logistics", "acquisitions", "market_priority",
+                      "required_entry_caps", "hire_caps", "routes"):
+            self.assertEqual(getattr(normalized, field), getattr(custom, field), field)
+
+    def test_initial_constructor_keeps_a_natural_spatial_district(self):
+        positions = ((0, 0), (0, 1), (1, 0), (1, 1))
+        state = state_at(hour=8, tiles={position: crop() for position in positions},
+                         workers=[((0, 0), {}), ((9, 9), {})])
+        plan = work_plan(state, [(f"crop-{n}", position, ("WATER",), {})
+                                 for n, position in enumerate(positions)])
+        skeleton = initial_skeleton(build_route_problem(state, plan), workforce=2)
+        self.assertEqual(len(skeleton.routes[0]), 4)
+        self.assertEqual(skeleton.routes[1], ())
+
+    def test_search_mutations_preserve_causal_route_feasibility(self):
+        state = state_at(hour=10, money=100, tiles={(4, 4): crop()},
+                         workers=[((4, 4), {}), ((3, 4), {})], seeds={"WHEAT": 1})
+        plan = work_plan(state, [
+            ("old", (4, 4), ("HARVEST",), {}),
+            ("new", None, ("PLANT", "WATER"), {"crop": "WHEAT"}),
+        ], {"new": ((4, 4),)})
+        old, new = plan.obligations
+        plan = replace(plan, obligations=(old,), selected=(replace(new, kind="CROP"),))
+        problem = build_route_problem(state, plan)
+        skeleton = initial_skeleton(problem, workforce=2)
+        rng = Random(17)
+        for _ in range(200):
+            skeleton = _mutate(problem, skeleton, rng, ruin_probability=.5,
+                               fixed_workforce=True)
+            self.assertTrue(route_precedence_feasible(problem, skeleton))
+            self.assertTrue(validate_skeleton(problem, skeleton))
 
     def test_ruin_recreate_preserves_unplaced_goal_as_reported_infeasibility(self):
         positions = ((0, 0), (4, 4), (8, 8))
