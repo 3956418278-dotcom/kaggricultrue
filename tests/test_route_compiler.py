@@ -2,6 +2,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from src.kaggriculture_agent import rules
 from src.kaggriculture_agent.economics import (
@@ -18,6 +19,8 @@ from src.kaggriculture_agent.route_structure import (
     TileLease, build_route_problem, with_initial_logistics,
 )
 from src.kaggriculture_agent.route_support import solve_support
+from src.kaggriculture_agent import route_support as route_support_module
+from src.kaggriculture_agent.route_support import SupportConfig
 from src.kaggriculture_agent.state import OwnedState, TileState, WorkerState
 
 
@@ -181,6 +184,121 @@ class RouteCompilerTests(unittest.TestCase):
 
 
 class ConditionalSupportTests(unittest.TestCase):
+    def _feed_problem(self, count=1):
+        positions = tuple((4+index, 4) for index in range(count))
+        state = state_at(
+            hour=18, money=200,
+            tiles={position: animal() for position in positions},
+            shed={"WHEAT": count},
+        )
+        plan = work_plan(state, [
+            (f"animal-{index}", position, ("FEED",), {})
+            for index, position in enumerate(positions)
+        ])
+        problem = build_route_problem(state, plan)
+        goals = tuple(problem.goals)
+        return state, problem, structure_for(problem, 1, (goals,))
+
+    @staticmethod
+    def _compiled(state, completed, unfulfilled=(), money_delta=0):
+        return SimpleNamespace(
+            completed=frozenset(completed),
+            unfulfilled=frozenset(unfulfilled),
+            final_state=replace(state, money=state.money+money_delta),
+            diagnostics={
+                "blockers": ({"missing": {"WHEAT": 1}},),
+                "unbought_inputs": (), "unlocked_land_missing": (),
+            },
+        )
+
+    def test_schedule_alternative_repairs_first_compiler_failure(self):
+        state, problem, structure = self._feed_problem(count=2)
+        failed = self._compiled(state, (), problem.goals)
+        succeeded = self._compiled(state, problem.goals)
+        config = SupportConfig(
+            max_material_alternatives=1,
+            max_schedule_alternatives=2,
+            max_exact_compilations=2,
+        )
+        with patch.object(route_support_module, "compile_skeleton",
+                          side_effect=(failed, succeeded)) as compiler:
+            support = solve_support(problem, structure, config)
+        self.assertTrue(support.feasible, support.conflict)
+        self.assertIsNone(support.conflict)
+        self.assertEqual(compiler.call_count, 2)
+        self.assertEqual(support.diagnostics["selected_schedule_policy"],
+                         "split-early-deferred-transfer")
+        self.assertEqual(support.diagnostics["compiler_rejections"],
+                         {"capacity-or-timing": 1})
+
+    def test_exact_value_overrules_material_proxy_order(self):
+        state, problem, structure = self._feed_problem()
+        entity = problem.goal_entity[next(iter(problem.goals))]
+        goal = next(iter(problem.goals))
+        first_signature = route_support_module._SupportSignature(
+            ((entity, 0),), (0,), (), ())
+        second_signature = route_support_module._SupportSignature(
+            ((entity, 0),), (1,), (), ())
+        first_links = (ResourceLink(goal, "WHEAT", 1, "SHED"),)
+        second_links = (ResourceLink(goal, "WHEAT", 1, "PURCHASE"),)
+        material_results = (
+            ({entity: 0}, first_links, {}, first_signature,
+             {"material_objective": 1}, None),
+            ({entity: 0}, second_links, {}, second_signature,
+             {"material_objective": 10}, None),
+        )
+        proxy_winner = self._compiled(state, problem.goals, money_delta=1)
+        exact_winner = self._compiled(state, problem.goals, money_delta=10)
+        config = SupportConfig(
+            max_material_alternatives=2,
+            max_schedule_alternatives=1,
+            max_exact_compilations=2,
+        )
+        with patch.object(route_support_module, "_solve_material_network",
+                          side_effect=material_results), patch.object(
+                              route_support_module, "compile_skeleton",
+                              side_effect=(proxy_winner, exact_winner)):
+            support = solve_support(problem, structure, config)
+        self.assertTrue(support.feasible, support.conflict)
+        self.assertEqual(support.diagnostics["proxy_objectives"], (1, 10))
+        self.assertEqual(support.diagnostics[
+            "selected_material_alternative"], 1)
+        self.assertEqual(support.compilation.final_state.money,
+                         state.money+10)
+
+    def test_compiler_rejection_adds_internal_material_no_good(self):
+        state, problem, structure = self._feed_problem()
+        entity = problem.goal_entity[next(iter(problem.goals))]
+        goal = next(iter(problem.goals))
+        first_signature = route_support_module._SupportSignature(
+            ((entity, 0),), (0,), (), ())
+        second_signature = route_support_module._SupportSignature(
+            ((entity, 0),), (1,), (), ())
+        material_results = (
+            ({entity: 0}, (ResourceLink(goal, "WHEAT", 1, "SHED"),), {},
+             first_signature, {"material_objective": 1}, None),
+            ({entity: 0}, (ResourceLink(goal, "WHEAT", 1, "PURCHASE"),), {},
+             second_signature, {"material_objective": 2}, None),
+        )
+        failed = self._compiled(state, (), problem.goals)
+        succeeded = self._compiled(state, problem.goals)
+        config = SupportConfig(
+            max_material_alternatives=2,
+            max_schedule_alternatives=1,
+            max_exact_compilations=2,
+        )
+        with patch.object(route_support_module, "_solve_material_network",
+                          side_effect=material_results) as network, patch.object(
+                              route_support_module, "compile_skeleton",
+                              side_effect=(failed, succeeded)):
+            support = solve_support(problem, structure, config)
+        self.assertTrue(support.feasible, support.conflict)
+        self.assertIsNone(support.conflict)
+        self.assertEqual(network.call_count, 2)
+        exclusions = network.call_args_list[1].args[3]
+        self.assertEqual(exclusions, (first_signature,))
+        self.assertEqual(support.diagnostics["material_alternatives"], 2)
+
     def test_temporal_lease_allows_harvest_then_replant(self):
         state = state_at(hour=20, money=20, tiles={(4, 4): crop()})
         plan = work_plan(state, [

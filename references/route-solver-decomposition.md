@@ -66,18 +66,30 @@ and activated producer-before-consumer precedence.  Resource-source costs are
 economic acquisition or opportunity costs.  Stable arc order only breaks ties;
 movement, worker turns and logistics are not secondary objectives.
 
-The selected flow is converted into explicit pickup and shed-mediated transfer
-events.  Purchase batches, hire requirements, land entries, financing deposits,
-shared shed capacity, exact cash timing, movement, service, synchronization,
-waiting and hire timing are then evaluated by the deterministic compiler under
-the real state transition.  Thus route capacity is the capacity of this full
-realization; there is no fixed support margin.
+The network objective orders candidates; it does not select the final support.
+A bounded k-best loop excludes each active mode/source/liquidity signature and
+resolves the compact model.  Each material candidate is expanded through a
+small support-scheduling set covering merged or consumer-split pickups,
+just-in-time or early pickup insertion, merged or split transfers, and immediate
+or deferred producer deposits.  Duplicate schedules are compiled only once.
+
+Every resulting support schedule is evaluated by the deterministic compiler
+under the real state transition.  A compiler rejection first causes other
+batching/insertion/timing policies for the same material allocation to be tried;
+after those fail, a no-good cut requests another source signature.  Successful
+alternatives are retained and the realization with greatest exact `V(S_end)` is
+returned, regardless of material-proxy order.  Purchase batches, hire
+requirements, land entries, financing deposits, shared shed capacity, exact cash
+timing, movement, service, synchronization, waiting and hire timing therefore
+belong to the complete support realization.  There is no fixed support margin.
 
 The compiler either completes every residual Plan and returns `S_end`, or the
 support solver returns a structured conflict containing missing goals, workers,
-items and compiler blockers.  A partial compiler trace may be used by the upper
-LNS only as an explicitly configured fallback/search signal.  It is never a
-support-layer goal-selection decision.
+items and compiler blockers.  Exhaustion of the configured alternative budget
+is reported as unresolved search, not proof that the `RouteStructure` is
+infeasible.  A partial compiler trace may be used by the upper LNS only as an
+explicitly configured fallback/search signal.  It is never a support-layer
+goal-selection decision.
 
 ## Fixed-workforce LNS
 

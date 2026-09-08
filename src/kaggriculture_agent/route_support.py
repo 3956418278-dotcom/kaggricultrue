@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Mapping
 
 from . import rules
@@ -18,7 +19,7 @@ from .intraday import EndValue
 from .route_compiler import compile_skeleton, purchase_orders_for_links
 from .route_structure import (
     LogisticsEvent, ResourceLink, RouteProblem, RouteSkeleton, RouteStructure,
-    TileLease, selected_paths, with_initial_logistics,
+    TileLease, selected_paths,
 )
 
 
@@ -27,6 +28,9 @@ class SupportConfig:
     """Limits for the cheap conditional solve used at every LNS proposal."""
 
     time_limit_seconds: float = 0.20
+    max_material_alternatives: int = 4
+    max_schedule_alternatives: int = 6
+    max_exact_compilations: int = 8
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,23 @@ class SupportResult:
     compilation: object | None = None
     conflict: SupportConflict | None = None
     diagnostics: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _SupportSignature:
+    modes: tuple[tuple[str, int], ...]
+    arcs: tuple[int, ...]
+    liquidity: tuple[tuple[str, object, str], ...]
+    sales: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SchedulePolicy:
+    name: str
+    split_pickups: bool
+    early_pickups: bool
+    split_transfers: bool
+    defer_transfer_deposits: bool
 
 
 @dataclass(frozen=True)
@@ -229,7 +250,7 @@ def _make_arcs(problem: RouteProblem, structure: RouteStructure,
 
 
 def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
-                            compatible,
+                            compatible, excluded_signatures,
                             time_limit: float):
     """Solve the compact fixed-charge material network.
 
@@ -255,6 +276,11 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
 
     flow = [solver.IntVar(0, arc.capacity, f"f:{index}")
             for index, arc in enumerate(arcs)]
+    arc_used = [solver.BoolVar(f"source-use:{index}")
+                for index in range(len(arcs))]
+    for index, arc in enumerate(arcs):
+        solver.Add(flow[index] <= arc.capacity * arc_used[index])
+        solver.Add(flow[index] >= arc_used[index])
     by_demand, by_source = defaultdict(list), defaultdict(list)
     for index, arc in enumerate(arcs):
         by_demand[arc.consumer, arc.item].append(index)
@@ -333,13 +359,8 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
     for index, arc in enumerate(arcs):
         if arc.kind != "EVENT" or not arc.via_shed:
             continue
-        active = solver.BoolVar(
-            f"transfer-edge:{arc.producer}:{arc.consumer}:{arc.item}")
-        solver.Add(flow[index] <= arc.capacity * active)
-        solver.Add(flow[index] >= active)
         solver.Add(rank[arc.consumer] >= rank[arc.producer] + 1
-                   - big_m * (1-active))
-        activations.append(active)
+                   - big_m * (1-arc_used[index]))
 
     # Cash is a shared resource. These aggregate rows are necessary economic
     # conditions; exact per-turn market and shed timing stays with the compiler.
@@ -351,6 +372,7 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
     sale_active = {}
     opening_sales = {}
     liquidity = {}
+    liquidity_active = {}
     revenue_terms = []
     for item in rules.SELLABLE_PRODUCTS:
         opening = int(state.shed.get(item, 0))
@@ -385,6 +407,7 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
             solver.Add(amount >= deposit)
             solver.Add(deposit <= active)
             liquidity["EVENT", producer, item] = amount
+            liquidity_active["EVENT", producer, item] = deposit
             item_liquidity.append(amount)
             activations.append(deposit)
             revenue_terms.append(_source_unit_cost(state, "EVENT", item)
@@ -400,6 +423,7 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
             solver.Add(amount >= deposit)
             solver.Add(deposit <= active)
             liquidity["CARRY", worker, item] = amount
+            liquidity_active["CARRY", worker, item] = deposit
             item_liquidity.append(amount)
             activations.append(deposit)
             revenue_terms.append(_source_unit_cost(state, "EVENT", item)
@@ -426,6 +450,25 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
         solver.Add(hires + len(locked_land) + sum(purchase_active.values())
                    + sum(sale_active.values())
                    <= rules.MAX_MARKET_ORDERS * horizon)
+
+    # Each exact-compiler rejection or accepted k-best candidate excludes its
+    # complete active support pattern.  The next solve must change a source,
+    # service mode, liquidity decision, or sale activation; no goal is relaxed.
+    for signature in excluded_signatures:
+        selected_arcs = set(signature.arcs)
+        selected_modes = set(signature.modes)
+        selected_liquidity = set(signature.liquidity)
+        selected_sales = set(signature.sales)
+        matching = [variable if index in selected_arcs else 1-variable
+                    for index, variable in enumerate(arc_used)]
+        matching.extend(variable if key in selected_modes else 1-variable
+                        for key, variable in modes.items())
+        matching.extend(variable if key in selected_liquidity else 1-variable
+                        for key, variable in liquidity_active.items())
+        matching.extend(variable if item in selected_sales else 1-variable
+                        for item, variable in sale_active.items())
+        if matching:
+            solver.Add(sum(matching) <= len(matching)-1)
 
     # Pure economic coefficients own support selection.  A small stable arc
     # rank resolves mathematically equal realizations; logistics is not a
@@ -465,8 +508,13 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
     status = solver.Solve()
     if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
         blocked_items = tuple(sorted({item for _, item in max_need}))
-        return None, None, None, {}, SupportConflict(
-            "resource-flow", "mandatory resource-flow network is infeasible",
+        proved = status == pywraplp.Solver.INFEASIBLE
+        kind = (("support-alternatives-exhausted" if excluded_signatures
+                 else "resource-flow") if proved else "material-search-limit")
+        detail = ("mandatory compact support network is infeasible" if proved
+                  else "material alternative solve reached its limit")
+        return None, None, None, None, {}, SupportConflict(
+            kind, detail,
             tuple(sorted({goal for goal, _ in max_need})), items=blocked_items)
 
     path_choices = {
@@ -485,7 +533,7 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
             ))
     diagnostics = {
         "flow_variables": len(flow),
-        "binary_variables": len(activations) + len(modes),
+        "binary_variables": len(arc_used) + len(activations) + len(modes),
         "mode_variables": len(modes),
         "rank_variables": len(rank),
         "material_objective": objective.Value(),
@@ -497,9 +545,17 @@ def _solve_material_network(problem: RouteProblem, structure: RouteStructure,
         for key, variable in liquidity.items()
         if variable.solution_value() > 0.5
     }
+    signature = _SupportSignature(
+        tuple(sorted(path_choices.items())),
+        tuple(index for index, variable in enumerate(arc_used)
+              if variable.solution_value() > 0.5),
+        tuple(sorted(selected_liquidity)),
+        tuple(sorted(item for item, variable in sale_active.items()
+                     if variable.solution_value() > 0.5)),
+    )
     diagnostics["liquidity_deposits"] = len(selected_liquidity)
     return (path_choices, tuple(links), selected_liquidity,
-            diagnostics, None)
+            signature, diagnostics, None)
 
 
 def _market_priority(problem: RouteProblem, skeleton: RouteSkeleton):
@@ -510,6 +566,100 @@ def _market_priority(problem: RouteProblem, skeleton: RouteSkeleton):
         *(f"BUY:{key}" for key in sorted(skeleton.acquisitions)),
         *(f"LAND:{quadrant}" for quadrant in problem.intent.land),
     ])
+
+
+def _schedule_policies(limit):
+    policies = (
+        _SchedulePolicy("merged-jit", False, False, False, False),
+        _SchedulePolicy("split-early-deferred-transfer", True, True,
+                        True, True),
+        _SchedulePolicy("split-jit", True, False, True, False),
+        _SchedulePolicy("merged-jit-deferred-transfer", False, False,
+                        False, True),
+        _SchedulePolicy("merged-early", False, True, False, False),
+        _SchedulePolicy("split-jit-deferred-transfer", True, False,
+                        True, True),
+    )
+    return policies[:max(1, min(len(policies), int(limit)))]
+
+
+def _materialize_logistics(problem: RouteProblem, skeleton: RouteSkeleton,
+                           policy: _SchedulePolicy):
+    """Turn one material allocation into one explicit support schedule."""
+    owner = {goal: worker for worker, route in enumerate(skeleton.routes)
+             for goal in route}
+    base_order = {goal: index for route in skeleton.routes
+                  for index, goal in enumerate(route)}
+    routes = [list(route) for route in skeleton.routes]
+    logistics = {}
+    pickups, transfers = defaultdict(list), defaultdict(list)
+    for link in skeleton.resources:
+        if link.item.endswith("_SEED") or link.kind == "CARRY":
+            continue
+        worker = owner[link.consumer]
+        if link.kind in {"SHED", "PURCHASE"}:
+            suffix = link.consumer if policy.split_pickups else None
+            pickups[worker, link.item, suffix].append(link)
+        elif link.kind == "EVENT" and link.via_shed:
+            source_worker = owner[link.producer]
+            suffix = link.consumer if policy.split_transfers else None
+            transfers[source_worker, worker, link.item,
+                      link.producer, suffix].append(link)
+
+    def ordered_consumers(worker, links):
+        return tuple(sorted({link.consumer for link in links},
+                            key=lambda goal: (base_order[goal], goal)))
+
+    def insert_pickup(worker, identifier, consumers):
+        if policy.early_pickups:
+            at = 0
+        else:
+            indices = [routes[worker].index(goal) for goal in consumers]
+            at = min(indices) if indices else 0
+        routes[worker].insert(at, identifier)
+
+    for (worker, item, suffix), links in sorted(pickups.items()):
+        consumers = ordered_consumers(worker, links)
+        tag = suffix or "batch"
+        identifier = f"pickup:{policy.name}:{worker}:{item}:{tag}"
+        logistics[identifier] = LogisticsEvent(
+            identifier, "PICKUP", item,
+            sum(link.quantity for link in links), consumers=consumers,
+        )
+        insert_pickup(worker, identifier, consumers)
+
+    for key, links in sorted(transfers.items()):
+        source_worker, worker, item, producer, suffix = key
+        consumers = ordered_consumers(worker, links)
+        tag = suffix or "batch"
+        deposit = (f"transfer-out:{policy.name}:{source_worker}:{worker}:"
+                   f"{item}:{producer}:{tag}")
+        pickup = (f"transfer-in:{policy.name}:{source_worker}:{worker}:"
+                  f"{item}:{producer}:{tag}")
+        quantity = sum(link.quantity for link in links)
+        logistics[deposit] = LogisticsEvent(
+            deposit, "PLACE", item, quantity, requires=(producer,),
+            purpose="transfer",
+        )
+        logistics[pickup] = LogisticsEvent(
+            pickup, "PICKUP", item, quantity, requires=(deposit,),
+            consumers=consumers, purpose="transfer",
+        )
+        if policy.defer_transfer_deposits:
+            routes[source_worker].append(deposit)
+        else:
+            routes[source_worker].insert(
+                routes[source_worker].index(producer)+1, deposit)
+        insert_pickup(worker, pickup, consumers)
+
+    if problem.intent.state.day == 29:
+        for worker in range(skeleton.workforce):
+            identifier = f"terminal-drop:{worker}"
+            logistics[identifier] = LogisticsEvent(
+                identifier, "DROP", purpose="terminal-liquidation")
+            routes[worker].append(identifier)
+    return replace(skeleton, routes=tuple(tuple(route) for route in routes),
+                   logistics=logistics)
 
 
 def _with_liquidity_logistics(skeleton: RouteSkeleton, selected):
@@ -558,6 +708,20 @@ def _compiler_conflict(problem: RouteProblem, compilation):
         missing, tuple(sorted(workers)), tuple(sorted(items)), diagnostics)
 
 
+def _realization_shell(problem: RouteProblem, structure: RouteStructure,
+                       path_choices, links, liquidity, spawn, policy):
+    shell = RouteSkeleton(
+        structure.workforce, structure.routes, path_choices,
+        dict(structure.placements), links, (), spawn_preferences=spawn,
+    )
+    shell = replace(shell, leases=rebuild_leases(problem, shell))
+    shell = _materialize_logistics(problem, shell, policy)
+    shell = _with_liquidity_logistics(shell, liquidity)
+    shell = replace(shell, acquisitions=purchase_orders_for_links(
+        shell.resources))
+    return replace(shell, market_priority=_market_priority(problem, shell))
+
+
 def solve_support(problem: RouteProblem, structure: RouteStructure,
                   config: SupportConfig | None = None) -> SupportResult:
     """Return the best complete support realization for one fixed structure.
@@ -567,6 +731,7 @@ def solve_support(problem: RouteProblem, structure: RouteStructure,
     route order, placement, or the requested goal set.
     """
     config = config or SupportConfig()
+    started = perf_counter()
     if structure.workforce != len(structure.routes):
         conflict = SupportConflict("structure", "workforce/routes mismatch")
         return SupportResult(False, structure, conflict=conflict)
@@ -590,50 +755,121 @@ def solve_support(problem: RouteProblem, structure: RouteStructure,
         return SupportResult(False, structure, conflict=conflict)
     state = problem.intent.state
     spawn = _worker_starts(state, structure.workforce)[len(state.workers):]
-    (path_choices, links, liquidity, flow_diagnostics,
-     conflict) = _solve_material_network(
-         problem, structure, compatible, config.time_limit_seconds)
-    if conflict:
-        return SupportResult(False, structure, conflict=conflict,
-                             diagnostics=flow_diagnostics)
-    shell = RouteSkeleton(
-        structure.workforce, structure.routes, path_choices,
-        dict(structure.placements), links, (), spawn_preferences=spawn,
-    )
-    shell = RouteSkeleton(
-        shell.workforce, shell.routes, shell.path_choices, shell.placements,
-        shell.resources, rebuild_leases(problem, shell),
-        spawn_preferences=shell.spawn_preferences,
-    )
-    shell = with_initial_logistics(problem, shell)
-    shell = _with_liquidity_logistics(shell, liquidity)
-    acquisitions = purchase_orders_for_links(shell.resources)
-    shell = RouteSkeleton(
-        shell.workforce, shell.routes, shell.path_choices, shell.placements,
-        shell.resources, shell.leases, shell.synchronizations,
-        shell.spawn_preferences, (), shell.logistics, acquisitions,
-    )
-    shell = RouteSkeleton(
-        shell.workforce, shell.routes, shell.path_choices, shell.placements,
-        shell.resources, shell.leases, shell.synchronizations,
-        shell.spawn_preferences, _market_priority(problem, shell),
-        shell.logistics, shell.acquisitions,
-    )
-    try:
-        compilation = compile_skeleton(problem, shell)
-    except ValueError as exc:
-        conflict = SupportConflict("invalid-realization", str(exc))
-        return SupportResult(False, structure, shell, conflict=conflict,
-                             diagnostics=flow_diagnostics)
-    if compilation.unfulfilled:
-        return SupportResult(False, structure, shell, compilation,
-                             _compiler_conflict(problem, compilation),
-                             flow_diagnostics)
-    diagnostics = dict(flow_diagnostics)
-    diagnostics.update({
-        "support_model": "compact-fixed-charge-resource-flow",
-        "economic_value": EndValue(state)(compilation.final_state)[0],
-        "completed": len(compilation.completed),
-    })
-    return SupportResult(True, structure, shell, compilation,
+    exclusions = []
+    policies = _schedule_policies(config.max_schedule_alternatives)
+    best = None
+    best_failure = None
+    last_conflict = None
+    proxy_objectives = []
+    compiler_rejections = Counter()
+    material_exhausted = False
+    exact_compilations = 0
+    schedule_attempts = 0
+    seen_schedules = set()
+    per_solve = max(0.01, config.time_limit_seconds /
+                    max(1, config.max_material_alternatives))
+
+    for material_index in range(max(1, config.max_material_alternatives)):
+        (path_choices, links, liquidity, signature, flow_diagnostics,
+         conflict) = _solve_material_network(
+            problem, structure, compatible, tuple(exclusions), per_solve)
+        if conflict:
+            last_conflict = conflict
+            material_exhausted = conflict.kind in {
+                "resource-flow", "support-alternatives-exhausted"}
+            break
+        exclusions.append(signature)
+        proxy_objectives.append(flow_diagnostics["material_objective"])
+
+        schedule_successes = 0
+        for policy in policies:
+            if exact_compilations >= max(1, config.max_exact_compilations):
+                break
+            if schedule_successes >= 2:
+                break
+            schedule_attempts += 1
+            shell = _realization_shell(
+                problem, structure, path_choices, links, liquidity, spawn,
+                policy)
+            schedule_key = (
+                shell.routes, tuple(shell.resources),
+                tuple(sorted(shell.logistics.items())),
+                tuple(sorted(shell.acquisitions.items())),
+            )
+            if schedule_key in seen_schedules:
+                continue
+            seen_schedules.add(schedule_key)
+            exact_compilations += 1
+            try:
+                compilation = compile_skeleton(problem, shell)
+            except ValueError as exc:
+                last_conflict = SupportConflict(
+                    "invalid-support-schedule", str(exc))
+                compiler_rejections[last_conflict.kind] += 1
+                continue
+
+            if compilation.unfulfilled:
+                last_conflict = _compiler_conflict(problem, compilation)
+                compiler_rejections[last_conflict.kind] += 1
+                failure_score = (
+                    len(compilation.completed),
+                    EndValue(state)(compilation.final_state)[0],
+                )
+                if best_failure is None or failure_score > best_failure[0]:
+                    best_failure = failure_score, shell, compilation
+                continue
+
+            value = EndValue(state)(compilation.final_state)[0]
+            schedule_successes += 1
+            candidate = value, material_index, policy.name, shell, compilation
+            if best is None or value > best[0]:
+                best = candidate
+
+        if exact_compilations >= max(1, config.max_exact_compilations):
+            break
+
+    diagnostics = {
+        "support_model": "compact-flow+k-best+compiler-feedback",
+        "material_alternatives": len(exclusions),
+        "schedule_attempts": schedule_attempts,
+        "exact_compilations": exact_compilations,
+        "proxy_objectives": tuple(proxy_objectives),
+        "compiler_rejections": dict(compiler_rejections),
+        "material_space_exhausted": material_exhausted,
+        "support_search_seconds": perf_counter()-started,
+    }
+    if best is not None:
+        value, material_index, policy_name, shell, compilation = best
+        diagnostics.update({
+            "economic_value": value,
+            "completed": len(compilation.completed),
+            "selected_material_alternative": material_index,
+            "selected_schedule_policy": policy_name,
+        })
+        return SupportResult(True, structure, shell, compilation,
+                             diagnostics=diagnostics)
+
+    # A compiler-rejected bounded scheduling set is not an infeasibility
+    # certificate.  Only an infeasible mandatory material network before any
+    # candidate exists proves that this structure has no support realization.
+    proved_infeasible = (not exclusions and last_conflict is not None
+                         and last_conflict.kind == "resource-flow")
+    diagnostics["proved_infeasible"] = proved_infeasible
+    if not proved_infeasible:
+        conflict = SupportConflict(
+            "support-search-budget",
+            "no exact-feasible support was found before the bounded "
+            "alternative budget; structure infeasibility is not proved",
+            last_conflict.goals if last_conflict else (),
+            last_conflict.workers if last_conflict else (),
+            last_conflict.items if last_conflict else (),
+            compiler=last_conflict.compiler if last_conflict else None,
+        )
+    else:
+        conflict = last_conflict
+    if best_failure is not None:
+        _, shell, compilation = best_failure
+        return SupportResult(False, structure, shell, compilation, conflict,
+                             diagnostics)
+    return SupportResult(False, structure, conflict=conflict,
                          diagnostics=diagnostics)
