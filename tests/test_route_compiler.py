@@ -17,7 +17,7 @@ from src.kaggriculture_agent.route_structure import (
     validate_skeleton, with_initial_logistics,
 )
 from src.kaggriculture_agent.route_search import (
-    RouteSearchConfig, _complete_initial_placement, _compress_workforce_frontier,
+    RouteSearchConfig, _complete_initial_placement, _construct_route_candidate,
     _mutate, _reconstruct_open_placement_matching,
     _ruin_recreate, normalize, result_score, solve_routes,
 )
@@ -158,10 +158,15 @@ class RouteCompilerTests(unittest.TestCase):
         self.assertEqual(len(first.completed), 3)
         basins = first.diagnostics["search_workforce_basins"]
         self.assertEqual([basin["workforce"] for basin in basins], [1, 2, 3])
-        self.assertEqual(first.diagnostics["search_global_iterations"]
-                         + sum(basin["structural_iterations"] for basin in basins), 30)
+        self.assertEqual(sum(basin["structural_iterations"] for basin in basins), 30)
+        self.assertEqual(first.diagnostics["search_workforce_conditioned_iterations"], 30)
+        self.assertNotIn("search_global_iterations", first.diagnostics)
+        self.assertNotIn("staffing_compression_evaluations", first.diagnostics)
+        self.assertNotIn("cross_basin_reconstruction_evaluations", first.diagnostics)
         self.assertTrue(all(basin["structural_iterations"] >= 3 for basin in basins))
         self.assertTrue(all(basin["exact_compilations"] >= 1 for basin in basins))
+        self.assertLessEqual(first.diagnostics["search_exact_evaluations"],
+                             config.max_exact_evaluations)
 
     def test_exact_score_values_reached_state_without_ledger_double_counting(self):
         state = state_at(hour=20, money=20)
@@ -202,6 +207,13 @@ class RouteCompilerTests(unittest.TestCase):
         self.assertTrue(any(execution.worker_actions[0][0] == "PICKUP"
                             for execution in result.executions[1:]))
 
+    def test_initial_hired_worker_starts_cycle_over_shed_access(self):
+        state = state_at(hour=20, money=100)
+        problem = build_route_problem(state, work_plan(state, []))
+        skeleton = initial_skeleton(problem, workforce=6)
+        self.assertEqual(skeleton.spawn_preferences,
+                         ((4, 4), (5, 4), (4, 5), (5, 5), (4, 4)))
+
     def test_required_market_cap_preserves_sale_slot_before_hiring(self):
         state = state_at(hour=20, money=1000, shed={"FERTILIZER": 1})
         problem = build_route_problem(state, work_plan(state, []))
@@ -230,8 +242,8 @@ class RouteCompilerTests(unittest.TestCase):
                                  for n, position in enumerate(positions)])
         problem = build_route_problem(state, plan)
         opening = initial_skeleton(problem, workforce=3)
-        first = normalize(problem, _ruin_recreate(problem, opening, Random(16)))
-        second = normalize(problem, _ruin_recreate(problem, opening, Random(16)))
+        first = normalize(problem, _ruin_recreate(problem, opening, Random(4)))
+        second = normalize(problem, _ruin_recreate(problem, opening, Random(4)))
         self.assertEqual(first.routes, second.routes)
         before = {goal: worker for worker, route in enumerate(opening.routes) for goal in route}
         after = {goal: worker for worker, route in enumerate(first.routes)
@@ -263,6 +275,40 @@ class RouteCompilerTests(unittest.TestCase):
         for field in ("resources", "logistics", "acquisitions", "market_priority",
                       "required_entry_caps", "hire_caps", "routes"):
             self.assertEqual(getattr(normalized, field), getattr(custom, field), field)
+
+    def test_route_edit_repairs_only_invalidated_resource_group(self):
+        animal = dict(kind="COOP", animal="GOOSE", placed_day=0, fed_today=False,
+            cared_today=False, consecutive_unfed=0, fertilizer_available=False,
+            pending_care_bonus=0, yield_units=0)
+        state = state_at(hour=18, money=100, shed={"WHEAT": 1},
+                         workers=[((4, 4), {"WHEAT": 1}), ((6, 4), {})],
+                         tiles={(4, 4): animal, (6, 4): animal})
+        plan = work_plan(state, [
+            ("left", (4, 4), ("FEED",), {}),
+            ("right", (6, 4), ("FEED",), {}),
+        ])
+        problem = build_route_problem(state, plan)
+        entities = {entity.positions[0]: entity.identifier
+                    for entity in problem.intent.entities}
+        left = action_goals(problem, entities[(4, 4)])["FEED"]
+        right = action_goals(problem, entities[(6, 4)])["FEED"]
+        base = RouteSkeleton(2, ((left,), (right,)),
+            {entity: 0 for entity in entities.values()},
+            {entity: position for position, entity in entities.items()},
+            (ResourceLink(left, "WHEAT", 1, "CARRY", source_worker=0),
+             ResourceLink(right, "WHEAT", 1, "PURCHASE")),
+            tuple(TileLease(entity, position) for position, entity in entities.items()))
+        base = with_initial_logistics(problem, base)
+        edited = replace(base, routes=((), (right, left)), logistics={})
+        rebuilt = _construct_route_candidate(problem, base, edited)
+        self.assertIsNotNone(rebuilt)
+        right_links = [link for link in rebuilt.resources if link.consumer == right]
+        left_links = [link for link in rebuilt.resources if link.consumer == left]
+        self.assertEqual(right_links,
+                         [ResourceLink(right, "WHEAT", 1, "PURCHASE")])
+        self.assertFalse(any(link.kind == "CARRY" and link.source_worker == 0
+                             for link in left_links))
+        self.assertEqual(sum(link.quantity for link in left_links), 1)
 
     def test_initial_constructor_keeps_a_natural_spatial_district(self):
         positions = ((0, 0), (0, 1), (1, 0), (1, 1))
@@ -341,24 +387,6 @@ class RouteCompilerTests(unittest.TestCase):
         routed = {goal for route in initialized.routes for goal in route}
         self.assertEqual(len(initialized.placements), len(problem.intent.entities))
         self.assertEqual(set(problem.goals), routed & set(problem.goals))
-
-    def test_staffing_compression_preserves_identical_goal_set(self):
-        positions = ((4, 4), (4, 5), (5, 4))
-        state = state_at(hour=18, money=20,
-                         tiles={position: crop() for position in positions})
-        plan = work_plan(state, [(f"crop-{n}", position, ("WATER",), {})
-                                 for n, position in enumerate(positions)])
-        problem = build_route_problem(state, plan)
-        skeleton = initial_skeleton(problem, workforce=2)
-        original = compile_skeleton(problem, skeleton)
-        compressed = [compile_skeleton(problem, candidate)
-                      for candidate in _compress_workforce_frontier(
-                          problem, skeleton, limit=6)]
-        self.assertTrue(any(result.completed == original.completed
-                            and result.diagnostics["workforce"] == 1
-                            and result.diagnostics["hire_expenditure"] == 0
-                            for result in compressed))
-
 
 if __name__ == "__main__":
     unittest.main()

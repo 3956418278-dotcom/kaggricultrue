@@ -218,7 +218,8 @@ def _route_cost(start, route, positions):
 def _starts(state, workforce):
     access = rules.shed_access(state.board_size)
     starts = [w.position for w in state.workers]
-    starts.extend(access[(i-len(starts)) % len(access)] for i in range(len(starts), workforce))
+    opening = len(starts)
+    starts.extend(access[(i-opening) % len(access)] for i in range(opening, workforce))
     return tuple(starts)
 
 
@@ -251,20 +252,41 @@ def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: in
                if path and entity in skeleton.placements}
     placed_goals = set()
     horizon = min(problem.intent.state.turns_left_today, problem.intent.state.turns_left)
+    events = selected_events(problem, skeleton)
+    access = rules.shed_access(problem.intent.state.board_size)
 
     def flattened(blocks):
         return [goal for block in blocks for goal in block]
 
+    def route_cost(worker, goals):
+        """Service turns plus logistics implied by this assignment."""
+        service = _route_cost(starts[worker], goals, positions)
+        carried = Counter(problem.intent.state.workers[worker].inventory
+                          if worker < len(problem.intent.state.workers) else {})
+        pickups = set()
+        for goal in goals:
+            event = events[goal]
+            for item, quantity in _needed(event).items():
+                if item.endswith("_SEED"):
+                    continue
+                available = min(quantity, carried[item])
+                carried[item] -= available
+                if available < quantity:
+                    pickups.add(item)
+            carried.update(_produced(event))
+        if not pickups:
+            return service
+        first = positions[goals[0]] if goals else starts[worker]
+        via = min(rules.manhattan(starts[worker], shed)
+                  + rules.manhattan(shed, first) for shed in access)
+        direct = rules.manhattan(starts[worker], first)
+        return service+len(pickups)+max(0, via-direct)
+
     def capacity(worker):
-        # Service-only route cost omits at least the route's material pickup and
-        # synchronization slack. Reserving a small physical margin prevents a
-        # spatially compact route from being declared feasible only because its
-        # necessary logistics were ignored; it is not a load-balancing target.
-        support_margin = max(1, horizon // 8)
         if worker < len(problem.intent.state.workers):
-            return max(1, horizon-support_margin)
+            return max(1, horizon)
         hire_rank = worker-len(problem.intent.state.workers)
-        return max(1, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS-support_margin)
+        return max(1, horizon-1-hire_rank//rules.MAX_MARKET_ORDERS)
 
     while pending:
         ready = [(min(problem.goals[goal].deadline for goal in block), -len(block), entity, block)
@@ -277,7 +299,7 @@ def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: in
         _, _, entity, block = min(ready)
         best = None
         lease_requirement = lease_predecessor.get(entity)
-        current_costs = [_route_cost(starts[w], flattened(block_route), positions)
+        current_costs = [route_cost(w, flattened(block_route))
                          for w, block_route in enumerate(block_routes)]
         for worker in range(workforce):
             for at in range(len(block_routes[worker])+1):
@@ -285,7 +307,7 @@ def initial_routes(problem: RouteProblem, skeleton: RouteSkeleton, workforce: in
                                              for prior in block_routes[worker][at:]):
                     continue
                 trial_blocks = block_routes[worker][:at]+[block]+block_routes[worker][at:]
-                trial_cost = _route_cost(starts[worker], flattened(trial_blocks), positions)
+                trial_cost = route_cost(worker, flattened(trial_blocks))
                 costs = list(current_costs); costs[worker] = trial_cost
                 overruns = [max(0, cost-capacity(w)) for w, cost in enumerate(costs)]
                 # Capacity violations are infeasibility, but among feasible
