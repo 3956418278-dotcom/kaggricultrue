@@ -1,125 +1,100 @@
 # Current State
 
-## Project definition and accepted baseline
+## Project and baseline
 
-The project targets full Kaggriculture, pinned to `kaggle-environments==1.32.7` and schema `0.1.0`. `PROJECT.md` owns stable semantics and architecture; `EVALUATION.md` owns evidence rules. The environment/reference bootstrap is complete.
+The project targets full Kaggriculture under the pinned
+`kaggle-environments==1.32.7` contract. `PROJECT.md` owns stable architecture and
+environment semantics; `EVALUATION.md` owns evidence rules. The maintained root
+`main.py` is a deterministic runnable candidate, not an accepted competitive
+baseline. No competitive promotion claim has been accepted.
 
-The maintained root `main.py` is a deterministic runnable **candidate**, not an accepted baseline. No competitive evidence or baseline promotion has been accepted. Packaging and acceptance-quality arenas remain unfinished.
+## Current planning boundary
 
-## Current responsibility boundary
+The production direction is:
 
-- Runtime direction is `real current state -> fixed Daily Plan -> intraday planner -> trajectory`.
-- Daily economics uses the full current farm, including land/layout and existing structures. Commitments retain `(C,T,L,A,Q,R)`; actual existing locations stay fixed and economically equivalent new placements have explicit state-derived domains.
-- `ExecutionChoices` is separate from Plan. The former `Realization(Plan)`, `bind_plan` and `unbind_project` interfaces are removed. Choices hold placement witnesses and staffing, without replacing or modifying economic commitments.
-- Plan no longer contains a hire count or HIRE support commitments. The retained weak benchmark estimates staffing in the execution layer; the provisional search compares staffing variants.
-- Selling is owned by `market.py`, outside Plan. Expected revenue remains an economic estimate, not a sale schedule. Terminal recovery objectives concern recoverable farm output, not prescribed sales. Input-protected market entry ordering remains implemented.
-- Task generation is restricted to today's commitment work schedules, plus supporting logistics. Ordinary intraday observations retain the same economic Plan. Physical divergence triggers execution repair, not silent economic replanning or reduction of targets.
-- The submitted candidate still uses the **legacy restricted neighborhood search**. The event-route research planner is implemented and materially stronger on the development references, but it has not replaced the submitted policy because its dense-day runtime is not viable. The rejected joint temporal/resource model remains research infrastructure only.
+```text
+OwnedState + Plan
+    -> solve_intraday()
+    -> Realization
+    -> execute_realization()
+    -> S_end
+```
 
-## Maintained capabilities
+- `Plan` owns today's required economic/farm outcomes, exact placement of every
+  affected project, required outputs and deadlines. It may contain a small
+  `EconomicWindow` only when a sale, purchase, shed/cash condition or extra-hand
+  allowance has economically important timing.
+- `EconomicCommitment.required_state` and `required_outputs` are the canonical
+  intraday requirements. `EconomicCommitment.target` is exact. There is no
+  production `placement_domains` field.
+- `(C,T,L,A,Q,R)` remains the economic-planning record. In particular,
+  `ActionDimension.work` supports project scoring, labor estimation and capacity
+  planning; intraday does not interpret it as primitive work.
+- Intraday owns worker assignment, route/order, Manhattan travel and the sparse
+  resource precedences/logistics needed to execute the fixed Plan. Normal
+  purchase, hire and land orders are placed mechanically at the earliest legal
+  turn. Market timing is otherwise absent.
+- `Realization` remains the only public intraday result. A partial Plan is never
+  returned. `execute_realization()` replays real rules and requires every Plan
+  outcome/window. `end_value()` is diagnostic only and is not an intraday
+  objective.
 
-- Thin submission entrypoint; contract normalization; immutable owned-state reconstruction; one policy rule/transition owner; structured economic commitments; daily lifecycle; execution tasks; reactive market module; retained trajectories and greedy sanity benchmark.
-- Verified ordering and timing: atomic seed requests, ordered unit actions before market, market lockstep, town demand, crop/animal production, fertilizer, shed overflow, daily automatic inventory drop, hand removal/farmer reset, and the 718/719 terminal boundary.
-- Earlier correctness fixes remain: valuable final watering before one-time harvest, feed/care-derived animal yield, marginal fertilizer output, recoverable terminal crop/animal yield, and protection of required purchases from market-entry truncation.
-- Local official-scene replay viewer and deterministic environment, candidate, transition-parity and replay tests.
-- An inspectable event-route realization path now separates combinatorial route structure from deterministic primitive compilation: atomic service routes, staffing, open placement, resource links, temporal tile leases, synchronized ordered effects, explicit shed logistics and market-input feasibility are compiled through the maintained rule transition without rewriting Plan.
-- Python 3.12.3 and the exact local dependency lock remain maintained in the project environment. The authenticated `kaggle` Conda environment is separate tooling, not the simulation runtime.
+## Current intraday implementation
 
-## Plan-to-realization reference collection
+`src/kaggriculture_agent/intraday.py` contains one private event-based CP-SAT
+solver. For each Plan outcome it mechanically derives one shortest legal local
+action chain through `rules.advance_owned(..., unit_only=True)`. The CP model then
+contains fixed-location service events, event-to-worker assignment, per-worker
+route successor arcs, event times required for travel/deadlines, and sparse
+source/pickup/drop/transfer choices.
 
-The user approved a private CPU-only Kaggle pilot, with checkpoints before planner redesign. No model training is in scope.
+The model has no project-placement variables, no local-chain-choice variables,
+no normal market-time variables, and no worker-by-turn position/inventory or
+storage-by-turn lattice. Fixed workforce values are tried from low to high; the
+first complete exact solution wins. Within one workforce, transparent execution
+preferences cover residual purchases, worker actions, movement, logistics and
+makespan. No LNS, regret insertion, population or repair stack is present.
 
-Maintained implementation:
+The compact solver's search strength at full development scale is not
+established. The prior dense temporal model and the route population/support
+pipeline are rejected designs and are not production fallbacks. Their historical
+development outputs remain only in ignored run artifacts and git history.
 
-- `src/kaggriculture_eval/player_days.py`: shared-field/clock normalization, official full-replay reexecution, semantic unit-effect extraction, day slicing, attempted-versus-achieved effects, placement domains and deterministic compressed episode shards.
-- `src/kaggriculture_eval/reference_pipeline.py`: **one cloud run** collects metadata, qualifies sides, reads official Dataset-mounted replays, validates transitions, reconstructs Plans/realizations, checkpoints each episode and audits the result. Collection does not defer reconstruction to another job. Runtime-limited partial outputs are explicit; compatible checkpoints can resume without reexecuting valid shards.
-- `src/kaggriculture_eval/reference_audit.py`: streaming checks for source/shard identity, actual qualification, complete day chains, clocks, goal/effect counts, attempts, placement membership and the Plan/execution boundary. These checks do not establish execution optimality.
-- `scripts/kaggle_reference_pilot.py`: reusable private CPU notebook preparation, now with explicit source versions, candidate/runtime/query bounds, frozen selection reuse and optional metadata bootstrap. New metadata collection occurs in the cloud. The source allowlist is hashed, notebook size checked against Kaggle's 1 MB limit, and exact extractor/installed package identities retained in output. Usage: `references/player-day-pipeline.md`.
-- `scripts/fetch_kaggle_outputs.py`, `scripts/audit_player_days.py` and `scripts/prepare_reference_dataset.py`: safe selected-output retrieval, audit and allowlisted private Dataset staging. Raw replays, credentials and disposable metadata caches are not included in the staged Dataset.
-- `scripts/restore_reference_dataset.py` and `reference_storage.py`: lossless restoration of Kaggle-expanded JSONL into original hash-verified gzip checkpoints. This is storage handling, not a second Plan-reconstruction stage. Original expanded extractor files retain separate source-hash checks.
-- `scripts/inspect_player_day.py`: HTML inspection with official day-start/day-end scenes, a realization timeline, an economic-effect table and worker/market traces. Opponent public farm state is retained, but its private inventory is not reconstructed or represented as known.
+## Reference data and adapters
 
-Source and selection evidence:
+The private player-day pilot remains exploratory development data, not
+competitive evidence. It contains 2,880 player-days from 78 reproduced episodes
+and 96 qualified sides; all source episodes passed official transition and
+terminal-reward replay checks. Dataset and provenance details remain under
+`.cache/reference-pilot-20260905/` and the private Kaggle Dataset recorded in
+project references.
 
-- Official index `kaggle/kaggriculture-episodes-index`, inspected version 37: 37 daily datasets and 26,212 episodes. Index manifest SHA-256: `78c4d110c8e1f5c1b78654ed6d164dc1ac22f59b2098683d34622fc6356747fe`.
-- Source: `kaggle/kaggriculture-episodes-2026-09-04`, **verified version 1**, 668 candidates. Daily manifest SHA-256: `91b2037cdad455022cf90688d593b72cc93c84f767f7ad1be722d3eccd67c1a4`.
-- Index/daily manifests have aggregate scores, not player-side ratings. Replays have names but no submission IDs. The public episode service actually returned submission ID, team ID, side index and pre-/post-game score; confidence was not present in the inspected responses. Metadata discovery is not a leaderboard-ranking method.
-- Frozen leaderboard snapshot: 2026-09-05 13:44:52 UTC. Qualify each side only if its team is in that snapshot's top ten and its pre-game rating is at least the tenth-place score, **2828.9**. This is a snapshot-qualified high-rating cohort, not proven historical top-ten rank or optimal execution.
-- A deterministic hash sample selects 100 episodes before extraction, without selecting winners. Cached metadata joins 94 candidates and qualifies 96 player-sides before replay validation. Six missing joins stay unqualified; the other side is not automatically included.
-- The sampled official replay 105620288 reproduced all 719 joint transitions, 1,440 player observations and terminal rewards under the pinned engine. Local illustrative extraction produced 60 player-days; this is a pipeline check, not the final dataset.
-- Frame `t+1` contains the action from state `t`; side 1 can omit shared `step`. Days 0–28 have 24 actionable turns; day 29 has 23.
+New extraction schema `player-day-v3` produces one outcome-oriented commitment
+per achieved farm entity/day, fixes its demonstrated placement, aggregates its
+required outputs, and excludes failed attempts and primitive action records from
+Plan. The frozen dataset is older schema and remains immutable;
+`kaggriculture_eval.plan_io.plan_from_sample()` migrates it only inside the
+reference adapter before constructing the canonical production `Plan`.
 
-Audited pilot:
-
-- Private notebook: https://www.kaggle.com/code/f7e6n5g4/kaggriculture-player-day-pilot
-- Notebook version 1 completed on 2026-09-06. Of 100 candidates, **78 extracted, 22 unqualified, zero quarantined**: **2,880 player-days, 96 qualified sides, six teams and ten submissions**. Six candidates lacked metadata; sixteen had no qualified side.
-- All extracted episodes passed 719 official joint transitions, 1,440 observation comparisons and terminal-reward checks. Cloud Python was **3.12.13**, engine 1.32.7, official source SHA-256 `bc8a54879ef02c7ea64b8b333d6a976f0ea65c4949149d01f463f23bccee653e`. Summed recorded episode processing was **980.61 seconds**; this is not total notebook wall time.
-- Local audit verified every shard hash and all 2,880 samples: **281,737 economic-effect goals**, including **218 unfulfilled attempt-only goals**, no empty Plans and no phantom retry entities in this pilot. Qualification is not a claim that demonstrations are flawless. Raw action/no-op counts are diagnostics, not waste scores.
-- Extraction identity: `ae2878626e1b7d157cd9b26a47519daf17573d0aa513b018081125bc388a5323`. Immutable schema-v1 outputs and audit: `.cache/reference-pilot-20260905/cloud-output/player-days/` and `.cache/reference-pilot-20260905/audit.json`.
-- Private Dataset https://www.kaggle.com/datasets/f7e6n5g4/kaggriculture-player-day-references: **ID 11917310, version 1, Ready**, with `isPrivate=true` verified through Kaggle's API. The staging set contains 87 allowlisted files (70.3 MB), exact original extractor source and separately identified inspection tools. Creation receipt: `.cache/reference-pilot-20260905/dataset-create-receipt.json`.
-- Kaggle automatically expanded gzip shards to `.jsonl` and zipped sources into named directories, reporting **2.03 GB online**. Restore Dataset downloads/mounts with the maintained storage command before checkpoint audit/resume; notebook outputs still use original gzip paths. The pilot's archived inspection tools predate this adapter; use the maintained repository restoration command with v1.
-
-Larger integrated run:
-
-- Private CPU notebook https://www.kaggle.com/code/f7e6n5g4/kaggriculture-player-day-collection, **version 1**, successfully launched; Kaggle reports **RUNNING**. Startup confirmed 2026-09-06; further monitoring stopped as requested. Completion and output counts are not yet known.
-- Expands to **all 668 candidates** in the same frozen source, without changing the leaderboard snapshot or threshold. Bootstrap metadata joins 631 episodes and qualifies 674 sides (up to 20,220 player-days before validation); cloud discovery may improve coverage but cannot relax qualification.
-- Collection, validation, reconstruction and audit are in the same job, with 24 additional metadata-query maximum, 3-hour extraction budget and 4-hour notebook cap. No GPU or training. Preparation and launch receipt: `.cache/reference-scale-20260906/`.
-- The launched notebook is frozen. A storage-restoration wrapper was added to future notebook preparation after observing Dataset archive expansion. Resuming this already-launched version requires restoring its Dataset checkpoint before passing it to the exact archived extractor; do not mix a freshly generated extractor identity with its checkpoints.
-- Schema **player-day-v2** fixes a focused, reproducible edge case where repeated input-starved planting attempts became multiple new-asset goals. Retries now share a lifecycle-scoped identity; successful removal resets it. Unit effects also use the recorded shed capacity. The earlier pilot did not exhibit the retry defect and stays immutable; its v1 shards are not reused as v2 checkpoints.
-- Generated caches, downloaded outputs and staging directories remain ignored data, not project authority. A larger completed Dataset version will preserve the cloud-produced references; publication is not a separate reconstruction run.
+The frozen nine-row development benchmark uses episodes 105527696 and 105448362
+on days 8, 16 and 24. Held-out episodes remain untouched. A run of the new
+responsibility boundary has not been authorized or completed; the benchmark is
+paused pending user confirmation.
 
 ## Current validation
 
-### Intraday model under development
+- Focused Plan/intraday/reference tests pass in the optional OR-Tools environment.
+  They cover fixed placement, outcome-based exact validation, rejection of
+  partial realizations, ActionDimension independence, minimal economic-window
+  timing and reference extraction/audit.
+- A production initial-state Plan expands mechanically to fixed jobs, but this is
+  only a formulation check, not evidence of route-search strength or runtime.
+- No new nine-row result, held-out result, competitive arena result or runtime
+  acceptance claim exists for this boundary.
 
-- The first research candidate used **joint temporal constraint optimization**. `references/intraday-model-design.md` records that formulation. It is now rejected as the runtime representation: it remains useful for small correctness cases, but its dense turn/worker/position/resource lattice did not search effectively within the action budget.
-- `intent.py` compiles native commitments and reconstructed `STATE_EFFECT` Plans into semantic service requirements and local legal orders using the shared unit transition. `temporal_model.py` represents dated worker positions, service assignment/order, open placements, hiring/spawn, carrying, shared inventories, acquisitions, market-entry capacity, decay and daily refresh. `temporal_session.py` retains trajectories and records acknowledged progress separately from Plan; repairs do not edit production intent. Selling remains in `market.py`.
-- The optimizer includes full-space search and joint constraint neighborhoods. A constructive starting witness supplies a feasible incumbent, not restrictions on staffing, assignments, materials or routes. Its labeling is normalized only across genuinely equivalent new assets. Diagnostics explicitly distinguish a retained witness from a solution improved by joint search; merely returning the witness is not evidence of optimizer strength.
-- The solver dependency is optional and isolated: OR-Tools 9.14.6206, protobuf 6.31.1 and immutabledict 4.3.1 in `.cache/planner-runtime`, layered over the pinned local game environment. `requirements-planning.txt` owns this overlay. The base `.venv`, main submission imports and accepted-baseline status are unchanged.
-- Nineteen focused temporal-model tests pass in the optional solver environment. The canonical suite has 97 tests and passes under the pinned base environment, with the fourteen optional solver tests skipped there as intended. Coverage includes official trajectory parity, primitive-only projection, atomic seeds, shared pickup/feed, hiring availability, build/place ordering, fertilizer/water/harvest timing, decay, normal/terminal inventory handling, insertion-order overflow, land cost/availability, sale-entry truncation, retained execution and equivalent-asset witness labeling.
-- `plan_io.py`, `realization_benchmark.py` and `scripts/benchmark_realizations.py` compare the exact same starting state and Plan using official reachable effects, maximum one-to-one semantic matching and resulting states. Candidate inputs exclude demonstrated actions. Both controlled trajectories use an opponent-PASS background with random weeds disabled; the recorded reference is scored separately, and a change in its fulfilled goals is explicitly flagged. No automatic financing adjustment is imposed.
-- Episode membership was frozen before quality tuning: **59 development / 19 held-out episodes**, using the named SHA-256 split in `runs/temporal-split-20260906/manifest.json`. Every side and day of an episode stays in its partition. Held-out performance has not been inspected. Initial comparisons use a predetermined development episode; ten player-days from one episode are not ten independent games or broad strength evidence.
-- The frozen development run contains fifteen player-days from two predetermined episodes. The temporal candidate matched reference completion on six, but averaged 12.33 fewer completed goals; representative midgame gaps were 62/82, 111/126, and 120/142. Median planning time was 24.93 seconds and maximum 32.41 seconds. Search improved its starting witness on only one of fifteen cases. Raising the deterministic budget to 20 units on two day-8 states took 35--39 seconds and left completion at 62/82 and 72/89. This is decisive rejection evidence for the dense representation, not evidence that constraint or route optimization in general cannot work.
-- `references/intraday-formulation-study.md` compares four different representations against all 2,880 pilot player-days. A typical reference has 112 goals over 63 entities and about 12 workers, but compresses to about 70 same-position visit blocks. With demonstrated assignment/order fixed, Manhattan distances explain about 94% of movement on average. Event-route-skeleton search with deterministic primitive compilation is selected as the first engineering hypothesis; macro CP with validation cuts remains a credible peer, while event-driven forward search and route-column generation have recorded trigger conditions.
-- Whole-entity jobs and static placement exclusion were rejected during independent design review. Strong replays commonly split one entity across workers, use same-turn ordered effects, and clear then reuse tiles. The selected representation must therefore route atomic service/logistics events under local precedence, permit explicit synchronized worker-order bundles, and model temporal tile leases. Hire-turn movement ties, ordered shed transfers, and capacity-sensitive deposit order also remain explicit when consequential.
-- `route_structure.py` and `route_compiler.py` now implement that event-route representation and an earliest-feasible deterministic trajectory compiler. Demonstrated route skeletons compile all goals on the two original day-8 references (82/82 and 89/89). The compiler preserves Plan targets and reports unfinished work instead of reducing it.
-- `route_search.py` now performs all structural optimization inside protected fixed-workforce basins. The 300-proposal budget is distributed evenly across the retained workforce levels; there is no mixed-workforce population. Neighbor migration is limited to transferring a structure between adjacent basins inside that same proposal budget, after which the target basin continues its own assignment/order/placement/resource/logistics search.
-- Each basin starts from the ordinary constructor plus deterministic spatial districtings of the actual placed work. These are diverse seeds, not route templates that bound later search. Basin populations retain up to the configured population per workforce, so lower-workforce intermediate structures cannot be evicted by easier high-capacity schedules.
-- Route construction and ruin/recreate use candidate-derived input chains, pickup actions and shed detours when estimating capacity. The fixed `horizon // 8` support margin is removed. Total route cost owns feasible insertion decisions before peak-load tie-breaking, avoiding an artificial load-balancing objective.
-- `normalize()` refreshes only derived tile leases. Route edits now reconcile resources per consumer/item group: valid searched carry, shed, purchase and producer links are reserved first, and only invalidated groups are rebuilt from residual stock/output. Compatible acquisition batches, market ordering and logistics placement remain stable. Lifecycle, lease, resource, logistics and route precedence are validated as one DAG before a candidate enters search.
-- Cheap pruning includes the real hire, acquisition and land expenditure implied by a structure. Exact selection remains lexicographic: Plan completion, maintained reached-state economic value, then worker turns, movement and logistics. Ledger expenditures remain diagnostics and are not subtracted twice.
-- Exact replay is a bounded evaluator rather than a second planner. The default cap is 32 exact compilations (down from 96). It may spend at most four evaluations relocating compiler-observed unfinished events within the selected fixed-workforce basin. Cross-basin exact descent, exact reconstruction waves, staffing compression and final-feedback cascades are removed.
-- `rules.py` and `route_compiler.py` continue to provide exact opponent-PASS transitions and transaction ledgers for workforce, hire timing/expenditure, inputs, land, sales, ending cash and item breakdowns. Selling remains market-owned and outside Plan.
-- `realization_benchmark.py`, `scripts/benchmark_route_realizations.py` and `scripts/summarize_route_benchmark.py` compare only against the strong controlled reference/witness. They retain goal sets, resulting cash/inventory/assets/layout, workforce and hire timing/expenditure, input/land expenditure, sale revenue and conditionally comparable labor/movement/logistics. The reference is a strong feasible witness, not an optimum.
-- The clean focused development run uses days 8, 16 and 24 for every qualified side of the same two predetermined development episodes: nine player-days and 1,078 reference goals. Demonstrated skeletons compile **1,078/1,078**, so no representation or demonstration-compilation gap is established. Blind coherent search realizes **1,065/1,078**, matches **4/9** reference goal sets, and leaves **13 goals on five rows** as search gap. Held-out episodes remain untouched.
-- On the four equal-goal rows, relative to the controlled reference, workforce averages **4.5 higher** (range 0 to +7), hire expenditure averages **$5,836.25 higher**, and maintained economic-state value averages **$5,750 lower**. Worker turns average 7 more, movement 12.75 more, and pickup/drop/place actions 0.75 more. These are reference comparisons only; no former-planner result is used for validation.
-- Search time on the clean run averages **35.97 seconds** and peaks at **58.98 seconds**. Exact replay averages 30.33 compilations, peaks at the cap of 32, and totals 273. This is a substantial reduction from the removed cascade but remains unsuitable for the one-second action allowance without retained-plan amortization or further optimization. Immutable development rows and analysis are under ignored `runs/route-coherent-workforce-even-development-20260908-v2/`.
+## Next confirmation point
 
-### Maintained submission and collection checks
-
-All **117 maintained tests pass** under the pinned local environment, with fourteen optional temporal-solver tests skipped as intended. Route coverage includes stable normalization semantics, local resource reconciliation after route edits, candidate-derived logistics capacity, spatial-district construction, precedence-feasible mutation, deterministic evenly budgeted workforce basins, placement-complete initialization, multi-assignment ruin-and-recreate, augmenting open-placement reconstruction, reached-state economic ranking without ledger double counting, exact transaction attribution, exact compilation, ordered same-turn work, temporal tile reuse, cross-worker material transfer, balanced hired-worker spawn initialization and set-valued benchmark semantics. The earlier full-episode results below concern the maintained submission, not the research planner.
-
-Four full candidate-versus-starter episodes (seeds 17/29, both seats) completed 720 states with both players DONE and no terminal sellable inventory. Repeated-observation decisions were deterministic. Each episode used 30 daily searches without intraday repair. Maximum local decision times were 1.81–2.07 seconds; measured overage totals were 5.27–7.54 seconds, below the 60-second reserve locally. Reports, source hashes and complete replays are in `runs/boundary-20260905/`. These are integration results, not competitive evidence or proof of remote runtime equivalence.
-
-The older handcrafted execution scenarios remain sanity checks only. Their historical score table is superseded as the maturity standard by the same-state/same-Plan reference benchmark. The initial development run is diagnostic rejection evidence for the temporal formulation, not acceptance evidence for another planner.
-
-## Remaining limitations and decisions
-
-- The semantic player-day schema is **exploratory**, not an accepted benchmark. It captures direct tile effects, land unlocks and their physical input/output deltas. Failed placement retries are now coalesced, but standalone stock-acquisition objectives, ambiguous no-ops, broader entity lifecycles, placement dependencies and alternative-order effect equivalence still need review before defining the planner evaluator. Failed input-dependent actions remain distinct from achieved work.
-- Reconstructed `STATE_EFFECT` commitments remain unsupported by the legacy search/task generator but are supported by the new semantic compiler. Development comparisons now exist; they expose remaining deficiencies, not planner maturity.
-- The rejected joint temporal encoding remains outside `main.py`; the maintained submission still uses the legacy scheduler. The event-route planner is also not integrated because current exact replay and search costs are far above the runtime budget.
-- Event-route representation coverage is encouraging but not proved complete. The clean focused report establishes no unexpressible pattern or demonstration-translation miss. More varied development references may still reveal genuine representation gaps.
-- The focused reference slice still has 13 search-missing goals on five of nine rows, concentrated most heavily on the dense day-24 cases. No missing goal is attributed to an established representation gap: the demonstrated skeleton is a full feasible witness in every row. The limiting issue is primary-search coverage and pruning of tight assignment/order/resource structures.
-- Excess staffing remains material even after making workforce basins first class: the four equal-goal rows average 4.5 more workers and substantially worse reached-state value than the reference. Lower-workforce basins now receive equal structural budgets, so the next work should improve their within-basin reconstruction and approximate/exact agreement rather than reintroducing compression or cross-workforce exact descent.
-- State evaluation gives fulfillment precedence, then uses quoted inventory and surviving-asset option values with a simple future-service-distance estimate. Those are not exact long-horizon terminal-cash predictions. Native duplicate physical obligations share an execution acknowledgement; reference effect matching is exploratory and must not be mistaken for hidden-intent inference.
-- Daily admission and multi-day asset value retain coarse labor/travel/storage assumptions and optimistic future maintenance. They are not proofs of executable terminal profit.
-- Selling remains separate. Sale-financing effects have not been counterfactually measured; flag/control them only when they materially change achievable realization, not merely because hiring occurs.
-- Pilot cloud Python and engine source identity are verified; the entire image was not pinned. The larger run records installed distribution versions as additional provenance. Local dependency identity does not establish byte-identical Kaggle infrastructure.
-- Tooling environment Kaggle CLI 2.2.3 failed to read its upload-resume cache (`KaggleObject.from_dict` signature mismatch) following a transient SSL transfer failure, so the successful Dataset retry retransferred files. This is separate from the tested extraction checkpoint mechanism; large future uploads may need a tooling compatibility fix.
-- Acceptance arena design, packaged submission validation, immutable baseline designation and competitive promotion remain separate unfinished work.
-
-## Next meaningful work
-
-Profile dense-day support reconstruction, causal validation and exact compilation, then reduce their cost without weakening stable candidate semantics or narrowing assignment/order space. Improve within-basin route/resource organization on equal-goal rows where economic value or worker turns regress. Freeze a runtime-feasible configuration and rerun a broader development slice before touching held-out episodes or considering integration into `main.py`.
-
-The larger private collection was successfully started and is not being monitored, as requested. Its completion/publication can be handled at a separately requested checkpoint; it is not blocking planner development on the available audited pilot.
+Before any frozen nine-row run, report the canonical Plan fields, deleted
+decision-variable families, focused test result, and one real development
+player-day's fixed-job/precedence/assignment/route-variable profile. Only proceed
+to benchmark after explicit user confirmation.

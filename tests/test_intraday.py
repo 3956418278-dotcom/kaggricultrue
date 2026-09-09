@@ -1,13 +1,15 @@
 """Public intraday contract and exact-completion invariants."""
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 import unittest
 
 from kaggle_environments import make
 
 from src.kaggriculture_agent.execution import InvalidRealization, execute_realization
-from src.kaggriculture_agent.intraday import solve_intraday
+from src.kaggriculture_agent.economics import ActionDimension, WorkAmount
+from src.kaggriculture_agent.intraday import _expand_plan, solve_intraday
+from src.kaggriculture_agent.planner import EconomicWindow
 from src.kaggriculture_agent.realization import PlanningFailure, Realization, TurnDecision
 from src.kaggriculture_agent.state import reconstruct
 from src.kaggriculture_eval.plan_io import plan_from_dict
@@ -53,6 +55,32 @@ class IntradayContractTests(unittest.TestCase):
                             for turn in self.realization.turns
                             for action in turn.worker_actions))
         self.assertTrue(any(tile.animal == "COW" for tile in ending.tiles))
+
+    def test_action_dimension_is_not_an_intraday_prescription(self):
+        altered = replace(self.plan,
+            obligations=tuple(replace(project, actions=ActionDimension((
+                WorkAmount(self.plan.day, "DIG", 99, position=(9, 9)),
+            ))) for project in self.plan.obligations),
+            selected=tuple(replace(project, actions=ActionDimension((
+                WorkAmount(self.plan.day, "DIG", 99, position=(9, 9)),
+            ))) for project in self.plan.selected))
+        original = _expand_plan(self.state, self.plan)[0]
+        changed = _expand_plan(self.state, altered)[0]
+        signature = lambda projects: tuple(
+            (project.position, tuple(event.action for event in project.events))
+            for project in projects)
+        self.assertEqual(signature(original), signature(changed))
+
+    def test_explicit_economic_window_is_the_only_market_timing_input(self):
+        empty = replace(self.plan, obligations=(), selected=(), support=(),
+            economic_windows=(EconomicWindow(
+                2, 3, market_orders=(("BUY_SEED", "WHEAT", 1),),
+            ),))
+        realization = solve_intraday(self.state, empty)
+        execute_realization(self.state, empty, realization)
+        timed = [(index, order) for index, turn in enumerate(realization.turns)
+                 for order in turn.market_orders]
+        self.assertEqual(timed, [(2, ("BUY_SEED", "WHEAT", 1))])
 
     def test_incomplete_realization_is_never_a_result(self):
         with self.assertRaises(InvalidRealization):

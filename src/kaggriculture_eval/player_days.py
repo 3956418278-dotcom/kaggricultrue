@@ -1,13 +1,14 @@
 """Official replay -> fixed daily intent + demonstrated execution.
 
 Effects are obtained from the official unit transition, not a verb taxonomy.
-Locations of existing assets are constraints; newly created entities have
-placement domains and stable logical identities, independent of worker routes.
-No future replay actions are supplied to the planner input.
+Each day's achieved changes for one stable farm entity are collapsed into one
+outcome at its exact Plan-owned placement. Worker routes, primitive actions and
+failed attempts remain in the reference trace, not the canonical Plan.
 """
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict
 import gzip
@@ -21,15 +22,15 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official
 from src.kaggriculture_agent.economics import (
     ActionDimension, CashDimension, EconomicCommitment, LandDimension,
     OccupancyInterval, PhysicalDimension, RevenueDimension, TimeDimension,
-    TimedAmount, WorkAmount,
+    TimedAmount,
 )
 from src.kaggriculture_agent.planner import Plan
 
-SCHEMA_VERSION = "player-day-v2"
+SCHEMA_VERSION = "player-day-v3"
 
 
 def jsonable(value):
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(k): jsonable(v) for k, v in value.items()}
     if isinstance(value, (tuple, list, set, frozenset)):
         return [jsonable(v) for v in value]
@@ -175,7 +176,7 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
                  if tile == "LOCKED" and official._quadrant_of(x, y, len(initial_tiles)) in new_land}
     entities = {(x, y): f"existing:{x}:{y}" for y, row in enumerate(initial_tiles)
                 for x, tile in enumerate(row) if isinstance(tile, dict)}
-    entity_domains, goals, trace, pending_entities = {}, {}, [], {}
+    entity_domains, trace, pending_entities = {}, [], {}
     cleared = set()
     for frame in range(start, end):
         obs = observation(replay, frame, side)
@@ -206,41 +207,68 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
                     pending_entities[retry_key] = entity
             else:
                 entity = entities.get(pos, f"existing:{pos[0]}:{pos[1]}")
-            fixed = None if entity.startswith("new:") else pos
-            requirement = {"entity": entity, "fields": event["fields"], "physical_delta": event["physical_delta"]}
-            key = digest(requirement)
-            if key not in goals:
-                goals[key] = {**requirement, "position": fixed, "achieved": False,
-                              "attempted": False, "count": 0}
-            goal = goals[key]
-            goal["achieved"] |= event["achieved"]
-            goal["attempted"] |= not event["achieved"]
-            goal["count"] += int(event["achieved"])
-            step_events.append({**event, "goal": key, "entity": entity})
+            step_events.append({**event, "entity": entity})
             if after is None and event["achieved"]:
                 entities.pop(pos, None)
                 cleared.add(pos)
                 pending_entities = {k: v for k, v in pending_entities.items() if k[0] != pos}
         trace.append({"step": frame, "state_before": obs, "action": action, "effects": step_events, "noops": noops,
                       "opponent_market": deepcopy((replay["steps"][frame + 1][1-side].get("action") or {}).get("market", []))})
-    commitments, domains = [], {}
-    for identifier, goal in sorted(goals.items()):
-        position, entity = goal["position"], goal["entity"]
-        delta = goal["physical_delta"]
-        inputs = tuple(TimedAmount(start, k, -v) for k, v in delta.items() if v < 0)
-        outputs = tuple(TimedAmount(end, k, v) for k, v in delta.items() if v > 0)
-        commitments.append(EconomicCommitment(identifier=identifier, kind="STATE_EFFECT", target=position,
-            existing=position is not None, cash=CashDimension(),
+    by_entity = {}
+    for turn in trace:
+        for event in turn["effects"]:
+            if not event["achieved"]:
+                continue
+            record = by_entity.setdefault(event["entity"], {
+                "position": tuple(event["position"]), "events": [],
+            })
+            if record["position"] != tuple(event["position"]):
+                raise ValueError("one daily farm entity occupied multiple placements")
+            record["events"].append(event)
+
+    commitments, entity_goal = [], {}
+    for entity, record in sorted(by_entity.items()):
+        events = record["events"]
+        inputs, outputs = Counter(), Counter()
+        for event in events:
+            for item, quantity in event["physical_delta"].items():
+                if quantity < 0:
+                    inputs[item] += -quantity
+                elif quantity > 0:
+                    outputs[item] += quantity
+        required_state = {"$tile": jsonable(events[-1]["after"])}
+        identity = {
+            "entity": entity,
+            "position": record["position"],
+            "required_state": required_state,
+            "required_outputs": dict(sorted(outputs.items())),
+        }
+        identifier = digest(identity)
+        entity_goal[entity] = identifier
+        commitment = EconomicCommitment(
+            identifier=identifier,
+            kind="STATE_EFFECT",
+            target=record["position"],
+            existing=entity.startswith("existing:"),
+            cash=CashDimension(),
             time=TimeDimension(start, end - 1, end - 1, (end - 1,)),
-            land=LandDimension((OccupancyInterval(position, start, end - 1),)),
-            actions=ActionDimension((WorkAmount(day, "STATE_EFFECT", max(1, goal["count"]), position=position,
-                                               deadline_step=end - 1),)),
-            physical=PhysicalDimension(inputs=inputs, outputs=outputs), revenue=RevenueDimension(),
-            metadata={"entity": entity, "required_effect": goal["fields"],
-                      "demonstrated_count": goal["count"], "attempt_observed": goal["attempted"],
-                      "completion_observed": goal["achieved"]}))
-        if entity in entity_domains:
-            domains[identifier] = entity_domains[entity]
+            land=LandDimension((OccupancyInterval(record["position"], start, end - 1),)),
+            actions=ActionDimension(),
+            physical=PhysicalDimension(
+                inputs=tuple(TimedAmount(start, item, quantity)
+                             for item, quantity in sorted(inputs.items())),
+                outputs=tuple(TimedAmount(end, item, quantity)
+                              for item, quantity in sorted(outputs.items())),
+            ),
+            revenue=RevenueDimension(),
+            metadata={"entity": entity},
+            required_state=required_state,
+            required_outputs=dict(sorted(outputs.items())),
+        )
+        commitments.append(commitment)
+    for turn in trace:
+        for event in turn["effects"]:
+            event["goal"] = entity_goal.get(event["entity"])
     land = tuple(EconomicCommitment(identifier=f"land:{q}", kind="LAND", target=None,
         existing=False, cash=CashDimension(), time=TimeDimension(start, end-1, end-1),
         land=LandDimension(capacity_created=25), actions=ActionDimension(),
@@ -250,16 +278,11 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
         selected=tuple(p for p in commitments if not p.existing), support=land, rejected={},
         fertilize_targets=frozenset(), animal_purchases=(), buy_land=bool(new_land),
         feed_reserve=0, fertilizer_reserve=0, day=day, formed_step=start,
-        max_hands=None, placement_domains=domains,
+        max_hands=None,
         diagnostics={"source": "official-transition-effects", "economic_valuation": "not inferred",
                      "staffing_constraint": "actual cash and Fibonacci costs; no reference staffing cap",
                      "terminal_day": day == 29})
     episode_id = replay["info"]["EpisodeId"]
-    for turn in trace:
-        for event in turn["effects"]:
-            if event["achieved"] and event["entity"] in entity_domains:
-                if tuple(event["position"]) not in entity_domains[event["entity"]]:
-                    raise ValueError("demonstrated placement violates reconstructed domain")
     return jsonable({"schema_version": SCHEMA_VERSION, "sample_id": f"{episode_id}:{side}:{day}",
         "episode_id": episode_id, "side": side, "day": day, "actionable_turns": end-start,
         "environment": {"module_version": replay["module_version"], "configuration": replay["configuration"],
@@ -267,7 +290,7 @@ def reconstruct_day(replay, side, day, qualification, replay_sha256):
         "provenance": {"replay_sha256": replay_sha256, "qualification": qualification},
         "day_start_state": opening, "plan": jsonable(asdict(plan)),
         "demonstrated_realization": trace, "day_end_state": ending,
-        "diagnostics": {"goals": len(goals), "attempt_only_goals": sum(not g["achieved"] for g in goals.values()),
+        "diagnostics": {"goals": len(commitments), "attempt_only_goals": 0,
                         "selling_in_plan": False, "financing_control_required": "not assumed; assess on executable divergence"}})
 
 

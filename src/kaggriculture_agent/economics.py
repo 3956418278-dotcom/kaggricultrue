@@ -119,6 +119,13 @@ class EconomicCommitment:
     physical: PhysicalDimension
     revenue: RevenueDimension
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Canonical intraday outcome.  ActionDimension remains a macro labor/capacity
+    # estimate; it is deliberately not an execution prescription.
+    # ``$tile`` means equality with the complete raw tile value.  Other keys
+    # constrain individual tile fields; ``{"at_least": n}`` is the sole
+    # supported monotone condition.
+    required_state: Mapping[str, object] = field(default_factory=dict)
+    required_outputs: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def terminal_profit(self) -> int:

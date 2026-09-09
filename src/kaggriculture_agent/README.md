@@ -23,19 +23,21 @@ OwnedState + Plan
         -> S_end
 ```
 
-`Plan` describes the day's required economic/farm state changes and deliberately
-does not prescribe the intraday implementation. `Realization` contains only open
-placement commitments and actual per-turn worker/market actions. Assignment,
-order, travel, resource flow, transfers, purchases, hiring and cash timing are
-private solver decisions. Failure to find a fully executable Plan raises
-`PlanningFailure`; no partial realization crosses the API.
+`Plan` describes the day's required economic/farm outcomes, their exact project
+placements, required outputs/deadlines, and any exceptional `EconomicWindow`.
+`ActionDimension` is only a macro labor estimate. `Realization` contains the
+fixed placement commitments and actual per-turn worker/market actions. Worker
+assignment, order, travel and sparse resource logistics are private solver
+decisions. Failure to find a fully executable Plan raises `PlanningFailure`; no
+partial realization crosses the API.
 
-The solver privately derives legal local event chains from Plan and the exact
-rules, then jointly constrains event assignment/timing, placement, movement,
-inventory, market acquisition, hiring and land. Its constructive route is only
-a CP-SAT incumbent. Exact execution through `rules.advance_owned()` is the final
-completion authority, and only full realizations are compared by reached-state
-economic value.
+The solver privately derives one shortest legal local chain for each outcome by
+calling the exact unit transition. It then constrains fixed-position event
+assignment/order, Manhattan travel and sparse source/pickup/transfer relations.
+Normal acquisition, hiring and land orders are placed at the earliest required
+turn; market timing exists only for an explicit economic window. Workforce is
+tried from low to high and the first complete exact realization is selected by
+transparent execution effort, never by `V(S_end)`.
 
 Run focused checks with the OR-Tools environment:
 

@@ -41,6 +41,24 @@ class PlannerConfig:
 
 
 @dataclass(frozen=True)
+class EconomicWindow:
+    """A rare Plan-owned economic timing requirement within the current day.
+
+    Turns are day-relative (0..23).  The listed orders must execute together on
+    one legal turn in the inclusive window, after worker actions for that turn.
+    Shed and cash minima are checked immediately before those orders.  Extra
+    hands merely widen the Plan-authorized staffing cap; they are not required.
+    """
+
+    start_turn: int
+    end_turn: int
+    market_orders: tuple[tuple[object, ...], ...] = ()
+    required_shed: Mapping[str, int] = field(default_factory=dict)
+    minimum_cash: int = 0
+    extra_hands_allowed: int = 0
+
+
+@dataclass(frozen=True)
 class Plan:
     obligations: tuple[EconomicCommitment, ...]
     selected: tuple[EconomicCommitment, ...]
@@ -58,30 +76,7 @@ class Plan:
     revision: int = 0
     replan_reason: str | None = None
     max_hands: int | None = 5  # None: constrained only by cash and remaining time
-    placement_domains: Mapping[str, tuple[Position, ...]] = field(default_factory=dict)
-
-
-def _production_intent(state, projects):
-    """Retain economic spatial constraints, not a route-dependent witness.
-
-    A reusable structure is NOT equivalent to an empty tile requiring
-    construction. Domains describe the actual opening farm; execution may not
-    invent additional land or silently change that construction requirement.
-    """
-    result, domains = [], {}
-    for project in projects:
-        if project.kind in ("CROP", "ANIMAL", "ANIMAL_PLACEMENT"):
-            original = state.tile_at(project.target)
-            domain = tuple(t.position for t in state.tiles if
-                (t.is_empty if original.is_empty else
-                 t.kind == original.kind and t.animal is None))
-            domains[project.identifier] = domain
-            project = replace(project, target=None,
-                land=replace(project.land, intervals=tuple(replace(i, position=None) for i in project.land.intervals)),
-                actions=replace(project.actions, work=tuple(replace(w, position=None) for w in project.actions.work)),
-                metadata={**project.metadata, "requires_construction": original.is_empty and project.kind != "CROP"})
-        result.append(project)
-    return tuple(result), domains
+    economic_windows: tuple[EconomicWindow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -862,36 +857,103 @@ def _support_commitments(
                 deadline_step=realization_step,
             )
         )
-    liquidation_sales = (*inventory_outputs, *tile_outputs)
     if tile_outputs and state.day == 29:
-        support.append(
-            EconomicCommitment(
-                identifier=f"recover:{state.step}",
+        for index, (output, work) in enumerate(zip(tile_outputs, tile_work)):
+            support.append(EconomicCommitment(
+                identifier=f"recover:{state.step}:{index}",
                 kind="RECOVERY",
-                target=None,
+                target=work.position,
                 existing=True,
                 cash=CashDimension(),
                 time=TimeDimension(state.step, rules.TERMINAL_ACTION_STEP, rules.TERMINAL_ACTION_STEP),
                 land=LandDimension(),
-                actions=ActionDimension(
-                    tuple(tile_work)
-                ),
-                physical=PhysicalDimension(
-                    outputs=tuple(tile_outputs),
-                ),
+                actions=ActionDimension((work,)),
+                physical=PhysicalDimension(outputs=(output,)),
                 revenue=RevenueDimension(
-                    projected_sales=tuple(tile_outputs),
-                    projected_gross=_revenue_for_outputs(state, tile_outputs),
+                    projected_sales=(output,),
+                    projected_gross=_revenue_for_outputs(state, (output,)),
                 ),
                 metadata={
                     "inventory_is_sunk": True,
-                    "recoverable_tile_units": sum(
-                        output.quantity for output in tile_outputs
-                    ),
+                    "recoverable_tile_units": output.quantity,
+                    "item": output.item,
                 },
-            )
-        )
+            ))
     return tuple(support)
+
+
+def _canonical_daily_commitment(
+    state: OwnedState, project: EconomicCommitment
+) -> EconomicCommitment:
+    """Attach today's economic outcome without prescribing primitive actions."""
+
+    if project.kind in ("LAND", "HIRE"):
+        return project
+    if project.target is None:
+        raise ValueError(
+            f"daily commitment {project.identifier!r} has no fixed placement"
+        )
+    raw = state.tile_at(project.target).raw
+    required: dict[str, object] = {}
+    outputs: dict[str, int] = {}
+
+    if project.kind == "CROP":
+        required = {
+            "kind": "PLANT",
+            "crop": str(project.metadata["crop"]),
+            "watered_today": True,
+        }
+    elif project.kind == "CROP_MAINTENANCE":
+        crop = str(project.metadata["crop"])
+        harvest_today = project.time.completion_step // rules.TURNS_PER_DAY <= state.day
+        if harvest_today and not rules.CROPS[crop].ongoing:
+            required = {"$tile": None}
+            if isinstance(raw, Mapping):
+                outputs[crop] = max(0, int(raw.get("yield_units", 0) or 0))
+        else:
+            required = {"watered_today": True}
+            if harvest_today:
+                required["yield_units"] = 0
+                if isinstance(raw, Mapping):
+                    outputs[crop] = max(0, int(raw.get("yield_units", 0) or 0))
+    elif project.kind in ("ANIMAL", "ANIMAL_PLACEMENT"):
+        required = {
+            "kind": str(project.metadata["structure"]),
+            "animal": str(project.metadata["animal"]),
+            "fed_today": True,
+            "cared_today": True,
+        }
+    elif project.kind == "ANIMAL_MAINTENANCE":
+        required = {"fed_today": True, "cared_today": True}
+        if isinstance(raw, Mapping) and int(raw.get("yield_units", 0) or 0) > 0:
+            required["yield_units"] = 0
+            item = rules.ANIMALS[str(project.metadata["animal"])].product
+            outputs[item] = int(raw["yield_units"])
+        if isinstance(raw, Mapping) and raw.get("fertilizer_available", False):
+            required["fertilizer_available"] = False
+            outputs["FERTILIZER"] = 1
+    elif project.kind == "FERTILIZER":
+        required = {"fertilized_until_day": {"at_least": state.day + 2}}
+    elif project.kind == "RECOVERY":
+        if isinstance(raw, Mapping) and raw.get("kind") == "PLANT" and rules.CROPS[str(raw["crop"])].ongoing:
+            required = {"yield_units": 0}
+        elif isinstance(raw, Mapping) and "animal" in raw:
+            required = {"yield_units": 0}
+        else:
+            required = {"$tile": None}
+        item = project.metadata.get("item")
+        quantity = int(project.metadata.get("recoverable_tile_units", 0) or 0)
+        if item and quantity:
+            outputs[str(item)] = quantity
+    else:
+        raise ValueError(
+            f"daily commitment {project.identifier!r} has no outcome semantics"
+        )
+    return replace(
+        project,
+        required_state=required,
+        required_outputs=outputs,
+    )
 
 
 def make_plan(
@@ -991,11 +1053,10 @@ def make_plan(
         unit_margin = max(0, 4 * state.market_prices.get("WHEAT", 25) - rules.CROPS["WHEAT"].seed_cost)
         buy_land = state.money - cash_spent - config.cash_reserve >= price and 25 * unit_margin > price
 
-    support = _support_commitments(
-        state, fertilizer_opportunities, buy_land
-    )
-    obligations, owned_domains = _production_intent(state, obligations)
-    selected, new_domains = _production_intent(state, selected)
+    support = _support_commitments(state, fertilizer_opportunities, buy_land)
+    obligations = tuple(_canonical_daily_commitment(state, item) for item in obligations)
+    selected = tuple(_canonical_daily_commitment(state, item) for item in selected)
+    support = tuple(_canonical_daily_commitment(state, item) for item in support)
     return Plan(
         obligations=obligations,
         selected=selected,
@@ -1019,5 +1080,4 @@ def make_plan(
         revision=revision,
         replan_reason=replan_reason,
         max_hands=config.max_daily_hands,
-        placement_domains={**owned_domains, **new_domains},
     )

@@ -66,11 +66,10 @@ def _target_invalidation(state: OwnedState, plan: Plan) -> str | None:
 
 
 def daily_plan_replan_reason(state: OwnedState, plan: Plan) -> str | None:
-    """Invalidate owned physical premises, not a speculative spatial binding.
+    """Invalidate a fixed Plan target only when its physical premise changed.
 
-    Intraday search owns executable capacity and remaining work. Rebinding all
-    new projects here would mistake completed plantings for more unfulfilled
-    work and silently change the economic plan late in the day.
+    Intraday owns execution capacity not placement repair. Rebinding a target here
+    would silently replace the Plan's long-horizon layout decision.
     """
     return _target_invalidation(state, plan)
 

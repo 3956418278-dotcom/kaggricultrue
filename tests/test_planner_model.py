@@ -1,6 +1,6 @@
 """Day-level Plan remains the economic contract, not an execution schedule."""
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import unittest
 
 from kaggle_environments import make
@@ -23,11 +23,16 @@ class PlannerModelTests(unittest.TestCase):
             self.assertIsNotNone(project.revenue)
         self.assertFalse(hasattr(plan, "routes"))
         self.assertFalse(hasattr(plan, "resource_links"))
+        self.assertNotIn("placement_domains", {field.name for field in fields(Plan)})
+        self.assertIn("economic_windows", {field.name for field in fields(Plan)})
+        for project in (*plan.obligations, *plan.selected, *plan.support):
+            if project.kind != "LAND" and project.required_state:
+                self.assertIsNotNone(project.target)
 
     def test_empty_plan_stays_empty(self):
         state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
         base = make_plan(state)
-        empty = replace(base, obligations=(), selected=(), support=(), placement_domains={})
+        empty = replace(base, obligations=(), selected=(), support=())
         self.assertEqual(empty.obligations + empty.selected + empty.support, ())
 
 

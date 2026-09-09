@@ -27,40 +27,21 @@ def audit_sample(sample):
     check(trace[0]["state_before"] == sample["day_start_state"], "opening state")
     check(plan["day"] == day and plan["formed_step"] == start, "Plan clock")
     check("hire_count" not in plan and plan["max_hands"] is None, "staffing leaked into Plan")
+    check("placement_domains" not in plan, "placement freedom leaked into intraday Plan")
     goals = {p["identifier"]: p for p in plan["obligations"] + plan["selected"]}
     check(len(goals) == len(plan["obligations"]) + len(plan["selected"]), "duplicate goals")
-    counts, attempts, seen, pending = Counter(), set(), set(), {}
+    events_by_goal = {key: [] for key in goals}
     metrics = Counter(player_days=1)
     for offset, turn in enumerate(trace):
         check(turn["step"] == start + offset == turn["state_before"]["step"], "trace clock")
         check(turn["state_before"]["player"] == side, "trace side")
         for event in turn["effects"]:
             key = event["goal"]
-            check(key in goals, "effect has no goal")
-            goal = goals[key]
-            metadata = goal["metadata"]
-            check(goal["kind"] == "STATE_EFFECT", "nonsemantic work goal")
-            check(metadata["entity"] == event["entity"], "entity mismatch")
-            check(metadata["required_effect"] == event["fields"], "required effect mismatch")
-            check(not ({"worker", "action", "hire_count", "market"} & metadata.keys()), "execution in Plan")
-            check(key == digest({"entity": event["entity"], "fields": event["fields"],
-                                 "physical_delta": event["physical_delta"]}), "goal content identity")
-            if goal["target"] is not None:
-                check(goal["target"] == event["position"], "existing position changed")
-            else:
-                check(event["position"] in plan["placement_domains"][key], "placement outside domain")
-            retry = (tuple(event["position"]), digest(event["fields"]))
-            if retry in pending:
-                check(pending[retry] == event["entity"], "retry created a phantom entity")
             if event["achieved"]:
-                counts[key] += 1
-                pending.pop(retry, None)
-                if event["after"] is None:
-                    pending = {k: v for k, v in pending.items() if k[0] != tuple(event["position"])}
+                check(key in goals, "achieved effect has no canonical outcome")
+                events_by_goal[key].append(event)
             else:
-                attempts.add(key)
-                pending[retry] = event["entity"]
-            seen.add(key)
+                check(key is None or key in goals, "failed effect has invalid goal")
         action = turn["action"]
         workers = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
         metrics["available_worker_turns"] += 1 + len(turn["state_before"]["farms"][side]["hands"])
@@ -69,18 +50,32 @@ def audit_sample(sample):
                 metrics["action_" + str(operation[0])] += 1
         metrics["unresolved_noops"] += sum(not n.get("input_repair_exposes_economic_effect", False)
                                              for n in turn["noops"])
-    check(seen == goals.keys(), "goal has no demonstrated effect or attempt")
     for key, goal in goals.items():
+        events = events_by_goal[key]
+        check(events, "goal has no demonstrated achieved effect")
         metadata = goal["metadata"]
-        check(metadata["demonstrated_count"] == counts[key], "effect multiplicity")
-        check(metadata["completion_observed"] == bool(counts[key]), "achievement flag")
-        check(metadata["attempt_observed"] == (key in attempts), "attempt flag")
-        metrics["attempt_only_goals"] += not counts[key]
+        check(goal["kind"] == "STATE_EFFECT", "nonsemantic work goal")
+        check(not goal["actions"]["work"], "primitive work leaked into canonical Plan")
+        check(goal["target"] == events[-1]["position"], "fixed Plan placement changed")
+        check(metadata["entity"] == events[-1]["entity"], "entity mismatch")
+        check(goal["required_state"] == {"$tile": events[-1]["after"]},
+              "final daily state mismatch")
+        outputs = Counter()
+        for event in events:
+            outputs.update({item: quantity for item, quantity
+                            in event["physical_delta"].items() if quantity > 0})
+        check(goal["required_outputs"] == dict(outputs), "required outputs mismatch")
+        identity = {"entity": metadata["entity"], "position": goal["target"],
+                    "required_state": goal["required_state"],
+                    "required_outputs": goal["required_outputs"]}
+        check(key == digest(identity), "goal content identity")
+        check(not ({"worker", "action", "hire_count", "market"} & metadata.keys()),
+              "execution in Plan")
     check(all(p["kind"] == "LAND" for p in plan["support"]), "non-land support in reconstructed Plan")
     actual_land = set(sample["day_end_state"]["farms"][side]["unlocked_quadrants"]) - set(
         sample["day_start_state"]["farms"][side]["unlocked_quadrants"])
     check({p["metadata"]["quadrant"] for p in plan["support"]} == actual_land, "land effects")
-    check(metrics["attempt_only_goals"] == sample["diagnostics"]["attempt_only_goals"], "attempt summary")
+    check(sample["diagnostics"]["attempt_only_goals"] == 0, "attempt-only work entered Plan")
     metrics["goals"] = len(goals)
     metrics["empty_plans"] = not goals and not plan["support"]
     return metrics

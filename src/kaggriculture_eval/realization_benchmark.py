@@ -16,7 +16,7 @@ from src.kaggriculture_agent.realization import PlanningFailure
 from src.kaggriculture_agent.state import reconstruct
 from src.kaggriculture_agent.valuation import end_value
 
-from .plan_io import plan_from_dict
+from .plan_io import plan_from_sample
 
 
 def episode_partition(episode_id):
@@ -35,24 +35,10 @@ def source_identity():
 
 
 def _requirement_ids(plan):
-    result = []
-    aliases = {
-        "PICKUP_PLACE": ("PLACE",),
-        "HARVEST_TRANSPORT": ("HARVEST",),
-        "WATER_HARVEST_TRANSPORT": ("WATER", "HARVEST"),
-    }
-    for project in (*plan.obligations, *plan.selected, *plan.support):
-        if project.kind == "LAND":
-            result.append(project.identifier)
-        elif project.kind == "STATE_EFFECT":
-            count = max(1, int(project.metadata.get("demonstrated_count", 1)))
-            result.extend(f"{project.identifier}:copy:{index}" for index in range(count))
-        else:
-            for index, work in enumerate(project.actions.work):
-                if work.day == plan.day:
-                    result.extend(f"{project.identifier}:{index}:{kind}"
-                                  for kind in aliases.get(work.kind, (work.kind,)))
-    return tuple(result)
+    return tuple(project.identifier for project in
+                 (*plan.obligations, *plan.selected, *plan.support)
+                 if project.kind == "LAND"
+                 or project.required_state or project.required_outputs)
 
 
 def _effort(initial, turns):
@@ -84,7 +70,7 @@ def _effort(initial, turns):
 
 def compare_intraday_sample(sample, solver=solve_intraday):
     opening = reconstruct(sample["day_start_state"])
-    plan = plan_from_dict(sample["plan"])
+    plan = plan_from_sample(sample)
     reference_end = reconstruct(sample["day_end_state"])
     requirements = _requirement_ids(plan)
     reference_turns = tuple(

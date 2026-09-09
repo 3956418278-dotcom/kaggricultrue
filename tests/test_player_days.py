@@ -49,13 +49,14 @@ class PlayerDayTests(unittest.TestCase):
         plan = self.sample["plan"]
         self.assertNotIn("hire_count", plan)
         goals = plan["selected"] + plan["obligations"]
-        self.assertEqual(len(goals), 4)  # structure, animal placement, feed, care
+        self.assertEqual(len(goals), 1)  # one fixed-place daily animal outcome
         self.assertTrue(all(g["kind"] == "STATE_EFFECT" for g in goals))
-        self.assertTrue(all(g["target"] is None for g in goals))
+        self.assertTrue(all(g["target"] is not None for g in goals))
         self.assertTrue(all("worker" not in g["metadata"] and "action" not in g["metadata"] for g in goals))
         self.assertIsNone(plan["max_hands"])
         self.assertEqual(len({g["metadata"]["entity"] for g in goals}), 1)
-        self.assertGreater(len(next(iter(plan["placement_domains"].values()))), 1)
+        self.assertNotIn("placement_domains", plan)
+        self.assertTrue(all(not g["actions"]["work"] for g in goals))
 
     def test_atomic_seed_failure_is_an_attempt_not_an_achievement(self):
         obs = observation(self.replay, 0, 0)
@@ -95,15 +96,15 @@ class PlayerDayTests(unittest.TestCase):
         sample = reconstruct_day(replay, 0, 0, {}, "test")
         goals = sample["plan"]["selected"]
         self.assertEqual(len(goals), 1)
-        self.assertTrue(goals[0]["metadata"]["attempt_observed"])
-        self.assertTrue(goals[0]["metadata"]["completion_observed"])
+        self.assertNotIn("attempt_observed", goals[0]["metadata"])
+        self.assertIsNotNone(goals[0]["target"])
         self.assertEqual(audit_sample(sample)["attempt_only_goals"], 0)
 
     def test_audit_rejects_goal_effect_and_boundary_corruption(self):
         self.assertEqual(audit_sample(self.sample)["player_days"], 1)
         for mutate in (
             lambda s: s["plan"].update(hire_count=3),
-            lambda s: s["plan"]["selected"][0]["metadata"].update(demonstrated_count=99),
+            lambda s: s["plan"]["selected"][0]["required_state"].update({"$tile": None}),
             lambda s: s["day_end_state"].update(step=23),
         ):
             sample = deepcopy(self.sample)
@@ -113,7 +114,7 @@ class PlayerDayTests(unittest.TestCase):
 
 
 class FixedBoundaryTests(unittest.TestCase):
-    def test_existing_structure_domain_does_not_become_empty_land(self):
+    def test_existing_structure_is_fixed_by_plan(self):
         state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
         tiles = list(state.tiles)
         for pos in ((0, 0), (0, 1)):
@@ -121,12 +122,12 @@ class FixedBoundaryTests(unittest.TestCase):
         state = replace(state, tiles=tuple(tiles), shed={"COW": 1})
         plan = make_plan(state, PlannerConfig(cash_reserve=100000))
         project = next(p for p in plan.obligations if p.kind == "ANIMAL_PLACEMENT")
-        self.assertEqual(set(plan.placement_domains[project.identifier]), {(0, 0), (0, 1)})
+        self.assertEqual(project.target, (0, 0))
         self.assertFalse(hasattr(plan, "routes"))
 
     def test_no_opportunistic_work_outside_fixed_daily_intent(self):
         state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
-        plan = replace(make_plan(state), obligations=(), selected=(), support=(), placement_domains={})
+        plan = replace(make_plan(state), obligations=(), selected=(), support=())
         self.assertEqual(plan.obligations + plan.selected + plan.support, ())
 
 
