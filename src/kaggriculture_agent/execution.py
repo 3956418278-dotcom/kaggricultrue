@@ -1,324 +1,147 @@
-"""Turn commitments into inspectable work and legal Kaggriculture actions."""
+"""Exact execution and validation of an intraday ``Realization``.
+
+This module never chooses actions. It replays submitted turns through the
+single rule owner and verifies that every requirement in the fixed Plan was
+actually achieved.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter, defaultdict
 from typing import Mapping
 
 from . import rules
 from .planner import Plan
-from .market import build_market_orders
-from .state import OwnedState, Position, WorkerState
+from .realization import Realization
+from .state import OwnedState
 
 
-@dataclass(frozen=True)
-class WorkTask:
-    identifier: str
-    kind: str
-    action: tuple[object, ...]
-    priority: int
-    deadline_step: int
-    target: Position | None = None
-    at_shed: bool = False
-    required_item: str | None = None
-    shared_item: str | None = None
-    eligible_worker: int | None = None
-    dependency: str | None = None
-    capacity: int = 1
-    followup_actions: int = 0
+class InvalidRealization(ValueError):
+    pass
 
 
-@dataclass(frozen=True)
-class Execution:
-    worker_actions: tuple[list[object], ...]
-    tasks: tuple[WorkTask, ...]
-    assignments: Mapping[int, str]
-    market_orders: tuple[list[object], ...]
-    benchmark_orders: bool = False
+def _tile_fields(raw: object) -> Mapping[str, object]:
+    return raw if isinstance(raw, Mapping) else {"$tile": raw}
 
 
-def _task_target(task: WorkTask, worker: WorkerState, board_size: int) -> Position:
-    if task.at_shed:
-        return min(
-            rules.shed_access(board_size),
-            key=lambda position: (rules.manhattan(worker.position, position), position[1], position[0]),
-        )
-    return worker.position if task.target is None else task.target
-
-
-def _inventory_drop_tasks(state: OwnedState, terminal: bool) -> list[WorkTask]:
-    tasks: list[WorkTask] = []
-    for worker in state.workers:
-        if not worker.carried:
+def _effect_matches(requirement: Mapping[str, object], before: object, after: object) -> bool:
+    fields = _tile_fields(after)
+    for name, condition in requirement.items():
+        expected_present = bool(condition["after_present"])
+        if (name in fields) != expected_present:
+            return False
+        if not expected_present:
             continue
-        # Daily refresh drops every inventory into the shed and returns the
-        # farmer to spawn. Do not spend late-day travel merely to preserve carry;
-        # ordinary drops exist to expose a useful batch for intraday sale.
-        if terminal or worker.carried >= 3:
-            tasks.append(
-                WorkTask(
-                    f"drop:{worker.index}", "DROP", ("DROP",), 1 if terminal else 32,
-                    rules.TERMINAL_ACTION_STEP if terminal else (state.day + 1) * 24 - 1,
-                    at_shed=True, eligible_worker=worker.index,
-                )
-            )
-    return tasks
+        expected, actual = condition.get("after"), fields[name]
+        if name in ("yield_units", "fertilized_until_day") and isinstance(expected, int) and expected > 0:
+            if not isinstance(actual, int) or actual < expected:
+                return False
+        elif actual != expected:
+            return False
+    return before != after
 
 
-def generate_tasks(state: OwnedState, plan: Plan, choices=None) -> tuple[WorkTask, ...]:
-    """Generate current concrete work; future work stays in commitments."""
-    from .realization import legacy_choices
-    choices = choices or legacy_choices(state, plan)
-    terminal = state.step >= 707
-    tasks = _inventory_drop_tasks(state, terminal)
-    end_of_day = min(rules.TERMINAL_ACTION_STEP, (state.day + 1) * 24 - 1)
-
-    if terminal:
-        for tile in state.crop_tiles():
-            raw = tile.raw
-            quantity = int(raw.get("yield_units", 0) or 0)
-            rule = rules.CROPS[str(raw["crop"])]
-            age = state.day - int(raw.get("planted_day", state.day))
-            if quantity <= 0 or age < rule.first_yield_day:
-                continue
-            water_gain = rules.one_time_water_gain(
-                str(raw["crop"]),
-                planted_day=int(raw.get("planted_day", state.day)),
-                day=state.day,
-                yield_units=quantity,
-                fertilized_until_day=int(raw.get("fertilized_until_day", -1)),
-                watered_today=bool(raw.get("watered_today", False)),
-            )
-            return_actions = rules.distance_to_shed(tile.position) + 1
-            if water_gain:
-                tasks.append(
-                    WorkTask(
-                        f"terminal-water:{tile.position}",
-                        "WATER",
-                        ("WATER",),
-                        2,
-                        rules.TERMINAL_ACTION_STEP,
-                        tile.position,
-                        followup_actions=1 + return_actions,
-                    )
-                )
-            else:
-                tasks.append(
-                    WorkTask(
-                        f"terminal-harvest:{tile.position}",
-                        "HARVEST",
-                        ("HARVEST",),
-                        3,
-                        rules.TERMINAL_ACTION_STEP,
-                        tile.position,
-                        followup_actions=return_actions,
-                    )
-                )
-        for tile in state.animal_tiles():
-            if int(tile.raw.get("yield_units", 0) or 0) <= 0:
-                continue
-            tasks.append(
-                WorkTask(
-                    f"terminal-animal-harvest:{tile.position}",
-                    "HARVEST",
-                    ("HARVEST",),
-                    3,
-                    rules.TERMINAL_ACTION_STEP,
-                    tile.position,
-                    followup_actions=rules.distance_to_shed(tile.position) + 1,
-                )
-            )
-
-    if not terminal:
-        for tile in state.crop_tiles():
-            raw = tile.raw
-            rule = rules.CROPS[str(raw["crop"])]
-            first_day = int(raw.get("planted_day", state.day)) + rule.first_yield_day
-            age = state.day - int(raw.get("planted_day", state.day))
-            harvest_ready = rule.ongoing and state.day >= first_day
-            final_water_gain = rules.one_time_water_gain(
-                str(raw["crop"]),
-                planted_day=int(raw.get("planted_day", state.day)),
-                day=state.day,
-                yield_units=int(raw.get("yield_units", 0) or 0),
-                fertilized_until_day=int(raw.get("fertilized_until_day", -1)),
-                watered_today=bool(raw.get("watered_today", False)),
-            )
-            harvest_ready = harvest_ready or (
-                not rule.ongoing
-                and age >= rule.max_yield_day
-                and final_water_gain == 0
-            )
-            if int(raw.get("yield_units", 0) or 0) > 0 and harvest_ready:
-                tasks.append(WorkTask(f"harvest:{tile.position}", "HARVEST", ("HARVEST",), 7, end_of_day, tile.position))
-            awaiting_fertilizer = (
-                tile.position in plan.fertilize_targets
-                and int(raw.get("fertilized_until_day", -1)) < state.day + 2
-            )
-            if not bool(raw.get("watered_today", False)) and not awaiting_fertilizer:
-                tasks.append(WorkTask(f"water:{tile.position}", "WATER", ("WATER",), 12, end_of_day, tile.position))
-            if tile.position in plan.fertilize_targets and int(raw.get("fertilized_until_day", -1)) < state.day + 2:
-                tasks.append(
-                    WorkTask(
-                        f"fertilize:{tile.position}", "FERTILIZE", ("FERTILIZE",), 10,
-                        end_of_day, tile.position, required_item="FERTILIZER",
-                        dependency="fertilizer-in-worker-inventory",
-                    )
-                )
-
-        feed_need = 0
-        for tile in state.animal_tiles():
-            raw = tile.raw
-            if int(raw.get("yield_units", 0) or 0) > 0:
-                tasks.append(WorkTask(f"animal-harvest:{tile.position}", "HARVEST", ("HARVEST",), 6, end_of_day, tile.position))
-            if not bool(raw.get("fed_today", False)):
-                feed_need += 1
-                tasks.append(
-                    WorkTask(
-                        f"feed:{tile.position}", "FEED", ("FEED",), 8, end_of_day,
-                        tile.position, required_item="WHEAT", dependency="wheat-in-worker-inventory",
-                    )
-                )
-            if not bool(raw.get("cared_today", False)):
-                tasks.append(WorkTask(f"care:{tile.position}", "CARE", ("CARE",), 15, end_of_day, tile.position))
-            if bool(raw.get("fertilizer_available", False)):
-                tasks.append(WorkTask(f"collect:{tile.position}", "COLLECT_FERTILIZER", ("COLLECT_FERTILIZER",), 20, end_of_day, tile.position))
-
-        carried_wheat = state.carried_total("WHEAT")
-        if feed_need > carried_wheat and state.shed.get("WHEAT", 0) > 0:
-            quantity = min(feed_need - carried_wheat, state.shed.get("WHEAT", 0), 4)
-            tasks.append(WorkTask("pickup:wheat", "PICKUP", ("PICKUP", "WHEAT", quantity), 5, end_of_day, at_shed=True))
-        carried_fertilizer = state.carried_total("FERTILIZER")
-        if len(plan.fertilize_targets) > carried_fertilizer and state.shed.get("FERTILIZER", 0) > 0:
-            quantity = min(len(plan.fertilize_targets) - carried_fertilizer, state.shed.get("FERTILIZER", 0))
-            tasks.append(WorkTask("pickup:fertilizer", "PICKUP", ("PICKUP", "FERTILIZER", quantity), 9, end_of_day, at_shed=True))
-
-        for animal in rules.ANIMALS:
-            if state.owned_total(animal) <= 0:
-                continue
-            structure = rules.ANIMALS[animal].structure
-            targets = {choices.target(p) for p in (*plan.obligations, *plan.selected)
-                       if p.metadata.get("animal") == animal and choices.target(p) is not None}
-            empties = tuple(t for t in state.empty_structures(structure) if t.position in targets)
-            carried = [worker for worker in state.workers if worker.inventory.get(animal, 0) > 0]
-            for index, worker in enumerate(carried[: len(empties)]):
-                target = empties[index].position
-                tasks.append(
-                    WorkTask(
-                        f"place:{animal}:{target}", "PLACE", ("PLACE", animal), 4,
-                        end_of_day, target, required_item=animal, eligible_worker=worker.index,
-                        dependency=f"structure:{target}",
-                    )
-                )
-            if empties and state.shed.get(animal, 0) > 0:
-                tasks.append(
-                    WorkTask(
-                        f"pickup:{animal}", "PICKUP", ("PICKUP", animal, 1), 3,
-                        end_of_day, at_shed=True, dependency=f"structure:{empties[0].position}",
-                    )
-                )
-
-        build_requests: dict[Position, str] = {}
-        for project in (*plan.obligations, *plan.selected):
-            if project.kind not in ("ANIMAL", "ANIMAL_PLACEMENT") or choices.target(project) is None:
-                continue
-            if state.tile_at(choices.target(project)).is_empty:
-                build_requests[choices.target(project)] = str(project.metadata["structure"])
-        for target, structure in sorted(build_requests.items()):
-            operation = "BUILD_COOP" if structure == "COOP" else "BUILD_PASTURE"
-            tasks.append(WorkTask(f"build:{target}", "BUILD", (operation,), 25, end_of_day, target))
-
-        for target, crop in sorted(choices.crop_targets(plan).items()):
-            if state.tile_at(target).is_empty and state.seeds.get(crop, 0) > 0:
-                tasks.append(
-                    WorkTask(
-                        f"plant:{crop}:{target}", "PLANT", ("PLANT", crop), 24,
-                        end_of_day, target, shared_item=f"{crop}_SEED",
-                    )
-                )
-        for tile in state.tiles_of_kind("WEED"):
-            tasks.append(WorkTask(f"dig:{tile.position}", "DIG", ("DIG",), 70, rules.TERMINAL_ACTION_STEP, tile.position))
-
-    allowed = daily_work(plan, choices)
-    tasks = [t for t in tasks if t.kind in ("PICKUP", "DROP") or (t.target, t.kind) in allowed]
-    return tuple(sorted(tasks, key=lambda task: (task.priority, task.deadline_step, task.identifier)))
+def _operation(project, kind: str) -> tuple[object, ...]:
+    if kind == "PLANT":
+        return ("PLANT", project.metadata["crop"])
+    if kind == "PLACE":
+        return ("PLACE", project.metadata["animal"])
+    if kind == "BUILD":
+        return ("BUILD_" + str(project.metadata["structure"]),)
+    return (kind,)
 
 
-def daily_work(plan, choices):
-    """Daily service goals from the existing dated commitment schedules."""
-    aliases = {"PICKUP_PLACE": ("PLACE",), "HARVEST_TRANSPORT": ("HARVEST",),
-               "WATER_HARVEST_TRANSPORT": ("WATER", "HARVEST")}
-    result = set()
+def _required(plan: Plan, placements: Mapping[str, tuple[int, int]]):
+    """Yield validation records directly from Plan; this is not a planner IR."""
+    aliases = {
+        "PICKUP_PLACE": ("PLACE",),
+        "HARVEST_TRANSPORT": ("HARVEST",),
+        "WATER_HARVEST_TRANSPORT": ("WATER", "HARVEST"),
+    }
+    records = []
     for project in (*plan.obligations, *plan.selected, *plan.support):
-        for work in project.actions.work:
+        if project.kind == "LAND":
+            records.append((project.identifier, None, None, None, 1, str(project.metadata["quadrant"])))
+            continue
+        target = project.target if project.target is not None else placements.get(project.identifier)
+        if project.kind == "STATE_EFFECT":
+            count = max(1, int(project.metadata.get("demonstrated_count", 1)))
+            records.append((project.identifier, target, None,
+                            project.metadata["required_effect"], count, None))
+            continue
+        for index, work in enumerate(project.actions.work):
             if work.day != plan.day:
                 continue
-            position = work.position if work.position is not None else choices.target(project)
+            position = work.position if work.position is not None else target
             for kind in aliases.get(work.kind, (work.kind,)):
-                result.add((position, kind))
-    return result
+                records.append((f"{project.identifier}:{index}:{kind}", position,
+                                _operation(project, kind), None, 1, None))
+    return records
 
 
-def _worker_can_do(worker: WorkerState, task: WorkTask) -> bool:
-    return not (
-        (task.eligible_worker is not None and task.eligible_worker != worker.index)
-        or (task.required_item is not None and worker.inventory.get(task.required_item, 0) <= 0)
-    )
+def execute_realization(state: OwnedState, plan: Plan, realization: Realization) -> OwnedState:
+    """Replay and validate a complete realization, returning its exact end state."""
+    requirements = _required(plan, realization.placements)
+    missing_positions = [identifier for identifier, position, operation, effect, _, land in requirements
+                         if land is None and position is None and (operation is not None or effect is not None)]
+    if missing_positions:
+        raise InvalidRealization(f"unbound Plan placements: {missing_positions[:3]}")
+    achieved = Counter()
+    by_position = defaultdict(list)
+    for record in requirements:
+        if record[1] is not None:
+            by_position[record[1]].append(record)
 
-
-def schedule(state: OwnedState, tasks: tuple[WorkTask, ...]) -> tuple[tuple[list[object], ...], dict[int, str]]:
-    """Greedy deadline scheduler with deterministic travel and resource safety."""
-    remaining = list(tasks)
-    actions: list[list[object]] = [["PASS"] for _ in state.workers]
-    assignments: dict[int, str] = {}
-    emitted_resources: dict[str, int] = {}
-    unassigned = set(range(len(state.workers)))
-    while unassigned and remaining:
-        choices: list[tuple[tuple[object, ...], int, int, Position]] = []
-        for worker_index in sorted(unassigned):
-            worker = state.workers[worker_index]
-            for task_index, task in enumerate(remaining):
-                if not _worker_can_do(worker, task):
+    current = state
+    for offset, decision in enumerate(realization.turns):
+        if len(decision.worker_actions) != len(current.workers):
+            raise InvalidRealization(
+                f"turn {offset}: expected {len(current.workers)} worker actions, got {len(decision.worker_actions)}"
+            )
+        if len(decision.market_orders) > rules.MAX_MARKET_ORDERS:
+            raise InvalidRealization(f"turn {offset}: too many market orders")
+        micro = current
+        requested_plants = Counter(
+            str(action[1]) for action in decision.worker_actions
+            if action and action[0] == "PLANT" and len(action) > 1
+        )
+        if any(quantity > current.seeds.get(crop, 0) for crop, quantity in requested_plants.items()):
+            raise InvalidRealization(f"turn {offset}: atomic seed shortfall")
+        for worker, action in enumerate(decision.worker_actions):
+            before_position = micro.workers[worker].position
+            before_tile = micro.tile_at(before_position).raw
+            unit_actions = tuple(action if index == worker else ("PASS",)
+                                 for index in range(len(micro.workers)))
+            after_micro = rules.advance_owned(micro, unit_actions, unit_only=True)
+            after_tile = after_micro.tile_at(before_position).raw
+            op = tuple(action)
+            changed = before_tile != after_tile
+            is_move = bool(action and action[0] in ("NORTH", "SOUTH", "EAST", "WEST"))
+            is_logistics = bool(action and action[0] in ("PICKUP", "DROP"))
+            if action and action[0] != "PASS" and not (changed or is_move or is_logistics):
+                raise InvalidRealization(f"turn {offset}, worker {worker}: illegal/no-op action {op!r}")
+            for identifier, _, operation, effect, count, _ in by_position.get(before_position, ()):
+                if achieved[identifier] >= count:
                     continue
-                if task.shared_item:
-                    crop = task.shared_item.removesuffix("_SEED")
-                    if emitted_resources.get(task.shared_item, 0) >= state.seeds.get(crop, 0):
-                        continue
-                target = _task_target(task, worker, state.board_size)
-                distance = rules.manhattan(worker.position, target)
-                if (
-                    state.step >= 707
-                    and distance + 1 + task.followup_actions > state.turns_left
-                ):
-                    continue
-                continuity = (-2 if worker.position == target else 0) + (-1 if task.required_item else 0)
-                # Deadline is ordered before route length.  Folding distance into
-                # slack would perversely favor farther work with the same deadline.
-                score = (task.priority, task.deadline_step, distance + continuity, task.identifier, worker.index)
-                choices.append((score, worker_index, task_index, target))
-        if not choices:
-            break
-        _, worker_index, task_index, target = min(choices)
-        worker = state.workers[worker_index]
-        task = remaining.pop(task_index)
-        if worker.position == target:
-            action = list(task.action)
-            if task.shared_item:
-                emitted_resources[task.shared_item] = emitted_resources.get(task.shared_item, 0) + 1
-        else:
-            action = rules.move_toward(worker.position, target)
-        actions[worker_index] = action
-        assignments[worker_index] = task.identifier
-        unassigned.remove(worker_index)
-    return tuple(actions), assignments
+                if operation is not None and op == operation and changed:
+                    achieved[identifier] += 1
+                    break
+                if effect is not None and _effect_matches(effect, before_tile, after_tile):
+                    achieved[identifier] += 1
+                    break
+            micro = after_micro
+        current = rules.advance_owned(current, decision.worker_actions, decision.market_orders)
+
+    missing = []
+    for identifier, _, _, _, count, land in requirements:
+        if land is not None:
+            if land not in current.unlocked_quadrants:
+                missing.append(identifier)
+        elif achieved[identifier] < count:
+            missing.append(identifier)
+    if missing:
+        raise InvalidRealization(f"Daily Plan incomplete: {len(missing)} requirement(s): {missing[:5]}")
+    return current
 
 
-
-
-def execute(state: OwnedState, plan: Plan, choices=None) -> Execution:
-    from .realization import legacy_choices
-    choices = choices or legacy_choices(state, plan)
-    tasks = generate_tasks(state, plan, choices)
-    worker_actions, assignments = schedule(state, tasks)
-    market_orders = build_market_orders(state, plan, worker_actions, choices)
-    return Execution(worker_actions, tasks, assignments, market_orders)
+validate_realization = execute_realization

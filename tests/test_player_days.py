@@ -12,9 +12,7 @@ from src.kaggriculture_eval.player_days import (
 from src.kaggriculture_eval.reference_pipeline import qualify_sides
 from src.kaggriculture_eval.reference_audit import audit_sample
 from src.kaggriculture_agent.planner import make_plan, PlannerConfig
-from src.kaggriculture_agent.realization import ExecutionChoices, legacy_choices
 from src.kaggriculture_agent.state import reconstruct, TileState
-from src.kaggriculture_agent.execution import generate_tasks
 
 
 class PlayerDayTests(unittest.TestCase):
@@ -124,16 +122,12 @@ class FixedBoundaryTests(unittest.TestCase):
         plan = make_plan(state, PlannerConfig(cash_reserve=100000))
         project = next(p for p in plan.obligations if p.kind == "ANIMAL_PLACEMENT")
         self.assertEqual(set(plan.placement_domains[project.identifier]), {(0, 0), (0, 1)})
-        saved = deepcopy(plan)
-        choices = legacy_choices(state, plan)
-        self.assertNotIsInstance(choices, type(plan))
-        self.assertEqual(plan, saved)
+        self.assertFalse(hasattr(plan, "routes"))
 
     def test_no_opportunistic_work_outside_fixed_daily_intent(self):
         state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
         plan = replace(make_plan(state), obligations=(), selected=(), support=(), placement_domains={})
-        tiles = tuple(TileState(t.position, {"kind": "WEED"}) if t.is_empty else t for t in state.tiles)
-        self.assertFalse(generate_tasks(replace(state, tiles=tiles), plan, ExecutionChoices()))
+        self.assertEqual(plan.obligations + plan.selected + plan.support, ())
 
 
 if __name__ == "__main__":

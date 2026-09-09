@@ -5,56 +5,47 @@
 | Concern | Owner |
 | --- | --- |
 | Observation/action contract | `state.py`, `contract.py`, root `main.py` |
-| Verified game arithmetic and owned-farm transition | `rules.py` |
-| Structured `(C,T,L,A,Q,R)` records | `economics.py` |
-| State-aware daily economic intent and placement domains | `planner.py` |
-| Separate execution choices; provisional placement witnesses | `realization.py` |
-| Remaining-day trajectory search and retention | `intraday.py` |
-| Schedule-derived concrete tasks and greedy sanity benchmark | `execution.py` |
-| Reactive selling and input-protected market orders | `market.py` |
-| Fixed daily Plan lifecycle and composition | `operating.py`, `agent.py` |
-| Replay-derived reference samples and cloud extraction | `src/kaggriculture_eval/player_days.py`, `reference_pipeline.py` |
+| Exact owned-state transition | `rules.py` |
+| Economic dimensions and Daily Plan | `economics.py`, `planner.py` |
+| Intraday optimization | `intraday.py` |
+| Public solved trajectory | `realization.py` |
+| Exact execution/completion validation | `execution.py` |
+| Reached-state value | `valuation.py` |
+| Plan lifecycle and runtime composition | `operating.py`, `agent.py` |
 
-## Boundary
+The production boundary is exactly:
 
-The direction is `current real state -> fixed Daily Plan -> intraday realization`.
-Plan retains existing-asset positions and real constraints on new placements.
-Equivalent route-dependent placements stay open. An existing empty structure
-and an empty tile requiring construction are different economic premises.
-
-`ExecutionChoices` is not a Plan subclass. It holds placement witnesses and
-staffing, never rewritten economic commitments. The next day forms a fresh
-Plan; intraday divergence repairs the trajectory and leaves economic shortfalls
-visible. Market selling is outside Plan. Expected revenue is not a sale schedule.
-
-The current implementation deliberately retains the **legacy restricted search**
-until the reference-data checkpoint. It uses three placement constructions,
-a small beam, staffing variants and bounded tail substitutions. Its economic
-value proxy and neighborhood coverage are not the requested maturity standard.
-Do not present the interface repair as a completed planner redesign.
-
-Worker/resource reservation, atomic seeds, transition parity and trajectory
-retention remain useful infrastructure. The greedy controller is only a weak
-sanity baseline. The reference extractor's generic `STATE_EFFECT` commitments
-are not yet implemented by the legacy task generator.
-
-## Checks
-
-```bash
-.venv/bin/python -m unittest discover -s tests -q
-.venv/bin/python scripts/verify_intraday.py --output runs/<unique-id>/scenarios.json
-.venv/bin/python scripts/verify_baseline.py --output runs/<unique-id>/episodes.json --replay-dir runs/<unique-id>/replays
+```text
+OwnedState + Plan
+        -> solve_intraday()
+        -> Realization
+        -> execute_realization()
+        -> S_end
 ```
 
-Full episodes check legality, determinism, terminal completion and runtime,
-not reference-level execution strength or competitive promotion.
+`Plan` describes the day's required economic/farm state changes and deliberately
+does not prescribe the intraday implementation. `Realization` contains only open
+placement commitments and actual per-turn worker/market actions. Assignment,
+order, travel, resource flow, transfers, purchases, hiring and cash timing are
+private solver decisions. Failure to find a fully executable Plan raises
+`PlanningFailure`; no partial realization crosses the API.
 
-Inspect an extracted sample with the official game renderer:
+The solver privately derives legal local event chains from Plan and the exact
+rules, then jointly constrains event assignment/timing, placement, movement,
+inventory, market acquisition, hiring and land. Its constructive route is only
+a CP-SAT incumbent. Exact execution through `rules.advance_owned()` is the final
+completion authority, and only full realizations are compared by reached-state
+economic value.
+
+Run focused checks with the OR-Tools environment:
 
 ```bash
-.venv/bin/python scripts/inspect_player_day.py data/player-days/episode-<id>.jsonl.gz --sample <id>:<side>:<day> --output replays/player-day.html
+.cache/planner-runtime/bin/python -m unittest tests.test_intraday tests.test_planner_model -v
 ```
 
-The page contains day-start/day-end scenes, an economic-effect table and the
-demonstrated trajectory. Opponent private inventory is unknown. Raw shards,
-HTML viewers and cloud outputs stay in ignored data areas.
+Run the frozen development-only benchmark with:
+
+```bash
+.cache/planner-runtime/bin/python scripts/benchmark_intraday.py \
+  .cache/reference-pilot-20260905/dataset-v1 runs/<unique-id>
+```

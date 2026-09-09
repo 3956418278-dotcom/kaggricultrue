@@ -1,4 +1,4 @@
-"""Lifecycle owner for fixed daily operating plans and bounded repair."""
+"""Lifecycle owner for one fixed daily Plan and its exact Realization."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from .planner import Plan, PlannerConfig, make_plan
+from .realization import Realization, TurnDecision
 from .state import OwnedState
 
 
@@ -81,18 +82,31 @@ class DailyPlanningSession:
     config: PlannerConfig = field(default_factory=PlannerConfig)
     _plans: dict[int, Plan] = field(default_factory=dict, init=False)
     _last_steps: dict[int, int] = field(default_factory=dict, init=False)
-    _intraday: object = field(default=None, init=False)
+    _realizations: dict[int, tuple[int, int, Realization]] = field(default_factory=dict, init=False)
 
-    def execution_for(self, state: OwnedState, plan: Plan):
-        from .intraday import IntradaySession
-        if self._intraday is None:
-            self._intraday = IntradaySession()
-        return self._intraday.execution_for(state, plan)
+    def execution_for(self, state: OwnedState, plan: Plan) -> TurnDecision:
+        """Return the already solved action for this absolute turn.
+
+        The lifecycle cache is not a second planner representation: its value is
+        exactly the public ``Realization`` returned by ``solve_intraday``.
+        """
+        from .intraday import solve_intraday
+
+        cached = self._realizations.get(state.player)
+        if cached is None or cached[0] != plan.day or cached[1] > state.step:
+            realization = solve_intraday(state, plan)
+            cached = (plan.day, state.step, realization)
+            self._realizations[state.player] = cached
+        _, start_step, realization = cached
+        offset = state.step - start_step
+        if not 0 <= offset < len(realization.turns):
+            return TurnDecision(tuple(("PASS",) for _ in state.workers))
+        return realization.turns[offset]
 
     def reset(self) -> None:
         self._plans.clear()
         self._last_steps.clear()
-        self._intraday = None
+        self._realizations.clear()
 
     def plan_for(self, state: OwnedState) -> Plan:
         prior = self._plans.get(state.player)
@@ -116,4 +130,4 @@ class DailyPlanningSession:
 
     @property
     def planning_diagnostics(self) -> tuple[dict, ...]:
-        return tuple(self._intraday.diagnostics) if self._intraday is not None else ()
+        return ()
