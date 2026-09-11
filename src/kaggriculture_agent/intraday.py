@@ -154,7 +154,15 @@ def _expand_plan(state, plan):
     projects, land, placements = [], [], {}
     identifiers = set()
     chain_cache = {}
-    for commitment in (*plan.obligations, *plan.selected, *plan.support):
+    commitments = (*plan.obligations, *plan.selected, *plan.support)
+    planned_land = {
+        str(commitment.metadata["quadrant"])
+        for commitment in commitments
+        if commitment.kind == "LAND"
+        and str(commitment.metadata["quadrant"])
+        not in state.unlocked_quadrants
+    }
+    for commitment in commitments:
         if commitment.identifier in identifiers:
             raise PlanningFailure(f"duplicate Plan commitment {commitment.identifier!r}")
         identifiers.add(commitment.identifier)
@@ -172,6 +180,15 @@ def _expand_plan(state, plan):
         position = tuple(commitment.target)
         placements[commitment.identifier] = position
         opening = state.tile_at(position).raw
+        if (
+            opening == "LOCKED"
+            and rules.quadrant(position, state.board_size) in planned_land
+        ):
+            # BUY_LAND changes every tile in that quadrant to empty.  Local
+            # action-chain derivation therefore starts from the deterministic
+            # post-purchase tile state; route timing below still forbids use
+            # until the Plan-specified purchase turn has completed.
+            opening = None
         chain_key = (
             repr(opening), repr(dict(commitment.required_state)),
             tuple(sorted(commitment.required_outputs.items())),
@@ -210,6 +227,7 @@ class _CompactModel:
         self.cp = cp_model
         self.model = cp_model.CpModel()
         self.state, self.plan = state, plan
+        self._read_window_market()
         self.projects, self.land = projects, land
         self.placements, self.W = placements, workforce
         self.H = min(state.turns_left, state.turns_left_today)
@@ -230,9 +248,46 @@ class _CompactModel:
         self._build_window_deliveries()
         self._add_resource_capacities()
         self._build_market()
+        self._add_window_purchase_dependencies()
         self._build_routes()
         self._build_tile_dependencies()
         self._build_objective()
+
+    def _read_window_market(self):
+        """Index only Plan-provided purchases and their fixed availability."""
+
+        quantities = Counter()
+        turns = defaultdict(list)
+        hire_turns, land_turns = [], []
+        for window in self.plan.economic_windows:
+            offset = max(0, int(window.end_turn) - self.state.hour)
+            for order in window.market_orders:
+                if not order:
+                    continue
+                operation = str(order[0])
+                quantity = int(order[2]) if len(order) > 2 else 1
+                if operation == "BUY_SEED":
+                    item = f"{order[1]}_SEED"
+                elif operation in ("BUY_ANIMAL", "BUY_PRODUCT"):
+                    item = str(order[1])
+                elif operation == "HIRE":
+                    hire_turns.extend((offset,) * quantity)
+                    continue
+                elif operation == "BUY_LAND":
+                    land_turns.extend((offset,) * quantity)
+                    continue
+                else:
+                    continue
+                quantities[item] += quantity
+                turns[item].extend((offset,) * quantity)
+        self.window_purchase_quantity = dict(quantities)
+        # Requiring use after the latest same-item purchase is conservative and
+        # prevents a later window's quantity being credited early.
+        self.window_purchase_turn = {
+            item: max(values) for item, values in turns.items()
+        }
+        self.window_hire_turns = tuple(sorted(hire_turns))
+        self.window_land_turns = tuple(sorted(land_turns))
 
     def _bool_and(self, name, literals):
         literals = tuple(literals)
@@ -333,11 +388,13 @@ class _CompactModel:
     def _build_sparse_resources(self):
         delta = self._event_deltas()
         producers, consumers, seed_needs = defaultdict(list), [], Counter()
+        seed_consumers = defaultdict(list)
         for event, values in delta.items():
             for item, quantity in values.items():
                 if quantity < 0:
                     if item.endswith("_SEED"):
                         seed_needs[item] += -quantity
+                        seed_consumers[item].append(event)
                     else:
                         consumers.append((event, item, -quantity))
                 elif quantity > 0 and not item.endswith("_SEED"):
@@ -405,7 +462,10 @@ class _CompactModel:
             self.model.add(self.node_time[pickup.identifier]
                            < self.node_time[f"service:{event}"]).only_enforce_if(pickup_active)
             if purchase is not None:
-                self.model.add(self.node_time[pickup.identifier] > 0).only_enforce_if(purchase)
+                purchase_turn = self.window_purchase_turn.get(item, 0)
+                self.model.add(
+                    self.node_time[pickup.identifier] > purchase_turn
+                ).only_enforce_if(purchase)
 
         for (producer, item), transfers in transfer_uses.items():
             active = self.model.new_bool_var(f"drop-active:{producer}:{item}")
@@ -428,6 +488,16 @@ class _CompactModel:
             self.model.add(quantity == seed_needs[item] + sum(
                 amount * literal for _, amount, literal
                 in self.purchase_sources[item]))
+            if item in self.window_purchase_quantity:
+                self.model.add(
+                    quantity <= self.window_purchase_quantity[item]
+                )
+            if item.endswith("_SEED") and seed_needs[item] > 0:
+                purchase_turn = self.window_purchase_turn.get(item, 0)
+                for event in seed_consumers[item]:
+                    self.model.add(
+                        self.node_time[f"service:{event}"] > purchase_turn
+                    )
             self.purchase_quantity[item] = quantity
 
     def _add_resource_capacities(self):
@@ -493,16 +563,37 @@ class _CompactModel:
 
     def _build_market(self):
         existing = len(self.state.workers)
-        self.hire_time = {worker: 0 for worker in range(existing, self.W)}
-        self.land_time = {quadrant: 0 for quadrant in self.land}
+        new_workers = tuple(range(existing, self.W))
+        if self.window_hire_turns:
+            if len(self.window_hire_turns) != len(new_workers):
+                self.model.add(0 == 1)
+            self.hire_time = {
+                worker: self.window_hire_turns[index]
+                for index, worker in enumerate(new_workers)
+                if index < len(self.window_hire_turns)
+            }
+            self.ordinary_hire_workers = ()
+        else:
+            self.hire_time = {worker: 0 for worker in new_workers}
+            self.ordinary_hire_workers = new_workers
+        self.land_time = {
+            quadrant: (self.window_land_turns[index]
+                       if index < len(self.window_land_turns) else 0)
+            for index, quadrant in enumerate(self.land)
+        }
+        self.ordinary_land_quadrants = tuple(
+            quadrant for quadrant in self.land
+            if self.land_time[quadrant] == 0 and not self.window_land_turns
+        )
         services = [node for node in self.nodes if node.kind == "service"]
         for worker in range(existing, self.W):
             self.model.add(sum(self.node_assign[node.identifier, worker]
                                for node in services) >= 1)
         for node in self.nodes:
             for worker in range(existing, self.W):
-                self.model.add(self.node_time[node.identifier] >= 1).only_enforce_if(
-                    self.node_assign[node.identifier, worker])
+                self.model.add(
+                    self.node_time[node.identifier] > self.hire_time.get(worker, 0)
+                ).only_enforce_if(self.node_assign[node.identifier, worker])
         planned_land = set(self.land) | set(self.state.unlocked_quadrants)
         for event in self.events.values():
             quadrant = rules.quadrant(event.position, self.state.board_size)
@@ -510,13 +601,56 @@ class _CompactModel:
                 if quadrant not in planned_land:
                     self.model.add(0 == 1)
                 else:
-                    self.model.add(self.node_time[f"service:{event.identifier}"] >= 1)
-        ordinary = len(self.hire_time) + len(self.land_time) + len(self.purchase_quantity)
+                    self.model.add(
+                        self.node_time[f"service:{event.identifier}"]
+                        > self.land_time.get(quadrant, 0)
+                    )
+        ordinary_purchase_items = tuple(
+            item for item in self.purchase_quantity
+            if item not in self.window_purchase_quantity
+        )
+        ordinary = (len(self.ordinary_hire_workers)
+                    + len(self.ordinary_land_quadrants)
+                    + len(ordinary_purchase_items))
         window_zero = sum(len(window.market_orders)
             for window in self.plan.economic_windows
             if window.start_turn <= self.state.hour <= window.end_turn)
         if ordinary + window_zero > rules.MAX_MARKET_ORDERS:
             self.model.add(0 == 1)
+
+    def _add_window_purchase_dependencies(self):
+        """Apply the narrow D5-D10 purchase-before-use timing contract."""
+
+        animal_place_deadline = max(
+            0, min(self.H - 1, 19 - self.state.hour)
+        )
+        crop_deadline = max(0, min(self.H - 1, 20 - self.state.hour))
+        for project in self.projects:
+            ending = project.ending if isinstance(project.ending, Mapping) else {}
+            animal = str(ending.get("animal", ""))
+            if animal in self.window_purchase_turn:
+                purchase_turn = self.window_purchase_turn[animal]
+                for event in project.events:
+                    node = f"service:{event.identifier}"
+                    operation = event.action[0]
+                    if operation in ("BUILD_COOP", "BUILD_PASTURE"):
+                        self.model.add(
+                            self.node_time[node] <= max(0, purchase_turn - 1)
+                        )
+                    elif operation == "PLACE":
+                        self.model.add(self.node_time[node] > purchase_turn)
+                        self.model.add(
+                            self.node_time[node] <= animal_place_deadline
+                        )
+            crop = str(ending.get("crop", ""))
+            seed = f"{crop}_SEED"
+            if seed in self.window_purchase_turn:
+                for event in project.events:
+                    if event.action[0] in ("PLANT", "WATER"):
+                        self.model.add(
+                            self.node_time[f"service:{event.identifier}"]
+                            <= crop_deadline
+                        )
 
     def _distance(self, left, right):
         if left.position is not None and right.position is not None:
@@ -577,7 +711,10 @@ class _CompactModel:
                         [(x, y, rules.distance_to_shed((x, y), self.state.board_size))
                          for x in range(self.state.board_size)
                          for y in range(self.state.board_size)])
-                    self.model.add(self.node_time[node.identifier] >= 1 + distance).only_enforce_if(first)
+                    self.model.add(
+                        self.node_time[node.identifier]
+                        >= self.hire_time.get(worker, 0) + 1 + distance
+                    ).only_enforce_if(first)
                     self._travel_on_arc(f"spawn:{worker}:{node.identifier}", first, distance)
             for left_index, left in enumerate(self.nodes, start=1):
                 for right_index, right in enumerate(self.nodes, start=1):
@@ -641,7 +778,8 @@ class _CompactModel:
             if solver.boolean_value(self.node_active[node.identifier])}
         purchases = {item: solver.value(quantity)
                      for item, quantity in self.purchase_quantity.items()
-                     if solver.value(quantity) > 0}
+                     if solver.value(quantity) > 0
+                     and item not in self.window_purchase_quantity}
         return schedule, positions, purchases
 
     def exclude(self, solver):
@@ -709,23 +847,43 @@ def _materialize(model, decoded):
                 route.pop(0)
             else:
                 actions[worker.index] = _move(worker.position, target)
-        required_orders = []
-        if offset == 0:
-            required_orders.extend(("HIRE",) for _ in model.hire_time)
-            required_orders.extend(("BUY_LAND",) for _ in model.land_time)
-            for item, quantity in purchases.items():
-                if item.endswith("_SEED"):
-                    required_orders.append(("BUY_SEED", item.removesuffix("_SEED"), quantity))
-                elif item in rules.ANIMALS:
-                    required_orders.append(("BUY_ANIMAL", item, quantity))
-                else:
-                    required_orders.append(("BUY_PRODUCT", item, quantity))
         after_units = rules.advance_owned(current, tuple(actions), unit_only=True)
+        window_orders = []
         for index, window in windows:
             if index not in completed_windows and window.start_turn <= current.hour <= window.end_turn \
                     and _window_ready(after_units, window):
-                required_orders.extend(window.market_orders)
+                window_orders.extend(window.market_orders)
                 completed_windows.add(index)
+        ordinary_orders = []
+        if offset == 0:
+            ordinary_orders.extend(("HIRE",)
+                                   for _ in model.ordinary_hire_workers)
+            ordinary_orders.extend(("BUY_LAND",)
+                                   for _ in model.ordinary_land_quadrants)
+            for item, quantity in purchases.items():
+                if item.endswith("_SEED"):
+                    ordinary_orders.append(
+                        ("BUY_SEED", item.removesuffix("_SEED"), quantity))
+                elif item in rules.ANIMALS:
+                    ordinary_orders.append(("BUY_ANIMAL", item, quantity))
+                else:
+                    ordinary_orders.append(("BUY_PRODUCT", item, quantity))
+        if offset == 0 and ordinary_orders:
+            # OPENING_FINANCE is the sole mixed case: Plan-owned opening sales
+            # must fund solver-selected hires, while Plan-owned emergency buys
+            # remain after those hires.
+            split = 0
+            while (split < len(window_orders)
+                   and window_orders[split]
+                   and window_orders[split][0] == "SELL"):
+                split += 1
+            required_orders = [
+                *window_orders[:split],
+                *ordinary_orders,
+                *window_orders[split:],
+            ]
+        else:
+            required_orders = [*ordinary_orders, *window_orders]
         try:
             orders = realization_orders(current, tuple(actions),
                                          required_sequence=tuple(required_orders))

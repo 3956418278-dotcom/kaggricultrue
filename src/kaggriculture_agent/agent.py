@@ -18,6 +18,10 @@ def decide(
     session: DailyPlanningSession | None = None,
 ) -> dict[str, list[Any]]:
     state = reconstruct(observation)
+    if state.day < 4:
+        from .scripted_opening import scripted_opening_action
+
+        return scripted_opening_action(observation)
     owner = session or _DEFAULT_SESSION
     operating_plan = owner.plan_for(state)
     return construct_action(state, owner.execution_for(state, operating_plan))

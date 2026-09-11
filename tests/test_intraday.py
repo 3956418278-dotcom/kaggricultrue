@@ -9,9 +9,16 @@ from kaggle_environments import make
 from src.kaggriculture_agent.execution import InvalidRealization, execute_realization
 from src.kaggriculture_agent.economics import ActionDimension, WorkAmount
 from src.kaggriculture_agent.intraday import _expand_plan, solve_intraday
-from src.kaggriculture_agent.planner import EconomicWindow
+from src.kaggriculture_agent.planner import (
+    EconomicWindow,
+    Plan,
+    _animal_commitment,
+    _canonical_daily_commitment,
+    _crop_commitment,
+)
 from src.kaggriculture_agent.realization import PlanningFailure, Realization, TurnDecision
-from src.kaggriculture_agent.state import reconstruct
+from src.kaggriculture_agent.state import TileState, reconstruct
+from src.kaggriculture_agent import rules
 from src.kaggriculture_eval.plan_io import plan_from_dict
 from src.kaggriculture_eval.player_days import reconstruct_day
 
@@ -99,6 +106,179 @@ class IntradayContractTests(unittest.TestCase):
                      "route_session.py", "temporal_model.py",
                      "temporal_session.py", "temporal_start.py"):
             self.assertFalse((root / name).exists(), name)
+
+
+class ProgrammeFinanceRegressionTests(unittest.TestCase):
+    def _state(self, *, money, shed, tile_updates):
+        observation = make(
+            "kaggriculture", configuration={"seed": 31}
+        ).reset(2)[0].observation
+        state = reconstruct(observation)
+        replacements = {
+            position: TileState(position, raw)
+            for position, raw in tile_updates.items()
+        }
+        return replace(
+            state,
+            step=4 * rules.TURNS_PER_DAY,
+            day=4,
+            hour=0,
+            money=money,
+            shed={item: int(shed.get(item, 0)) for item in rules.PRODUCTS},
+            tiles=tuple(replacements.get(tile.position, tile)
+                        for tile in state.tiles),
+        )
+
+    def _plan(self, state, *, obligations=(), selected=(), window):
+        return Plan(
+            obligations=tuple(obligations),
+            selected=tuple(selected),
+            support=(),
+            rejected={},
+            fertilize_targets=frozenset(),
+            animal_purchases=tuple(
+                str(item.metadata["animal"])
+                for item in selected if item.kind == "ANIMAL"
+            ),
+            buy_land=False,
+            feed_reserve=0,
+            fertilizer_reserve=0,
+            day=state.day,
+            formed_step=state.step,
+            max_hands=0,
+            economic_windows=(window,),
+        )
+
+    def _trace(self, state, realization):
+        current = state
+        trace = []
+        money = [state.money]
+        for turn, decision in enumerate(realization.turns):
+            for worker, action in enumerate(decision.worker_actions):
+                trace.append((turn, current.workers[worker].position, action))
+            current = rules.advance_owned(
+                current, decision.worker_actions, decision.market_orders
+            )
+            money.append(current.money)
+        return current, trace, money
+
+    def test_turn7_fertilizer_finances_cow_after_prebuild(self):
+        goose_position = (4, 4)
+        cow_position = (4, 3)
+        state = self._state(
+            money=300,
+            shed={"WHEAT": 2},
+            tile_updates={goose_position: {
+                "kind": "COOP",
+                "animal": "GOOSE",
+                "placed_day": 0,
+                "fed_today": False,
+                "cared_today": False,
+                "consecutive_unfed": 0,
+                "yield_units": 0,
+                "fertilizer_available": True,
+                "pending_care_bonus": 0,
+            }},
+        )
+        deadline = state.step + 20
+        goose = _canonical_daily_commitment(
+            state,
+            _animal_commitment(
+                state, "GOOSE", goose_position, existing=True,
+                placed_day=0, fertilizer_available=True,
+            ),
+        )
+        cow = _canonical_daily_commitment(
+            state,
+            _animal_commitment(
+                state, "COW", cow_position, existing=False,
+                needs_structure=True,
+            ),
+        )
+        goose = replace(goose, time=replace(
+            goose.time, deadlines=(deadline,)
+        ))
+        cow = replace(cow, time=replace(cow.time, deadlines=(deadline,)))
+        window = EconomicWindow(
+            7, 7,
+            market_orders=(("SELL", "FERTILIZER", 1),
+                           ("BUY_ANIMAL", "COW", 1)),
+            required_shed={"FERTILIZER": 1},
+        )
+        plan = self._plan(
+            state, obligations=(goose,), selected=(cow,), window=window
+        )
+
+        realization = solve_intraday(state, plan)
+        ending = execute_realization(state, plan, realization)
+        _, trace, money = self._trace(state, realization)
+        self.assertTrue(all(value >= 0 for value in money))
+        self.assertEqual(realization.turns[7].market_orders, (
+            ("SELL", "FERTILIZER", 1),
+            ("BUY_ANIMAL", "COW", 1),
+        ))
+        builds = [turn for turn, position, action in trace
+                  if position == cow_position and action[0] == "BUILD_PASTURE"]
+        places = [turn for turn, position, action in trace
+                  if position == cow_position and action[0] == "PLACE"]
+        mandatory = [turn for turn, _, action in trace
+                     if action[0] in {"FEED", "WATER", "COLLECT_FERTILIZER",
+                                      "BUILD_PASTURE", "PLACE", "CARE"}]
+        self.assertLess(builds[0], 7)
+        self.assertLessEqual(places[0], 19)
+        self.assertLessEqual(max(mandatory), 20)
+        self.assertEqual(ending.tile_at(cow_position).animal, "COW")
+
+    def test_reservation_wheat_finances_strawberry_seed(self):
+        position = (4, 3)
+        wheat = {
+            "kind": "PLANT",
+            "crop": "WHEAT",
+            "planted_day": 0,
+            "watered_today": False,
+            "consecutive_unwatered": 0,
+            "yield_units": 3,
+            "max_lifespan_step": 5 * rules.TURNS_PER_DAY,
+            "fertilized_until_day": -1,
+        }
+        state = self._state(money=25, shed={}, tile_updates={position: wheat})
+        strawberry = _canonical_daily_commitment(
+            state, _crop_commitment(state, "STRAWBERRY", state.tile_at(position))
+        )
+        strawberry = replace(
+            strawberry,
+            time=replace(strawberry.time, deadlines=(state.step + 20,)),
+            required_outputs={"WHEAT": 3},
+        )
+        window = EconomicWindow(
+            7, 7,
+            market_orders=(("SELL", "WHEAT", 3),
+                           ("BUY_SEED", "STRAWBERRY", 1)),
+            required_shed={"WHEAT": 3},
+        )
+        plan = self._plan(
+            state, selected=(strawberry,), window=window
+        )
+
+        realization = solve_intraday(state, plan)
+        ending = execute_realization(state, plan, realization)
+        _, trace, money = self._trace(state, realization)
+        self.assertTrue(all(value >= 0 for value in money))
+        self.assertEqual(realization.turns[7].market_orders, (
+            ("SELL", "WHEAT", 3),
+            ("BUY_SEED", "STRAWBERRY", 1),
+        ))
+        harvest = next(turn for turn, at, action in trace
+                       if at == position and action[0] == "HARVEST")
+        plant = next(turn for turn, at, action in trace
+                     if at == position and action[0] == "PLANT")
+        water = next(turn for turn, at, action in trace
+                     if at == position and action[0] == "WATER")
+        self.assertLess(harvest, 7)
+        self.assertGreaterEqual(plant, 8)
+        self.assertLessEqual(water, 20)
+        self.assertEqual(ending.tile_at(position).raw["crop"], "STRAWBERRY")
+        self.assertEqual(ending.tile_at(position).raw["consecutive_unwatered"], 0)
 
 
 if __name__ == "__main__":
