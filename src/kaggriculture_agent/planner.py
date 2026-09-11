@@ -909,7 +909,16 @@ def _canonical_daily_commitment(
         if harvest_today and not rules.CROPS[crop].ongoing:
             required = {"$tile": None}
             if isinstance(raw, Mapping):
-                outputs[crop] = max(0, int(raw.get("yield_units", 0) or 0))
+                opening_yield = max(0, int(raw.get("yield_units", 0) or 0))
+                water_gain = rules.one_time_water_gain(
+                    crop,
+                    planted_day=int(raw.get("planted_day", state.day)),
+                    day=state.day,
+                    yield_units=opening_yield,
+                    fertilized_until_day=int(raw.get("fertilized_until_day", -1)),
+                    watered_today=bool(raw.get("watered_today", False)),
+                )
+                outputs[crop] = opening_yield + water_gain
         else:
             required = {"watered_today": True}
             if harvest_today:
