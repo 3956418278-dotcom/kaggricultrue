@@ -18,6 +18,13 @@ class PlanningFailure(RuntimeError):
     pass
 
 
+_DAY_ROUTE_CACHE = {}
+
+
+def clear_route_cache():
+    _DAY_ROUTE_CACHE.clear()
+
+
 _ACTION_ORDER = {
     "FERTILIZE": 0, "WATER": 1, "FEED": 1, "CARE": 2,
     "HARVEST": 3, "COLLECT_FERTILIZER": 4, "DIG": 5,
@@ -198,6 +205,60 @@ def _compile_worker(state: State, day: int, worker: int, bundles: list[_Bundle],
     return actions
 
 
+def _day_signature(state: State, day: int, bundles, workforce: int, item_available):
+    return (
+        state.step if day == state.day else day * rules.TURNS_PER_DAY,
+        workforce,
+        tuple((worker.position, tuple(sorted(worker.inventory.items())))
+              for worker in state.workers) if day == state.day else (),
+        tuple(sorted(item_available.items())),
+        tuple((bundle.tile, bundle.day, bundle.release, bundle.deadline, bundle.zone,
+               bundle.return_required,
+               tuple((event.step, event.event_id, event.action, event.item,
+                      event.quantity, event.deadline) for event in bundle.events))
+              for bundle in bundles),
+    )
+
+
+def _compile_day(state: State, day: int, bundles, workforce: int, item_available):
+    key = _day_signature(state, day, bundles, workforce, item_available)
+    if key in _DAY_ROUTE_CACHE:
+        return _DAY_ROUTE_CACHE[key]
+    routes = []
+    starts = []
+    access = rules.shed_access(state.board_size)
+    for worker in range(workforce):
+        if day == state.day and worker < len(state.workers):
+            starts.append(state.workers[worker].position)
+        else:
+            starts.append(access[worker % len(access)])
+    assigned = [[] for _ in range(workforce)]
+    inner = sorted((bundle for bundle in bundles if bundle.zone == "INNER"),
+                   key=lambda bundle: (bundle.deadline, bundle.tile[1], bundle.tile[0]))
+    outer = _outer_order([bundle for bundle in bundles if bundle.zone == "OUTER"], access[0])
+    for bundle in (*inner, *outer):
+        choice = min(range(workforce), key=lambda worker: (
+            sum(len(assigned_bundle.events) + 2 * rules.manhattan(
+                starts[worker], assigned_bundle.tile)
+                for assigned_bundle in assigned[worker]), worker))
+        assigned[choice].append(bundle)
+    for worker, work in enumerate(assigned):
+        if not work:
+            continue
+        available = max(state.step, day * rules.TURNS_PER_DAY)
+        if not (day == state.day and worker < len(state.workers)):
+            available = day * rules.TURNS_PER_DAY + 1
+        actions = _compile_worker(state, day, worker, work, starts[worker], available,
+                                  item_available)
+        if actions is None:
+            _DAY_ROUTE_CACHE[key] = None
+            return None
+        routes.append(WorkerRoute(worker, day, "MIXED", actions))
+    result = tuple(routes)
+    _DAY_ROUTE_CACHE[key] = result
+    return result
+
+
 def _compile(state: State, programme: Programme, bundles, workforce: int):
     routes = []
     item_available = {item: state.step for item, quantity in state.shed.items() if quantity > 0}
@@ -208,25 +269,10 @@ def _compile(state: State, programme: Programme, bundles, workforce: int):
         day_bundles = [b for b in bundles if b.day == day]
         if not day_bundles:
             continue
-        starts = []
-        access = rules.shed_access(state.board_size)
-        for worker in range(workforce):
-            if day == state.day and worker < len(state.workers): starts.append(state.workers[worker].position)
-            else: starts.append(access[worker % len(access)])
-        assigned = [[] for _ in range(workforce)]
-        inner = sorted((b for b in day_bundles if b.zone == "INNER"), key=lambda b: (b.deadline, b.tile[1], b.tile[0]))
-        outer = _outer_order([b for b in day_bundles if b.zone == "OUTER"], access[0])
-        for bundle in (*inner, *outer):
-            choice = min(range(workforce), key=lambda w: (sum(len(b.events) + 2 * rules.manhattan(starts[w], b.tile) for b in assigned[w]), w))
-            assigned[choice].append(bundle)
-        for worker, work in enumerate(assigned):
-            if not work: continue
-            available = max(state.step, day * 24)
-            if not (day == state.day and worker < len(state.workers)):
-                available = day * 24 + 1
-            actions = _compile_worker(state, day, worker, work, starts[worker], available, item_available)
-            if actions is None: return None
-            routes.append(WorkerRoute(worker, day, "MIXED", actions))
+        day_routes = _compile_day(state, day, day_bundles, workforce, item_available)
+        if day_routes is None:
+            return None
+        routes.extend(day_routes)
     return tuple(routes)
 
 

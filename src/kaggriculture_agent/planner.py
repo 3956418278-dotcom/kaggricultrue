@@ -6,10 +6,11 @@ from dataclasses import replace
 from typing import Iterable, Mapping
 
 from . import rules
-from .intraday import PlanningFailure, solve_intraday
+from .intraday import PlanningFailure, clear_route_cache, solve_intraday
 from .market import clear_sale_cache, known_demand_events, next_reveal, opponent_pressure, optimize_sales
 from .programme import AssetProgramme, FertilizerProgramme, LandProgramme, Programme, ProgrammeEvent
-from .simulation import cash_projection, simulate_programme
+from .simulation import (cash_projection, drop_arrivals,
+                         project_asset_transitions, simulate_programme)
 from .state import AssetState, Position, State
 
 LONG_ASSETS = ("COW", "SHEEP", "GOOSE", "STRAWBERRY", "TOMATO", "MELON")
@@ -190,25 +191,80 @@ def _programme_from_assets(state: State, assets: Iterable[AssetProgramme], extra
 
 
 def _arrivals(state: State, programme: Programme):
-    arrivals = defaultdict(lambda: defaultdict(int))
-    # Carried goods reach the shed at the next daily close if no earlier route drop exists.
-    close = min((state.day + 1) * 24, 718)
-    for worker in state.workers:
-        for item, quantity in worker.inventory.items(): arrivals[close][item] += quantity
-    for asset in programme.assets:
-        if asset.purpose=="W_FEED":
-            continue
-        for event in asset.harvest_schedule:
-            arrival = min((event.step // 24 + 1) * 24, 718)
-            arrivals[arrival][event.item] += event.quantity
-        for event in asset.service_schedule:
-            if event.action and event.action[0] == "COLLECT_FERTILIZER":
-                arrivals[min((event.step//24+1)*24,718)]["FERTILIZER"] += 1
-    return {step: dict(amounts) for step, amounts in arrivals.items()}
+    if not programme.routes:
+        return {}
+    return drop_arrivals(state, programme)
 
 
 _VALUE_CACHE={}
 _SALE_CACHE={}
+_ECONOMIC_CACHE={}
+
+
+def _economic_core(programme: Programme):
+    """Cache tile-independent production and fixed cash commitments first."""
+    key = tuple(sorted((
+        asset.asset_type, asset.existing, asset.purpose, asset.release_turn,
+        tuple((event.step, event.kind, event.item, event.quantity, event.mandatory)
+              for event in asset.service_schedule),
+        tuple((event.step, event.item, event.quantity)
+              for event in asset.output_schedule),
+        tuple((event.step, event.item, event.quantity)
+              for event in asset.harvest_schedule),
+    ) for asset in programme.assets))
+    cached = _ECONOMIC_CACHE.get(key)
+    if cached is None:
+        output = tuple(sorted((event.step, event.item, event.quantity)
+                              for asset in programme.assets
+                              for event in asset.output_schedule))
+        harvest = tuple(sorted((event.step, event.item, event.quantity)
+                               for asset in programme.assets
+                               for event in asset.harvest_schedule))
+        commitments = tuple(sorted((event.step, event.kind, event.item, event.quantity)
+                                   for event in programme.events
+                                   if event.kind in {"BUY_SEED", "BUY_ANIMAL",
+                                                     "BUY_PRODUCT", "BUY_LAND"}))
+        cached = (output, harvest, commitments)
+        _ECONOMIC_CACHE[key] = cached
+    return cached
+
+
+def _feed_sale_inputs(state: State, programme: Programme, arrivals):
+    """Reserve dated wheat needed by FEED before exposing stock to SELL DP."""
+    feeds=sorted((event.deadline if event.deadline is not None else event.step)
+                 for event in programme.events if event.kind=="FEED")
+    if not feeds:
+        return state,arrivals
+    adjusted={step:dict(amounts) for step,amounts in arrivals.items()}
+    opening=state.shed.get("WHEAT",0)
+    opening_reserved=0
+    arrival_records=[[step,amounts.get("WHEAT",0)]
+                     for step,amounts in sorted(adjusted.items())
+                     if amounts.get("WHEAT",0)]
+    buys=sorted(event.step+1 for event in programme.events
+                if event.kind=="BUY_PRODUCT" and event.item=="WHEAT")
+    used_buys=0
+    for deadline in feeds:
+        if used_buys<len(buys) and buys[used_buys]<=deadline:
+            used_buys+=1
+            continue
+        if opening_reserved<opening:
+            opening_reserved+=1
+            continue
+        source=next((record for record in arrival_records
+                     if record[0]<=deadline and record[1]>0),None)
+        if source is not None:
+            source[1]-=1
+    for step,remaining in arrival_records:
+        adjusted[step]["WHEAT"]=remaining
+        if not remaining:
+            del adjusted[step]["WHEAT"]
+    adjusted={step:amounts for step,amounts in adjusted.items() if amounts}
+    shed=dict(state.shed)
+    if opening_reserved:
+        shed["WHEAT"]=opening-opening_reserved
+    sale_state=replace(state,own=replace(state.own,shed_inventory=shed))
+    return sale_state,adjusted
 
 
 def _economic_signature(state: State, programme: Programme):
@@ -224,30 +280,64 @@ def _economic_signature(state: State, programme: Programme):
             tuple((land.quadrant,land.buy_step,land.cost,land.use) for land in programme.land))
 
 
-def _finalize(state: State, programme: Programme, demand, pressure, *, force=False):
-    programme = _ensure_feed_supply(state, programme)
-    arrivals=_arrivals(state,programme)
-    sale_key=(tuple((step,tuple(sorted(amounts.items()))) for step,amounts in sorted(arrivals.items())),
-              tuple(sorted(state.shed.items())),tuple(sorted(state.market.inventory.items())))
-    sales=_SALE_CACHE.get(sale_key)
-    if sales is None:
-        sales=optimize_sales(state,arrivals,demand,pressure); _SALE_CACHE[sale_key]=sales
-    programme = replace(programme, planned_sale=sales.planned_sale,
-                        market_inventory=sales.market_inventory)
-    programme=_finance_sales(state,programme,arrivals,pressure)
-    try:
-        programme = solve_intraday(state, programme, complete_actions=force)
-    except PlanningFailure as exc:
-        return replace(programme, feasible=False, terminal_cash=-(10**18), diagnostics={"failure":str(exc)})
+def _finalize(state: State, programme: Programme, demand, pressure, *, force=False,
+              ensure_feed=True):
+    if ensure_feed:
+        programme = _ensure_feed_supply(state, programme)
+    _economic_core(programme)
+
+    # Route timing and SELL timing form a small deterministic fixed point:
+    # same-day sales may require a return, and that return is the exact arrival.
+    seen = set()
+    arrivals = {}
+    while True:
+        try:
+            routed = solve_intraday(state, programme, complete_actions=False)
+        except PlanningFailure as exc:
+            return replace(programme, feasible=False, terminal_cash=-(10**18),
+                           diagnostics={"failure":str(exc)})
+        arrivals = _arrivals(state, routed)
+        sale_state,sale_arrivals=_feed_sale_inputs(state,routed,arrivals)
+        sale_key=(tuple((step,tuple(sorted(amounts.items())))
+                        for step,amounts in sorted(sale_arrivals.items())),
+                  tuple(sorted(sale_state.shed.items())),
+                  tuple(sorted(state.market.inventory.items())))
+        sales=_SALE_CACHE.get(sale_key)
+        if sales is None:
+            sales=optimize_sales(sale_state,sale_arrivals,demand,pressure)
+            _SALE_CACHE[sale_key]=sales
+        updated = replace(routed, planned_sale=sales.planned_sale,
+                          market_inventory=sales.market_inventory)
+        updated = _finance_sales(state,updated,arrivals,pressure)
+        marker=(tuple((step,tuple(sorted(amounts.items())))
+                      for step,amounts in sorted(arrivals.items())),
+                tuple((step,tuple(sorted(amounts.items())))
+                      for step,amounts in sorted(updated.planned_sale.items())))
+        if (updated.planned_sale == programme.planned_sale and
+                updated.return_mode == programme.return_mode):
+            programme = updated
+            break
+        if marker in seen:
+            return replace(updated, feasible=False, terminal_cash=-(10**18),
+                           diagnostics={"failure":"route/SELL timing has no stable programme"})
+        seen.add(marker)
+        programme = updated
+    if force:
+        try:
+            programme = solve_intraday(state, programme, complete_actions=True)
+            arrivals = _arrivals(state, programme)
+        except PlanningFailure as exc:
+            return replace(programme, feasible=False, terminal_cash=-(10**18),
+                           diagnostics={"failure":str(exc)})
     signature=_economic_signature(state,programme)
     if not force and signature in _VALUE_CACHE:
         cash,feasible,failure=_VALUE_CACHE[signature]
-        return replace(_attach_asset_flows(programme),terminal_cash=cash,feasible=feasible,
+        return replace(_attach_asset_flows(programme,arrivals),terminal_cash=cash,feasible=feasible,
                        diagnostics={} if feasible else {"failure":failure})
     if not force:
         cash,feasible=cash_projection(state,programme,pressure)
         _VALUE_CACHE[signature]=(cash,feasible,None if feasible else "cash/market infeasible")
-        return replace(_attach_asset_flows(programme),terminal_cash=cash,feasible=feasible,
+        return replace(_attach_asset_flows(programme,arrivals),terminal_cash=cash,feasible=feasible,
                        diagnostics={} if feasible else {"failure":"cash/market infeasible"})
     result = simulate_programme(state, programme, pressure_events=pressure)
     projected_cash,projected_feasible=cash_projection(state,programme,pressure)
@@ -255,7 +345,7 @@ def _finalize(state: State, programme: Programme, demand, pressure, *, force=Fal
         result=replace(result,feasible=False,
                        failure=result.failure or "physical replay did not realize projected cash")
     _VALUE_CACHE[signature]=(result.terminal_cash,result.feasible,result.failure)
-    programme = _attach_asset_flows(programme)
+    programme = _attach_asset_flows(programme,arrivals)
     return replace(programme, terminal_cash=result.terminal_cash, feasible=result.feasible,
         farm_output=result.farm_output, field_stock=result.field_stock,
         worker_stock=result.worker_stock, shed_stock=result.shed_stock,
@@ -290,15 +380,24 @@ def _finance_sales(state: State, programme: Programme, arrivals, pressure):
     return programme
 
 
-def _attach_asset_flows(programme: Programme):
+def _attach_asset_flows(programme: Programme, arrivals):
     queues=defaultdict(list)
+    available_arrivals={item:[[step,quantity] for step,amounts in sorted(arrivals.items())
+                              if (quantity:=amounts.get(item,0))]
+                        for item in rules.PRODUCTS}
     assets=[]
     for asset in programme.assets:
         core_service=tuple(e for e in asset.service_schedule if e.kind not in {"PICKUP","DROP"})
         stock=[]
         logistics=[]
         for event in asset.harvest_schedule:
-            arrival=min((event.step//24+1)*24,718)
+            arrival=next((record[0] for record in available_arrivals.get(event.item,())
+                          if record[1]>0 and record[0]>=event.step),
+                         rules.TERMINAL_ACTION_STEP)
+            left=event.quantity
+            for record in available_arrivals.get(event.item,()):
+                if record[0]!=arrival or left<=0: continue
+                take=min(left,record[1]); record[1]-=take; left-=take
             stock.append(_pe(arrival,0,event.event_id+":stock","STOCK",tile=asset.tile,
                 asset=asset.asset_id,item=event.item,quantity=event.quantity,mandatory=False))
             queues[event.item].append([arrival,event.quantity,asset.asset_id,asset.tile])
@@ -397,10 +496,46 @@ def _exit_programme(state: State, programme: Programme, asset: AssetProgramme):
     events.append(_pe(free_step, 40, asset.asset_id+":dig", "DIG", tile=asset.tile,
                       asset=asset.asset_id, action=("DIG",), deadline=min(free_step//24*24+23,718)))
     assets = [replacement if a.asset_id == asset.asset_id else a for a in programme.assets]
-    buffer = _buffer(state, asset.tile, "WHEAT", free_step+1)
-    if buffer is not None:
-        assets.append(buffer)
     return _programme_from_assets(state, assets, events)
+
+
+def _best_released_tile(state: State, programme: Programme, tile: Position,
+                        free_step: int, demand, pressure):
+    """Value EMPTY/W/C/all legal long uses after an EXIT frees one tile."""
+    start_step=min(free_step+1,rules.TERMINAL_ACTION_STEP)
+    options=[_finalize(state,programme,demand,pressure)]
+    baseline=options[0]
+    for crop in ("WHEAT","CARROT"):
+        buffer=_buffer(state,tile,crop,start_step)
+        if buffer is not None:
+            trial=_programme_from_assets(state,(*programme.assets,buffer),programme.events,
+                                         programme.land)
+            options.append(_finalize(state,trial,demand,pressure))
+    baseline=max(enumerate(options),key=lambda value:(value[1].terminal_cash,-value[0]))[1]
+    for kind in LONG_ASSETS:
+        candidate=(_animal_programme(state,kind,tile,existing=False,start_step=start_step)
+                   if kind in rules.ANIMALS else
+                   _crop_programme(state,kind,tile,existing=False,start_step=start_step))
+        trial=_finalize(state,_programme_from_assets(
+            state,(*programme.assets,candidate),programme.events,programme.land),
+            demand,pressure)
+        if trial.terminal_cash<=baseline.terminal_cash:
+            continue
+        reveal=next_reveal(start_step//24)
+        wait_value=baseline.terminal_cash
+        if reveal<31:
+            delayed=(_animal_programme(state,kind,tile,existing=False,
+                                       start_step=reveal*24+1)
+                     if kind in rules.ANIMALS else
+                     _crop_programme(state,kind,tile,existing=False,
+                                     start_step=reveal*24+1))
+            wait=_finalize(state,_programme_from_assets(
+                state,(*baseline.assets,delayed),baseline.events,baseline.land),
+                demand,pressure)
+            wait_value=wait.terminal_cash
+        if trial.terminal_cash>wait_value:
+            options.append(trial)
+    return max(options,key=lambda option:option.terminal_cash)
 
 
 def _optional_events(state: State, programme: Programme):
@@ -443,42 +578,12 @@ def _optional_events(state: State, programme: Programme):
     return result
 
 
-def _add_event(programme: Programme, event: ProgrammeEvent):
+def _add_event(state: State, programme: Programme, event: ProgrammeEvent):
     assets=[]
     for asset in programme.assets:
         if asset.asset_id == event.asset_id:
-            output=list(asset.output_schedule); harvest=list(asset.harvest_schedule)
-            if event.kind == "CARE":
-                care_day=event.step//24
-                feed_days={e.step//24 for e in asset.service_schedule if e.kind=="FEED"}
-                for index,out in enumerate(output):
-                    production_day=out.step//24-1
-                    if production_day>care_day and production_day in feed_days:
-                        output[index]=replace(out,quantity=out.quantity+1)
-                        harvest=[replace(h,quantity=h.quantity+1) if h.step==out.step else h for h in harvest]
-                        break
-            elif event.kind == "WATER" and asset.asset_type in rules.CROPS and not rules.CROPS[asset.asset_type].ongoing:
-                harvest=[replace(h,quantity=min(rules.CROPS[asset.asset_type].max_yield,h.quantity+1)) for h in harvest]
-            elif event.kind == "FERTILIZE" and asset.asset_type in rules.CROPS:
-                day=event.step//24; rule=rules.CROPS[asset.asset_type]
-                if rule.ongoing:
-                    water_days={e.step//24 for e in asset.service_schedule if e.kind=="WATER"}
-                    changed=set()
-                    for index,out in enumerate(output):
-                        production_day=out.step//24-1
-                        if day<=production_day<=day+2 and production_day in water_days:
-                            output[index]=replace(out,quantity=min(2,out.quantity+1)); changed.add(out.step)
-                    harvest=[replace(h,quantity=h.quantity+1) if h.step in changed else h for h in harvest]
-                else:
-                    water_days=sum(day<=e.step//24<=day+2 for e in asset.service_schedule if e.kind=="WATER")
-                    harvest=[replace(h,quantity=min(rule.max_yield,h.quantity+water_days)) for h in harvest]
-            elif event.kind == "COLLECT_F":
-                step=min((event.step//24+1)*24,718)
-                if step>event.step:
-                    output.append(_pe(step,0,event.event_id+":next-output","OUTPUT",tile=asset.tile,
-                        asset=asset.asset_id,item="FERTILIZER",quantity=1,mandatory=False))
-            assets.append(replace(asset, service_schedule=tuple(sorted((*asset.service_schedule,event))),
-                                  output_schedule=tuple(output),harvest_schedule=tuple(harvest)))
+            assets.append(replace(asset,
+                service_schedule=tuple(sorted((*asset.service_schedule,event)))))
         else: assets.append(asset)
     events=[*programme.events,event]
     if event.kind=="FERTILIZE":
@@ -491,17 +596,86 @@ def _add_event(programme: Programme, event: ProgrammeEvent):
                 shifted=replace(event,step=buy_step+1)
                 events=[shifted if e.event_id==event.event_id else e for e in events]
                 assets=[replace(a,service_schedule=tuple(shifted if e.event_id==event.event_id else e for e in a.service_schedule)) if a.asset_id==event.asset_id else a for a in assets]
-    return replace(programme, assets=tuple(assets), events=tuple(sorted({e.event_id:e for e in events}.values())))
+    assets=tuple(project_asset_transitions(state,asset)
+                 if asset.asset_id==event.asset_id else asset for asset in assets)
+    projected={asset.asset_id:asset for asset in assets}
+    rebuilt=[]
+    for old in events:
+        if old.asset_id==event.asset_id and old.kind=="HARVEST":
+            replacement_event=next((harvest for harvest in projected[event.asset_id].harvest_schedule
+                                    if harvest.event_id==old.event_id),old)
+            rebuilt.append(replacement_event)
+        else:
+            rebuilt.append(old)
+    return replace(programme, assets=assets,
+                   events=tuple(sorted({e.event_id:e for e in rebuilt}.values())))
 
 
-def _feed_gap(state: State, programme: Programme):
-    deadline_day=next_reveal(state.day)
-    required=sum(1 for e in programme.events if e.kind=="FEED" and e.step//24 < deadline_day)
-    available=state.owned_total("WHEAT")
+_OPTIONAL_KINDS={"CARE","WATER","FERTILIZE","COLLECT_F"}
+
+
+def _without_optional(state: State, programme: Programme):
+    optional_ids={event.event_id for event in programme.events
+                  if not event.mandatory and event.kind in _OPTIONAL_KINDS}
+    if not optional_ids:
+        return programme
+    assets=[]
     for asset in programme.assets:
-        if asset.asset_type=="WHEAT":
-            available += sum(e.quantity for e in asset.harvest_schedule if e.step//24 < deadline_day)
-    return max(0, required-available)
+        service=tuple(event for event in asset.service_schedule
+                      if event.event_id not in optional_ids)
+        stripped=replace(asset,service_schedule=service)
+        assets.append(project_asset_transitions(state,stripped))
+    events=tuple(event for event in programme.events
+                 if event.event_id not in optional_ids and
+                 not (event.source=="FERTILIZE" and event.kind=="BUY_PRODUCT"))
+    return replace(programme,assets=tuple(assets),events=events,
+                   routes=(),planned_sale={},market_inventory={})
+
+
+def _optimize_optional(state: State, programme: Programme, demand, pressure):
+    """Rebuild all optional service against the current whole programme."""
+    programme=_finalize(state,_without_optional(state,programme),demand,pressure)
+    accepted=set()
+    while True:
+        candidates={event.event_id:event for event in _optional_events(state,programme)
+                    if event.event_id not in accepted and
+                    all(old.event_id!=event.event_id for old in programme.events)}
+        if not candidates:
+            return programme
+        choices=[]
+        for event in candidates.values():
+            trial=_finalize(state,_add_event(state,programme,event),demand,pressure)
+            choices.append((trial.terminal_cash-programme.terminal_cash,
+                            event.event_id,trial))
+        gain,event_id,trial=max(choices,key=lambda value:(value[0],value[1]))
+        if gain<=0:
+            return programme
+        checked=_finalize(state,trial,demand,pressure,force=True)
+        accepted.add(event_id)
+        if checked.feasible:
+            programme=checked
+
+
+def _first_feed_deficit(state: State, programme: Programme):
+    arrivals=_arrivals(state,programme)
+    available=state.owned_total("WHEAT")
+    arrival_steps=sorted((step,amounts.get("WHEAT",0))
+                         for step,amounts in arrivals.items()
+                         if amounts.get("WHEAT",0))
+    buys=sorted(event.step+1 for event in programme.events
+                if event.kind=="BUY_PRODUCT" and event.item=="WHEAT")
+    cursor=buy_cursor=0
+    feeds=sorted(event.deadline if event.deadline is not None else event.step
+                 for event in programme.events if event.kind=="FEED")
+    for deadline in feeds:
+        while cursor<len(arrival_steps) and arrival_steps[cursor][0]<=deadline:
+            available+=arrival_steps[cursor][1];cursor+=1
+        while buy_cursor<len(buys) and buys[buy_cursor]<=deadline:
+            available+=1;buy_cursor+=1
+        available-=1
+        if available<0:
+            return deadline,-available
+    return None
 
 
 def _strip_auto_feed(programme: Programme):
@@ -510,30 +684,174 @@ def _strip_auto_feed(programme: Programme):
 
 def _resolve_feed(state: State, programme: Programme, demand, pressure):
     base=_strip_auto_feed(programme)
-    gap=_feed_gap(state,base)
-    if gap<=0: return _finalize(state,base,demand,pressure)
-    buy=_finalize(state,base,demand,pressure)
-    order=list(_unused_tiles(state,base))
-    inner=[p for p in order if p in programme.inner]
-    outer=[p for p in order if p not in programme.inner]
-    order=sorted(inner,key=lambda p:(-rules.distance_to_shed(p,state.board_size),p[1],p[0]))+sorted(
-        outer,key=lambda p:(rules.distance_to_shed(p,state.board_size),p[1],p[0]))
-    planted=[]; supplied=0
-    for tile in order:
-        wheat=_buffer(state,tile,"WHEAT")
-        if wheat is None: continue
-        wheat=replace(wheat,purpose="W_FEED"); planted.append(wheat)
-        supplied+=sum(e.quantity for e in wheat.harvest_schedule)
-        if supplied>=gap: break
-    if supplied<gap: return buy
-    plant=_finalize(state,_programme_from_assets(state,(*base.assets,*planted),base.events),demand,pressure)
-    return max((buy,plant),key=lambda p:p.terminal_cash)
+    base=_finalize(state,base,demand,pressure,ensure_feed=False)
+    memo={}
+
+    def source_key(current):
+        return (tuple(sorted(asset.tile for asset in current.assets
+                             if asset.purpose=="W_FEED")),
+                tuple(sorted(event.step for event in current.events
+                             if event.kind=="BUY_PRODUCT" and
+                             event.item=="WHEAT")))
+
+    def search(current):
+        key=source_key(current)
+        if key in memo:
+            return memo[key]
+        deficit=_first_feed_deficit(state,current)
+        if deficit is None:
+            result=_finalize(state,current,demand,pressure,force=True,
+                             ensure_feed=False)
+            memo[key]=result
+            return result
+        deadline,gap=deficit
+        def progresses(next_deficit):
+            return (next_deficit is None or next_deficit[0]>deadline or
+                    (next_deficit[0]==deadline and next_deficit[1]<gap))
+        choices=[]
+        price_events={state.step,deadline-1}
+        price_events.update(step for step,_ in demand.get("WHEAT",())
+                            if state.step<=step<deadline)
+        price_events.update(step for step,_ in pressure.get("WHEAT",())
+                            if state.step<=step<deadline)
+        price_events.update(step for step in current.planned_sale
+                            if state.step<=step<deadline and
+                            current.planned_sale[step].get("WHEAT",0))
+        ordinal=sum(event.kind=="BUY_PRODUCT" and event.item=="WHEAT"
+                    for event in current.events)
+        for step in sorted(price_events):
+            if step<state.step or step>=deadline:
+                continue
+            buy=_pe(step,-15,f"feed-wheat:mixed:{ordinal}:{step}",
+                    "BUY_PRODUCT",item="WHEAT",quantity=1,source="W_FEED")
+            trial=_finalize(state,replace(current,events=tuple(sorted(
+                (*current.events,buy)))),demand,pressure,ensure_feed=False)
+            next_deficit=_first_feed_deficit(state,trial)
+            if progresses(next_deficit):
+                choices.append(search(trial))
+        for tile in _unused_tiles(state,current):
+            start=_candidate_start(state,current,tile)
+            mature=max(start,(start//24+rules.CROPS["WHEAT"].first_yield_day)*24)
+            if mature>deadline:
+                continue
+            wheat=_crop_programme(state,"WHEAT",tile,existing=False,
+                                  start_step=start,purpose="W_FEED",
+                                  release_step=mature)
+            trial=_finalize(state,_programme_from_assets(
+                state,(*current.assets,wheat),current.events,current.land),
+                demand,pressure,ensure_feed=False)
+            next_deficit=_first_feed_deficit(state,trial)
+            if progresses(next_deficit):
+                choices.append(search(trial))
+        feasible=[choice for choice in choices if choice.feasible]
+        result=(max(feasible,key=lambda choice:choice.terminal_cash)
+                if feasible else replace(current,feasible=False,
+                                         terminal_cash=-(10**18),
+                                         diagnostics={"failure":
+                                             f"WHEAT unavailable by feed deadline {deadline}"}))
+        memo[key]=result
+        return result
+
+    return search(base)
 
 
 def _unused_tiles(state: State, programme: Programme):
     occupied={a.tile for a in programme.assets if a.decision != "EXIT"}
+    unlocked=set(state.own.owned_land)|{land.quadrant for land in programme.land}
     return tuple(t.position for t in state.tiles if t.position not in occupied and
-                 (t.is_empty or t.kind=="WEED" or t.kind in {"COOP","PASTURE"} and t.animal is None))
+                 rules.quadrant(t.position,state.board_size) in unlocked and
+                 (t.is_locked or t.is_empty or t.kind=="WEED" or
+                  t.kind in {"COOP","PASTURE"} and t.animal is None))
+
+
+def _candidate_start(state: State, programme: Programme, tile: Position):
+    if not state.tile_at(tile).is_locked:
+        return state.step
+    buy=min((land.buy_step for land in programme.land
+             if land.quadrant==rules.quadrant(tile,state.board_size)),default=state.step)
+    return buy+1
+
+
+def _long_candidate_loop(state: State, programme: Programme, demand, pressure):
+    """Run the existing exact-tile greedy loop for the currently usable land."""
+    while True:
+        ranked=[]
+        for tile in _unused_tiles(state,programme):
+            start=_candidate_start(state,programme,tile)
+            baselines=[programme]
+            for crop in ("WHEAT","CARROT"):
+                buffer=_buffer(state,tile,crop,start)
+                if buffer:
+                    baselines.append(_finalize(state,_programme_from_assets(
+                        state,(*programme.assets,buffer),programme.events,programme.land),
+                        demand,pressure))
+            baseline=max(enumerate(baselines),
+                         key=lambda value:(value[1].terminal_cash,-value[0]))[1]
+            for kind in LONG_ASSETS:
+                tile_state=state.tile_at(tile)
+                if not tile_state.is_locked:
+                    if kind in rules.ANIMALS and not (
+                            tile_state.is_empty or tile_state.kind=="WEED" or
+                            tile_state.kind==rules.ANIMALS[kind].structure):
+                        continue
+                    if kind in rules.CROPS and not (
+                            tile_state.is_empty or tile_state.kind=="WEED"):
+                        continue
+                candidate=(_animal_programme(state,kind,tile,existing=False,
+                                             start_step=start)
+                           if kind in rules.ANIMALS else
+                           _crop_programme(state,kind,tile,existing=False,
+                                           start_step=start))
+                now=_finalize(state,_programme_from_assets(
+                    state,(*programme.assets,candidate),programme.events,programme.land),
+                    demand,pressure)
+                advantage=now.terminal_cash-baseline.terminal_cash
+                if advantage<=0:
+                    continue
+                reveal=next_reveal(start//24)
+                wait_value=baseline.terminal_cash
+                if reveal<31:
+                    delayed=(_animal_programme(state,kind,tile,existing=False,
+                                               start_step=reveal*24+1)
+                             if kind in rules.ANIMALS else
+                             _crop_programme(state,kind,tile,existing=False,
+                                             start_step=reveal*24+1))
+                    wait=_finalize(state,_programme_from_assets(
+                        state,(*baseline.assets,delayed),baseline.events,baseline.land),
+                        demand,pressure)
+                    wait_value=wait.terminal_cash
+                if now.terminal_cash<=wait_value:
+                    continue
+                key=(advantage,-rules.distance_to_shed(tile,state.board_size),
+                     -tile[1],-tile[0],kind)
+                ranked.append((key,now))
+        if not ranked:
+            return programme
+        committed=None
+        for _,candidate in sorted(ranked,key=lambda value:value[0],reverse=True):
+            checked=_finalize(state,candidate,demand,pressure,force=True)
+            if checked.feasible:
+                committed=checked
+                break
+        if committed is None:
+            return programme
+        programme=_resolve_feed(state,committed,demand,pressure)
+        programme=_optimize_optional(state,programme,demand,pressure)
+
+
+def _fill_buffers(state: State, programme: Programme, demand, pressure):
+    for tile in _unused_tiles(state,programme):
+        start=_candidate_start(state,programme,tile)
+        options=[programme]
+        for crop in ("WHEAT","CARROT"):
+            asset=_buffer(state,tile,crop,start)
+            if asset:
+                options.append(_finalize(state,_programme_from_assets(
+                    state,(*programme.assets,asset),programme.events,programme.land),
+                    demand,pressure))
+        programme=max(enumerate(options),
+                      key=lambda value:(value[1].terminal_cash,-value[0]))[1]
+    return programme
 
 
 def make_plan(state: State, config=None, **_ignored) -> Programme:
@@ -541,6 +859,8 @@ def make_plan(state: State, config=None, **_ignored) -> Programme:
     del config
     _VALUE_CACHE.clear()
     _SALE_CACHE.clear()
+    _ECONOMIC_CACHE.clear()
+    clear_route_cache()
     clear_sale_cache()
     demand=known_demand_events(state); pressure=opponent_pressure(state)
     programme=_finalize(state, _programme_from_assets(state,_initial_assets(state)), demand, pressure, force=True)
@@ -550,7 +870,11 @@ def make_plan(state: State, config=None, **_ignored) -> Programme:
         choices=[]
         for asset in programme.assets:
             if asset.existing and asset.asset_type in rules.ANIMALS and asset.decision=="KEEP":
-                trial=_finalize(state,_exit_programme(state,programme,asset),demand,pressure)
+                exited=_exit_programme(state,programme,asset)
+                trial=_best_released_tile(state,exited,asset.tile,
+                                          next(event.step for event in exited.events
+                                               if event.event_id==asset.asset_id+":dig"),
+                                          demand,pressure)
                 choices.append((trial.terminal_cash-programme.terminal_cash,asset.tile,trial))
         if not choices: break
         gain,_,trial=max(choices,key=lambda x:(x[0],-x[1][1],-x[1][0]))
@@ -559,93 +883,35 @@ def make_plan(state: State, config=None, **_ignored) -> Programme:
         if not committed.feasible: break
         programme=committed
 
-    # Optional service: accept only the largest positive marginal event, then repeat.
-    accepted_optional=set()
-    while True:
-        remaining={e.event_id:e for e in _optional_events(state,programme)
-                   if e.event_id not in accepted_optional and all(old.event_id != e.event_id for old in programme.events)}
-        if not remaining:
-            break
-        choices=[]
-        for event in remaining.values():
-            trial=_finalize(state,_add_event(programme,event),demand,pressure)
-            choices.append((trial.terminal_cash-programme.terminal_cash,event.event_id,trial))
-        gain,event_id,trial=max(choices,key=lambda x:(x[0],x[1]))
-        if gain<=0: break
-        committed=_finalize(state,trial,demand,pressure,force=True); accepted_optional.add(event_id)
-        if committed.feasible: programme=committed
+    # Optional service is rebuilt against the current whole programme.
+    programme=_optimize_optional(state,programme,demand,pressure)
 
     # Feed wheat is segregated before ordinary buffers.
     programme=_finalize(state,_resolve_feed(state,programme,demand,pressure),demand,pressure,force=True)
 
-    # Long assets are exact (type,tile) candidates with same-tile buffer baseline.
-    while True:
-        ranked=[]
-        for tile in _unused_tiles(state,programme):
-            baselines=[programme]
-            for crop in ("WHEAT","CARROT"):
-                buffer=_buffer(state,tile,crop)
-                if buffer:
-                    baselines.append(_finalize(state,_programme_from_assets(state,(*programme.assets,buffer),programme.events),demand,pressure))
-            baseline=max(baselines,key=lambda p:p.terminal_cash)
-            for kind in LONG_ASSETS:
-                if kind in rules.ANIMALS and not (state.tile_at(tile).is_empty or state.tile_at(tile).kind=="WEED" or state.tile_at(tile).kind==rules.ANIMALS[kind].structure):
-                    continue
-                if kind in rules.CROPS and not (state.tile_at(tile).is_empty or state.tile_at(tile).kind=="WEED"):
-                    continue
-                candidate=(_animal_programme(state,kind,tile,existing=False) if kind in rules.ANIMALS
-                           else _crop_programme(state,kind,tile,existing=False))
-                now=_finalize(state,_programme_from_assets(state,(*programme.assets,candidate),programme.events),demand,pressure)
-                advantage=now.terminal_cash-baseline.terminal_cash
-                if advantage<=0:
-                    continue
-                # WAIT_REVEAL uses only known shops and the best legal buffer first.
-                reveal=next_reveal(state.day)
-                wait_value=baseline.terminal_cash
-                if reveal<31:
-                    delayed=(_animal_programme(state,kind,tile,existing=False,start_step=reveal*24+1) if kind in rules.ANIMALS
-                             else _crop_programme(state,kind,tile,existing=False,start_step=reveal*24+1))
-                    wait=_finalize(state,_programme_from_assets(state,(*baseline.assets,delayed),baseline.events),demand,pressure)
-                    wait_value=wait.terminal_cash
-                if now.terminal_cash<=wait_value: continue
-                key=(advantage,-rules.distance_to_shed(tile,state.board_size),-tile[1],-tile[0],kind)
-                ranked.append((key,now))
-        if not ranked: break
-        committed=None
-        for _,candidate in sorted(ranked,key=lambda value:value[0],reverse=True):
-            checked=_finalize(state,candidate,demand,pressure,force=True)
-            if checked.feasible:
-                committed=checked;break
-        if committed is None:break
-        programme=_finalize(state,_resolve_feed(state,committed,demand,pressure),demand,pressure,force=True)
-        # Required feed is regenerated after every accepted long candidate.
+    # Long assets remain exact (type,tile) candidates.
+    programme=_long_candidate_loop(state,programme,demand,pressure)
 
-    # Land is valued only together with an exact first use.
+    # Land is compared as a whole unlocked quadrant after running the same feed,
+    # long-candidate and remaining-buffer programme over every new tile.
+    no_land=_fill_buffers(state,programme,demand,pressure)
     if len(state.own.owned_land)<4:
         quadrant=rules.LAND_ORDER[len(state.own.owned_land)-1]
         price=rules.LAND_PRICES[len(state.own.owned_land)-1]
-        locked=[t.position for t in state.tiles if t.is_locked and rules.quadrant(t.position,state.board_size)==quadrant]
-        land_best=None
-        for tile in locked:
-            for kind in LONG_ASSETS:
-                asset=(_animal_programme(state,kind,tile,existing=False,start_step=state.step+1) if kind in rules.ANIMALS
-                       else _crop_programme(state,kind,tile,existing=False,start_step=state.step+1))
-                land=LandProgramme(quadrant,state.step,price,tile,kind)
-                event=_pe(state.step,-30,f"land:{quadrant}","BUY_LAND",tile=tile)
-                trial=_finalize(state,_programme_from_assets(state,(*programme.assets,asset),(*programme.events,event),(land,)),demand,pressure)
-                gain=trial.terminal_cash-programme.terminal_cash
-                key=(gain,-rules.distance_to_shed(tile,state.board_size),-tile[1],-tile[0],kind)
-                if land_best is None or key>land_best[0]: land_best=(key,trial)
-        if land_best and land_best[0][0]>0: programme=_finalize(state,land_best[1],demand,pressure,force=True)
-
-    # Final remaining exact tiles receive their best W/C/EMPTY use.
-    for tile in _unused_tiles(state,programme):
-        options=[programme]
-        for crop in ("WHEAT","CARROT"):
-            asset=_buffer(state,tile,crop)
-            if asset: options.append(_finalize(state,_programme_from_assets(state,(*programme.assets,asset),programme.events),demand,pressure))
-        # tuple order supplies the required W > C > EMPTY equality tie.
-        programme=max(enumerate(options),key=lambda x:(x[1].terminal_cash,-x[0]))[1]
+        land=LandProgramme(quadrant,state.step,price,(-1,-1),"PROGRAMME")
+        event=_pe(state.step,-30,f"land:{quadrant}","BUY_LAND")
+        land_base=_programme_from_assets(
+            state,programme.assets,(*programme.events,event),(*programme.land,land))
+        land_trial=_finalize(state,land_base,demand,pressure)
+        if land_trial.feasible:
+            land_trial=_resolve_feed(state,land_trial,demand,pressure)
+            land_trial=_long_candidate_loop(state,land_trial,demand,pressure)
+            land_trial=_fill_buffers(state,land_trial,demand,pressure)
+            land_trial=_finalize(state,land_trial,demand,pressure,force=True)
+        programme=land_trial if (land_trial.feasible and
+                                  land_trial.terminal_cash>no_land.terminal_cash) else no_land
+    else:
+        programme=no_land
 
     wheat_feed=defaultdict(list); wheat_buffer=defaultdict(list); carrot_buffer=defaultdict(list)
     for asset in programme.assets:

@@ -5,14 +5,14 @@ this module only assembles the frozen programme and records separated flows.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from typing import Mapping
 
 from . import rules
 from .market import opponent_pressure
-from .programme import Programme
-from .state import State
+from .programme import AssetProgramme, Programme, ProgrammeEvent
+from .state import State, TileState, WorkerState
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,179 @@ def _orders(programme: Programme, state: State):
         elif event.kind == "HIRE":
             orders.extend(("HIRE",) for _ in range(event.quantity))
     return tuple(orders[:rules.MAX_MARKET_ORDERS])
+
+
+def drop_arrivals(state: State, programme: Programme):
+    """Return newly produced stock at the turn it actually reaches the shed.
+
+    This is a logistics projection over the already-built routes.  PICKUP stock
+    is deliberately tracked separately: dropping an item previously taken from
+    the shed is not a new arrival.  The pinned end-of-day worker reset is also a
+    real drop, recorded at the following state step rather than assigned to a
+    generic daily close in advance.
+    """
+    events_by_tile_day = defaultdict(list)
+    for event in programme.events:
+        if event.tile is not None and event.action and event.action[0] in {
+            "HARVEST", "COLLECT_FERTILIZER"
+        }:
+            events_by_tile_day[event.step // rules.TURNS_PER_DAY, event.tile,
+                               str(event.action[0])].append(event)
+    for events in events_by_tile_day.values():
+        events.sort(key=lambda event: (event.step, event.event_id))
+
+    routes = {(route.day, route.worker): route for route in programme.routes}
+    arrivals = defaultdict(Counter)
+    access = set(rules.shed_access(state.board_size))
+    for day in range(state.day, rules.TERMINAL_ACTION_STEP // rules.TURNS_PER_DAY + 1):
+        first = max(state.step, day * rules.TURNS_PER_DAY)
+        last = min((day + 1) * rules.TURNS_PER_DAY - 1,
+                   rules.TERMINAL_ACTION_STEP)
+        worker_ids = sorted(worker for route_day, worker in routes if route_day == day)
+        if day == state.day:
+            worker_ids = sorted(set(worker_ids) | set(range(len(state.workers))))
+        for worker in worker_ids:
+            route = routes.get((day, worker))
+            position = (state.workers[worker].position
+                        if day == state.day and worker < len(state.workers)
+                        else rules.shed_access(state.board_size)[worker % len(access)])
+            carried = Counter(state.workers[worker].inventory
+                              if day == state.day and worker < len(state.workers) else {})
+            # ``fresh`` is the subset not already counted in opening shed stock.
+            fresh = Counter(carried)
+            used_events = set()
+            for step in range(first, last + 1):
+                action = route.actions.get(step, ("PASS",)) if route else ("PASS",)
+                op = str(action[0]) if action else "PASS"
+                if op in {"NORTH", "SOUTH", "EAST", "WEST"}:
+                    dx, dy = {"NORTH": (0, -1), "SOUTH": (0, 1),
+                              "EAST": (1, 0), "WEST": (-1, 0)}[op]
+                    position = (position[0] + dx, position[1] + dy)
+                elif op == "PICKUP":
+                    carried[str(action[1])] += int(action[2]) if len(action) > 2 else 1
+                elif op in {"FEED", "FERTILIZE", "PLACE"}:
+                    item = ("WHEAT" if op == "FEED" else
+                            "FERTILIZER" if op == "FERTILIZE" else str(action[1]))
+                    if carried[item]:
+                        carried[item] -= 1
+                    elif fresh[item]:
+                        fresh[item] -= 1
+                    fresh[item] = min(fresh[item], carried[item])
+                elif op in {"HARVEST", "COLLECT_FERTILIZER"}:
+                    key = (day, position, op)
+                    candidates = events_by_tile_day.get(key, ())
+                    event = next((candidate for candidate in candidates
+                                  if candidate.event_id not in used_events), None)
+                    if event is not None:
+                        used_events.add(event.event_id)
+                        item = event.item or "FERTILIZER"
+                        quantity = event.quantity or 1
+                        carried[item] += quantity
+                        fresh[item] += quantity
+                elif op == "DROP" and position in access:
+                    for item, quantity in fresh.items():
+                        if quantity > 0:
+                            arrivals[step][item] += quantity
+                    carried.clear(); fresh.clear()
+            # The official refresh drops every remaining worker inventory.
+            if fresh:
+                arrival_step = min(last + 1, rules.TERMINAL_ACTION_STEP)
+                for item, quantity in fresh.items():
+                    if quantity > 0:
+                        arrivals[arrival_step][item] += quantity
+    return {step: dict(amounts) for step, amounts in sorted(arrivals.items())}
+
+
+def project_asset_transitions(state: State, asset: AssetProgramme) -> AssetProgramme:
+    """Derive one asset's output and harvest quantities through pinned rules.
+
+    Movement and stock sourcing belong to intraday planning, so this shadow
+    replay places one supplied worker on the exact tile.  Every biological
+    change itself is made exclusively by ``rules.advance_owned``.
+    """
+    tile_index = asset.tile[1] * state.board_size + asset.tile[0]
+    raw_tiles = [tile.raw for tile in state.tiles]
+    if not asset.existing:
+        # BUY_LAND candidates may still be LOCKED in the observation; the land
+        # event makes the tile empty before the asset's first field action.
+        raw_tiles[tile_index] = None
+    shadow_tiles = tuple(TileState(tile.position,
+                                  dict(raw) if isinstance(raw, dict) else raw)
+                         for tile, raw in zip(state.tiles, raw_tiles))
+    worker = WorkerState(0, asset.tile, {})
+    own = replace(state.own, workers=(worker,), worker_positions=(asset.tile,),
+                  worker_inventory=({},), tiles=shadow_tiles,
+                  animals=tuple(a for a in state.own.animals
+                                if a.position == asset.tile and asset.existing),
+                  crops=tuple(a for a in state.own.crops
+                              if a.position == asset.tile and asset.existing),
+                  shed_inventory={}, seeds={})
+    current = replace(state, own=own)
+
+    scheduled = sorted((*asset.service_schedule, *asset.harvest_schedule),
+                       key=lambda event: (event.step, event.priority, event.event_id))
+    by_step = defaultdict(list)
+    cursor_by_day = defaultdict(int)
+    for event in scheduled:
+        day = event.step // rules.TURNS_PER_DAY
+        cursor = max(event.step, cursor_by_day[day],
+                     state.step if day == state.day else day * rules.TURNS_PER_DAY)
+        deadline = event.deadline if event.deadline is not None else (day + 1) * 24 - 1
+        if cursor <= min(deadline, rules.TERMINAL_ACTION_STEP):
+            by_step[cursor].append(event)
+            cursor_by_day[day] = cursor + 1
+
+    output = []
+    actual_harvest = {}
+    while current.step <= rules.TERMINAL_ACTION_STEP:
+        action = ("PASS",)
+        event = by_step.get(current.step, [None])[0]
+        if event is not None:
+            action = tuple(event.action)
+            inventory = dict(current.workers[0].inventory)
+            seeds = dict(current.seeds)
+            op = str(action[0])
+            if op == "FEED": inventory["WHEAT"] = inventory.get("WHEAT", 0) + 1
+            elif op == "FERTILIZE": inventory["FERTILIZER"] = inventory.get("FERTILIZER", 0) + 1
+            elif op == "PLACE": inventory[str(action[1])] = inventory.get(str(action[1]), 0) + 1
+            elif op == "PLANT": seeds[str(action[1])] = seeds.get(str(action[1]), 0) + 1
+            supplied = replace(current.workers[0], position=asset.tile, inventory=inventory)
+            current = replace(current, own=replace(
+                current.own, workers=(supplied,), worker_positions=(asset.tile,),
+                worker_inventory=(inventory,), seeds=seeds))
+
+        before = current.tile_at(asset.tile).raw
+        before_yield = int(before.get("yield_units", 0)) if isinstance(before, dict) else 0
+        before_f = bool(before.get("fertilizer_available", False)) if isinstance(before, dict) else False
+        before_inventory = dict(current.workers[0].inventory)
+        after = rules.advance_owned(current, (action,))
+        after_raw = after.tile_at(asset.tile).raw
+        after_yield = int(after_raw.get("yield_units", 0)) if isinstance(after_raw, dict) else 0
+        after_f = bool(after_raw.get("fertilizer_available", False)) if isinstance(after_raw, dict) else False
+
+        if after_yield > before_yield:
+            item = (asset.asset_type if asset.asset_type in rules.CROPS
+                    else rules.ANIMALS[asset.asset_type].product)
+            output.append(ProgrammeEvent(
+                after.step, 0, f"{asset.asset_id}:official-output:{after.step}:{len(output)}",
+                "OUTPUT", asset.tile, asset.asset_id, item,
+                after_yield - before_yield, mandatory=False))
+        if after_f and not before_f:
+            output.append(ProgrammeEvent(
+                after.step, 0, f"{asset.asset_id}:official-output:F:{after.step}",
+                "OUTPUT", asset.tile, asset.asset_id, "FERTILIZER", 1,
+                mandatory=False))
+        if event is not None and event.kind == "HARVEST":
+            item = event.item or asset.asset_type
+            after_inventory = (after.workers[0].inventory
+                               if after.workers else {})
+            quantity = max(0, after_inventory.get(item, 0) - before_inventory.get(item, 0))
+            actual_harvest[event.event_id] = replace(event, quantity=quantity)
+        current = after
+
+    harvest = tuple(actual_harvest.get(event.event_id, event)
+                    for event in asset.harvest_schedule)
+    return replace(asset, output_schedule=tuple(output), harvest_schedule=harvest)
 
 
 def _inject_pressure(state: State, amounts: Mapping[str, int]) -> State:
