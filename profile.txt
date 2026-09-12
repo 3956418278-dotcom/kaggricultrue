@@ -1,0 +1,12 @@
+Starting D11+ single episode benchmark...
+Running episode...
+Step 0 (Day 0): decide took 0.0112s
+Step 24 (Day 1): decide took 0.0011s
+Step 48 (Day 2): decide took 0.0011s
+Step 72 (Day 3): decide took 0.0010s
+Step 96 (Day 4): decide took 0.0010s
+Step 120 (Day 5): decide took 0.0010s
+Step 144 (Day 6): decide took 0.0010s
+Step 168 (Day 7): decide took 0.0015s
+Step 192 (Day 8): decide took 0.0009s
+Step 216 (Day 9): decide took 0.0011s

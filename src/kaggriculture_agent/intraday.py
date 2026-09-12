@@ -167,7 +167,7 @@ def _needed(events: Iterable[ProgrammeEvent]):
 
 
 class ResourceAvailability:
-    def __init__(self, state: State, programme: Programme):
+    def __init__(self, state: State, programme: Programme, drops=None):
         self.arrivals = defaultdict(list)
         for item, qty in state.shed.items():
             if qty > 0:
@@ -175,12 +175,11 @@ class ResourceAvailability:
         for event in programme.events:
             if event.kind in {"BUY_PRODUCT", "BUY_ANIMAL", "BUY_SEED"} and event.item and event.quantity > 0:
                 self.arrivals[event.item].append((event.step + 1, event.quantity))
-        from .simulation import drop_arrivals
-        drops = drop_arrivals(state, programme)
-        for step, amounts in drops.items():
-            for item, qty in amounts.items():
-                if qty > 0:
-                    self.arrivals[item].append((step, qty))
+        if drops is not None:
+            for step, amounts in drops.items():
+                for item, qty in amounts.items():
+                    if qty > 0:
+                        self.arrivals[item].append((step, qty))
         for item in self.arrivals:
             self.arrivals[item].sort(key=lambda x: x[0])
         self.consumed = Counter()
@@ -304,9 +303,9 @@ def _compile_day(state: State, day: int, bundles, workforce: int, resource_avail
     return result
 
 
-def _compile(state: State, programme: Programme, bundles, workforce: int):
+def _compile(state: State, programme: Programme, bundles, workforce: int, drops):
     routes = []
-    resource_avail = ResourceAvailability(state, programme)
+    resource_avail = ResourceAvailability(state, programme, drops)
     for day in range(state.day, rules.TERMINAL_ACTION_STEP // 24 + 1):
         day_bundles = [b for b in bundles if b.day == day]
         if not day_bundles:
@@ -341,9 +340,34 @@ def solve_intraday(state: State, programme: Programme, *, complete_actions: bool
     bundles = _bundles(state, programme, inner, modes)
     minimum = len(state.workers)
     maximum = max(minimum, min(minimum + 10, 11))
+
+    optimistic_drops = defaultdict(lambda: defaultdict(int))
+    for asset in programme.assets:
+        for ev in asset.harvest_schedule:
+            item = ev.item or (asset.asset_type if asset.asset_type in rules.CROPS else rules.ANIMALS[asset.asset_type].product)
+            optimistic_drops[ev.step][item] += ev.quantity
+    optimistic_drops = {s: dict(a) for s, a in optimistic_drops.items()}
+
+    from .simulation import drop_arrivals
+
     for workforce in range(minimum, maximum + 1):
-        routes = _compile(state, programme, bundles, workforce)
-        if routes is None: continue
+        current_drops = optimistic_drops
+        last_routes = None
+        max_iters = 3 if complete_actions else 1
+        for _ in range(max_iters):
+            routes = _compile(state, programme, bundles, workforce, current_drops)
+            if routes is None:
+                break
+            temp_prog = replace(programme, routes=routes)
+            new_drops = drop_arrivals(state, temp_prog)
+            if new_drops == current_drops:
+                last_routes = routes
+                break
+            current_drops = new_drops
+            
+        if last_routes is None:
+            continue
+        routes = last_routes
         if complete_actions:
             complete = {}
             for route in routes:

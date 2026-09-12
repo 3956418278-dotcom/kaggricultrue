@@ -372,11 +372,14 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                     by_product_arrivals[product], demand.get(product, {}), pressure.get(product, {}),
                     state.step, forced[product])
                 loss = old[0] - result[0]
-                choices.append((loss, product))
+                price = rules.market_price(product, market_inv[product] + sold_by_step)
+                if price > 0:
+                    choices.append((loss / price, loss, price, product, avail_at_step - sold_by_step))
             if not choices:
                 break
-            _, chosen = min(choices)
-            forced[chosen][step] = forced[chosen].get(step, 0) + 1
+            _, _, chosen_price, chosen, avail = min(choices)
+            increment = max(1, min(avail, deficit // chosen_price)) if chosen_price > 0 else 1
+            forced[chosen][step] = forced[chosen].get(step, 0) + increment
             revenue, schedules = solve_all()
             continue
 
