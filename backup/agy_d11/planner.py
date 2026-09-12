@@ -274,80 +274,110 @@ def _economic_signature(state: State, programme: Programme):
         tuple((e.step,e.item,e.quantity) for e in a.harvest_schedule)) for a in programme.assets))
     events=tuple(sorted(((e.step,e.kind,e.item,e.quantity,e.source) for e in programme.events
                         if e.kind not in {"HIRE"} and e.kind not in {"PICKUP","DROP"}), key=repr))
+    sales=tuple((step,tuple(sorted(amounts.items()))) for step,amounts in sorted(programme.planned_sale.items()))
     return (state.step,state.money,tuple(sorted(state.shed.items())),tuple(sorted(state.seeds.items())),
-            tuple(sorted(state.market.inventory.items())),assets,events,
+            tuple(sorted(state.market.inventory.items())),assets,events,sales,programme.worker_count,
             tuple((land.quadrant,land.buy_step,land.cost,land.use) for land in programme.land))
-
-
-def _economic_valuation(state: State, programme: Programme, demand, pressure):
-    signature = _economic_signature(state, programme)
-    cached = _ECONOMIC_CACHE.get(signature)
-    if cached is not None:
-        return cached
-
-    import time
-    t0 = time.perf_counter()
-    estimated_arrivals = defaultdict(lambda: defaultdict(int))
-    for asset in programme.assets:
-        for event in asset.harvest_schedule:
-            item = event.item or (asset.asset_type if asset.asset_type in rules.CROPS else rules.ANIMALS[asset.asset_type].product)
-            estimated_arrivals[event.step][item] += event.quantity
-
-    sale_state, sale_arrivals = _feed_sale_inputs(state, programme, estimated_arrivals)
-    sale_key = (tuple((step, tuple(sorted(amounts.items())))
-                      for step, amounts in sorted(sale_arrivals.items())),
-                tuple(sorted(sale_state.shed.items())),
-                tuple(sorted(state.market.inventory.items())),
-                tuple((e.step, e.kind, e.item, e.quantity) for e in programme.events if e.kind in {"BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_LAND", "HIRE"}))
-    sales = _SALE_CACHE.get(sale_key)
-    if sales is None:
-        sales = optimize_sales(sale_state, sale_arrivals, demand, pressure, commitments=programme.events)
-        _SALE_CACHE[sale_key] = sales
-    updated = replace(programme, planned_sale=sales.planned_sale, market_inventory=sales.market_inventory)
-    cash, feasible = cash_projection(state, updated, pressure)
-    result = (cash, feasible, sales)
-    _ECONOMIC_CACHE[signature] = result
-    return result
 
 
 def _finalize(state: State, programme: Programme, demand, pressure, *, force=False,
               ensure_feed=True):
     if ensure_feed:
         programme = _ensure_feed_supply(state, programme)
-    
-    cash, feasible, sales = _economic_valuation(state, programme, demand, pressure)
-    if not feasible:
-        return replace(programme, feasible=False, terminal_cash=-(10**18),
-                       diagnostics={"failure": "cash/market infeasible"})
+    _economic_core(programme)
 
-    if not force:
+    # Route timing and SELL timing form a small deterministic fixed point:
+    # same-day sales may require a return, and that return is the exact arrival.
+    seen = set()
+    arrivals = {}
+    while True:
         try:
             routed = solve_intraday(state, programme, complete_actions=False)
         except PlanningFailure as exc:
             return replace(programme, feasible=False, terminal_cash=-(10**18),
-                           diagnostics={"failure": str(exc)})
-        return replace(routed, planned_sale=sales.planned_sale,
-                       market_inventory=sales.market_inventory,
-                       terminal_cash=cash, feasible=True)
-
-    try:
-        routed = solve_intraday(state, programme, complete_actions=True)
+                           diagnostics={"failure":str(exc)})
         arrivals = _arrivals(state, routed)
-    except PlanningFailure as exc:
-        return replace(programme, feasible=False, terminal_cash=-(10**18),
-                       diagnostics={"failure": str(exc)})
-    sale_state, sale_arrivals = _feed_sale_inputs(state, routed, arrivals)
-    sales = optimize_sales(sale_state, sale_arrivals, demand, pressure, commitments=programme.events)
-    updated = replace(routed, planned_sale=sales.planned_sale, market_inventory=sales.market_inventory)
-    result = simulate_programme(state, updated, pressure_events=pressure)
-    if not result.feasible or result.terminal_cash != cash:
-        result = replace(result, feasible=False,
+        sale_state,sale_arrivals=_feed_sale_inputs(state,routed,arrivals)
+        sale_key=(tuple((step,tuple(sorted(amounts.items())))
+                        for step,amounts in sorted(sale_arrivals.items())),
+                  tuple(sorted(sale_state.shed.items())),
+                  tuple(sorted(state.market.inventory.items())))
+        sales=_SALE_CACHE.get(sale_key)
+        if sales is None:
+            sales=optimize_sales(sale_state,sale_arrivals,demand,pressure)
+            _SALE_CACHE[sale_key]=sales
+        updated = replace(routed, planned_sale=sales.planned_sale,
+                          market_inventory=sales.market_inventory)
+        updated = _finance_sales(state,updated,arrivals,pressure)
+        marker=(tuple((step,tuple(sorted(amounts.items())))
+                      for step,amounts in sorted(arrivals.items())),
+                tuple((step,tuple(sorted(amounts.items())))
+                      for step,amounts in sorted(updated.planned_sale.items())))
+        if (updated.planned_sale == programme.planned_sale and
+                updated.return_mode == programme.return_mode):
+            programme = updated
+            break
+        if marker in seen:
+            return replace(updated, feasible=False, terminal_cash=-(10**18),
+                           diagnostics={"failure":"route/SELL timing has no stable programme"})
+        seen.add(marker)
+        programme = updated
+    if force:
+        try:
+            programme = solve_intraday(state, programme, complete_actions=True)
+            arrivals = _arrivals(state, programme)
+        except PlanningFailure as exc:
+            return replace(programme, feasible=False, terminal_cash=-(10**18),
+                           diagnostics={"failure":str(exc)})
+    signature=_economic_signature(state,programme)
+    if not force and signature in _VALUE_CACHE:
+        cash,feasible,failure=_VALUE_CACHE[signature]
+        return replace(_attach_asset_flows(programme,arrivals),terminal_cash=cash,feasible=feasible,
+                       diagnostics={} if feasible else {"failure":failure})
+    if not force:
+        cash,feasible=cash_projection(state,programme,pressure)
+        _VALUE_CACHE[signature]=(cash,feasible,None if feasible else "cash/market infeasible")
+        return replace(_attach_asset_flows(programme,arrivals),terminal_cash=cash,feasible=feasible,
+                       diagnostics={} if feasible else {"failure":"cash/market infeasible"})
+    result = simulate_programme(state, programme, pressure_events=pressure)
+    projected_cash,projected_feasible=cash_projection(state,programme,pressure)
+    if not projected_feasible or result.terminal_cash!=projected_cash:
+        result=replace(result,feasible=False,
                        failure=result.failure or "physical replay did not realize projected cash")
-    return replace(routed, terminal_cash=result.terminal_cash, feasible=result.feasible,
+    _VALUE_CACHE[signature]=(result.terminal_cash,result.feasible,result.failure)
+    programme = _attach_asset_flows(programme,arrivals)
+    return replace(programme, terminal_cash=result.terminal_cash, feasible=result.feasible,
         farm_output=result.farm_output, field_stock=result.field_stock,
         worker_stock=result.worker_stock, shed_stock=result.shed_stock,
-        planned_sale=result.planned_sale, market_inventory=result.market_inventory,
-        diagnostics={} if result.feasible else {"failure": result.failure})
+        market_inventory=result.market_inventory,
+        diagnostics={} if result.feasible else {"failure":result.failure})
+
+
+def _finance_sales(state: State, programme: Programme, arrivals, pressure):
+    """Move only the minimum already-planned stock needed to finance commitments."""
+    for _ in range(rules.SHED_CAPACITY+1):
+        _,feasible,step=cash_projection(state,programme,pressure,details=True)
+        if feasible:return programme
+        available={p:state.shed.get(p,0)+sum(a.get(p,0) for s,a in arrivals.items() if s<=step)
+                   -sum(a.get(p,0) for s,a in programme.planned_sale.items() if s<=step)
+                   for p in rules.PRODUCTS}
+        choices=[]
+        for product,stock in available.items():
+            if stock<=0:continue
+            future=next((s for s in sorted(programme.planned_sale) if s>step and programme.planned_sale[s].get(product,0)>0),None)
+            if future is None:continue
+            now_inventory=programme.market_inventory.get(step,state.market.inventory).get(product,state.market.inventory[product])
+            future_inventory=programme.market_inventory.get(future,state.market.inventory).get(product,state.market.inventory[product])
+            loss=rules.market_price(product,future_inventory)-rules.market_price(product,now_inventory)
+            choices.append((loss,product,future))
+        if not choices:return programme
+        _,product,future=min(choices)
+        sales={s:dict(a) for s,a in programme.planned_sale.items()}
+        sales[future][product]-=1
+        if not sales[future][product]:del sales[future][product]
+        sales.setdefault(step,{})[product]=sales.get(step,{}).get(product,0)+1
+        programme=replace(programme,planned_sale={s:a for s,a in sales.items() if a})
+    return programme
 
 
 def _attach_asset_flows(programme: Programme, arrivals):
@@ -508,11 +538,10 @@ def _best_released_tile(state: State, programme: Programme, tile: Position,
     return max(options,key=lambda option:option.terminal_cash)
 
 
-def _optional_events(state: State, programme: Programme, asset_ids=None):
+def _optional_events(state: State, programme: Programme):
     result = []
     for asset in programme.assets:
         if asset.decision == "EXIT": continue
-        if asset_ids is not None and asset.asset_id not in asset_ids: continue
         if asset.asset_type in rules.ANIMALS:
             feed_days = {e.step//24 for e in asset.service_schedule if e.kind == "FEED"}
             for day in feed_days:
@@ -603,37 +632,28 @@ def _without_optional(state: State, programme: Programme):
                    routes=(),planned_sale={},market_inventory={})
 
 
-def _optimize_optional(state: State, programme: Programme, demand, pressure, asset_ids=None, force=False):
-    """Rebuild optional service against the current programme."""
-    if asset_ids is None:
-        programme = _without_optional(state, programme)
-        for asset in programme.assets:
-            if asset.decision == "EXIT":
-                continue
-            programme = _optimize_optional(state, programme, demand, pressure, asset_ids={asset.asset_id}, force=False)
-        return _finalize(state, programme, demand, pressure, force=force)
-    accepted = set()
+def _optimize_optional(state: State, programme: Programme, demand, pressure):
+    """Rebuild all optional service against the current whole programme."""
+    programme=_finalize(state,_without_optional(state,programme),demand,pressure)
+    accepted=set()
     while True:
-        candidates = {event.event_id: event for event in _optional_events(state, programme, asset_ids=asset_ids)
+        candidates={event.event_id:event for event in _optional_events(state,programme)
                     if event.event_id not in accepted and
-                    all(old.event_id != event.event_id for old in programme.events)}
+                    all(old.event_id!=event.event_id for old in programme.events)}
         if not candidates:
-            break
-        choices = []
+            return programme
+        choices=[]
         for event in candidates.values():
-            trial_prog = _add_event(state, programme, event)
-            cash, feasible, _ = _economic_valuation(state, trial_prog, demand, pressure)
-            if feasible:
-                choices.append((cash - programme.terminal_cash, event.event_id, trial_prog))
-        if not choices:
-            break
-        gain, event_id, trial_prog = max(choices, key=lambda value: (value[0], value[1]))
-        if gain <= 0:
-            break
+            trial=_finalize(state,_add_event(state,programme,event),demand,pressure)
+            choices.append((trial.terminal_cash-programme.terminal_cash,
+                            event.event_id,trial))
+        gain,event_id,trial=max(choices,key=lambda value:(value[0],value[1]))
+        if gain<=0:
+            return programme
+        checked=_finalize(state,trial,demand,pressure,force=True)
         accepted.add(event_id)
-        programme = trial_prog
-
-    return _finalize(state, programme, demand, pressure, force=force)
+        if checked.feasible:
+            programme=checked
 
 
 def _first_feed_deficit(state: State, programme: Programme):
@@ -658,36 +678,13 @@ def _first_feed_deficit(state: State, programme: Programme):
     return None
 
 
-_VALUE_CACHE = {}
-_SALE_CACHE = {}
-_ECONOMIC_CACHE = {}
-_FEED_CACHE = {}
-
-
-def _feed_signature(state: State, programme: Programme, force: bool):
-    feeds = tuple(sorted((e.step, e.deadline) for e in programme.events if e.kind == "FEED"))
-    buys = tuple(sorted(e.step for e in programme.events if e.kind == "BUY_PRODUCT" and e.item == "WHEAT"))
-    w_feed_crops = tuple(sorted((a.asset_type, a.release_turn, tuple((e.step, e.item, e.quantity) for e in a.harvest_schedule))
-                                for a in programme.assets if a.purpose == "W_FEED"))
-    return (state.step, state.money, state.owned_total("WHEAT"), feeds, buys, w_feed_crops, force)
-
-
 def _strip_auto_feed(programme: Programme):
     return replace(programme,events=tuple(e for e in programme.events if not e.event_id.startswith("feed-wheat:auto:")))
 
 
-def _resolve_feed(state: State, programme: Programme, demand, pressure, force=False):
-    sig = _feed_signature(state, programme, force)
-    cached = _FEED_CACHE.get(sig)
-    if cached is not None:
-        return cached
-
+def _resolve_feed(state: State, programme: Programme, demand, pressure):
     base=_strip_auto_feed(programme)
-    if _first_feed_deficit(state, base) is None:
-        res = _finalize(state, base, demand, pressure, ensure_feed=False, force=force)
-        _FEED_CACHE[sig] = res
-        return res
-    base=_finalize(state,base,demand,pressure,ensure_feed=False,force=force)
+    base=_finalize(state,base,demand,pressure,ensure_feed=False)
     memo={}
 
     def source_key(current):
@@ -703,50 +700,49 @@ def _resolve_feed(state: State, programme: Programme, demand, pressure, force=Fa
             return memo[key]
         deficit=_first_feed_deficit(state,current)
         if deficit is None:
-            cash, feasible, sales = _economic_valuation(state, current, demand, pressure)
-            if not feasible:
-                result = replace(current, feasible=False, terminal_cash=-(10**18))
-            else:
-                result = replace(current, planned_sale=sales.planned_sale, market_inventory=sales.market_inventory, terminal_cash=cash, feasible=True)
-            memo[key] = result
+            result=_finalize(state,current,demand,pressure,force=True,
+                             ensure_feed=False)
+            memo[key]=result
             return result
         deadline,gap=deficit
         def progresses(next_deficit):
             return (next_deficit is None or next_deficit[0]>deadline or
                     (next_deficit[0]==deadline and next_deficit[1]<gap))
         choices=[]
+        price_events={state.step,deadline-1}
+        price_events.update(step for step,_ in demand.get("WHEAT",())
+                            if state.step<=step<deadline)
+        price_events.update(step for step,_ in pressure.get("WHEAT",())
+                            if state.step<=step<deadline)
+        price_events.update(step for step in current.planned_sale
+                            if state.step<=step<deadline and
+                            current.planned_sale[step].get("WHEAT",0))
         ordinal=sum(event.kind=="BUY_PRODUCT" and event.item=="WHEAT"
                     for event in current.events)
-
-        # 1. Candidate BUY step: max(state.step, (deadline // 24) * 24)
-        buy_step = max(state.step, (deadline // 24) * 24)
-        if buy_step < deadline:
-            buy=_pe(buy_step,-15,f"feed-wheat:mixed:{ordinal}:{buy_step}",
+        for step in sorted(price_events):
+            if step<state.step or step>=deadline:
+                continue
+            buy=_pe(step,-15,f"feed-wheat:mixed:{ordinal}:{step}",
                     "BUY_PRODUCT",item="WHEAT",quantity=1,source="W_FEED")
-            trial_prog = replace(current, events=tuple(sorted((*current.events, buy))))
-            next_deficit=_first_feed_deficit(state, trial_prog)
+            trial=_finalize(state,replace(current,events=tuple(sorted(
+                (*current.events,buy)))),demand,pressure,ensure_feed=False)
+            next_deficit=_first_feed_deficit(state,trial)
             if progresses(next_deficit):
-                choices.append(search(trial_prog))
-
-        # 2. Candidate PLANT tile: nearest unused tile to shed where mature <= deadline
-        valid_tiles = []
-        for tile in _unused_tiles(state, current):
-            start = _candidate_start(state, current, tile)
-            mature = max(start, (start // 24 + rules.CROPS["WHEAT"].first_yield_day) * 24)
-            if mature <= deadline:
-                dist = rules.distance_to_shed(tile, state.board_size)
-                valid_tiles.append((dist, tile, start, mature))
-        valid_tiles.sort(key=lambda x: (x[0], x[1][1], x[1][0]))
-
-        for _, tile, start, mature in valid_tiles[:2]:  # Top candidates closest to shed
+                choices.append(search(trial))
+        for tile in _unused_tiles(state,current):
+            start=_candidate_start(state,current,tile)
+            mature=max(start,(start//24+rules.CROPS["WHEAT"].first_yield_day)*24)
+            if mature>deadline:
+                continue
             wheat=_crop_programme(state,"WHEAT",tile,existing=False,
                                   start_step=start,purpose="W_FEED",
                                   release_step=mature)
-            trial_prog = _programme_from_assets(state, (*current.assets, wheat), current.events, current.land)
-            next_deficit=_first_feed_deficit(state, trial_prog)
+            trial=_finalize(state,_programme_from_assets(
+                state,(*current.assets,wheat),current.events,current.land),
+                demand,pressure,ensure_feed=False)
+            next_deficit=_first_feed_deficit(state,trial)
             if progresses(next_deficit):
-                choices.append(search(trial_prog))
-
+                choices.append(search(trial))
         feasible=[choice for choice in choices if choice.feasible]
         result=(max(feasible,key=lambda choice:choice.terminal_cash)
                 if feasible else replace(current,feasible=False,
@@ -756,13 +752,7 @@ def _resolve_feed(state: State, programme: Programme, demand, pressure, force=Fa
         memo[key]=result
         return result
 
-    best_econ = search(base)
-    if not best_econ.feasible:
-        _FEED_CACHE[sig] = best_econ
-        return best_econ
-    res = _finalize(state, best_econ, demand, pressure, ensure_feed=False, force=force)
-    _FEED_CACHE[sig] = res
-    return res
+    return search(base)
 
 
 def _unused_tiles(state: State, programme: Programme):
@@ -783,82 +773,70 @@ def _candidate_start(state: State, programme: Programme, tile: Position):
 
 
 def _long_candidate_loop(state: State, programme: Programme, demand, pressure):
-    """Run the exact-tile greedy loop for the currently usable land."""
-    import time
-    loop_start = time.perf_counter()
-    iter_count = 0
+    """Run the existing exact-tile greedy loop for the currently usable land."""
     while True:
-        iter_count += 1
-        ranked = []
-        unused = _unused_tiles(state, programme)
-        t_unused = time.perf_counter()
-        for idx, tile in enumerate(unused):
-            t_tile = time.perf_counter()
-            start = _candidate_start(state, programme, tile)
-            baselines = [programme]
-            for crop in ("WHEAT", "CARROT"):
-                buffer = _buffer(state, tile, crop, start)
+        ranked=[]
+        for tile in _unused_tiles(state,programme):
+            start=_candidate_start(state,programme,tile)
+            baselines=[programme]
+            for crop in ("WHEAT","CARROT"):
+                buffer=_buffer(state,tile,crop,start)
                 if buffer:
-                    trial_b = _programme_from_assets(state, (*programme.assets, buffer), programme.events, programme.land)
-                    now_b = _finalize(state, trial_b, demand, pressure)
-                    now_b = _resolve_feed(state, now_b, demand, pressure)
-                    now_b = _optimize_optional(state, now_b, demand, pressure, asset_ids={buffer.asset_id})
-                    if now_b.feasible:
-                        baselines.append(now_b)
-            baseline = max(enumerate(baselines), key=lambda value: (value[1].terminal_cash, -value[0]))[1]
+                    baselines.append(_finalize(state,_programme_from_assets(
+                        state,(*programme.assets,buffer),programme.events,programme.land),
+                        demand,pressure))
+            baseline=max(enumerate(baselines),
+                         key=lambda value:(value[1].terminal_cash,-value[0]))[1]
             for kind in LONG_ASSETS:
-                tile_state = state.tile_at(tile)
+                tile_state=state.tile_at(tile)
                 if not tile_state.is_locked:
                     if kind in rules.ANIMALS and not (
-                            tile_state.is_empty or tile_state.kind == "WEED" or
-                            tile_state.kind == rules.ANIMALS[kind].structure):
+                            tile_state.is_empty or tile_state.kind=="WEED" or
+                            tile_state.kind==rules.ANIMALS[kind].structure):
                         continue
                     if kind in rules.CROPS and not (
-                            tile_state.is_empty or tile_state.kind == "WEED"):
+                            tile_state.is_empty or tile_state.kind=="WEED"):
                         continue
-                candidate = (_animal_programme(state, kind, tile, existing=False, start_step=start)
+                candidate=(_animal_programme(state,kind,tile,existing=False,
+                                             start_step=start)
+                           if kind in rules.ANIMALS else
+                           _crop_programme(state,kind,tile,existing=False,
+                                           start_step=start))
+                now=_finalize(state,_programme_from_assets(
+                    state,(*programme.assets,candidate),programme.events,programme.land),
+                    demand,pressure)
+                advantage=now.terminal_cash-baseline.terminal_cash
+                if advantage<=0:
+                    continue
+                reveal=next_reveal(start//24)
+                wait_value=baseline.terminal_cash
+                if reveal<31:
+                    delayed=(_animal_programme(state,kind,tile,existing=False,
+                                               start_step=reveal*24+1)
                              if kind in rules.ANIMALS else
-                             _crop_programme(state, kind, tile, existing=False, start_step=start))
-                trial = _programme_from_assets(state, (*programme.assets, candidate), programme.events, programme.land)
-                now = _finalize(state, trial, demand, pressure)
-                if not now.feasible:
+                             _crop_programme(state,kind,tile,existing=False,
+                                             start_step=reveal*24+1))
+                    wait=_finalize(state,_programme_from_assets(
+                        state,(*baseline.assets,delayed),baseline.events,baseline.land),
+                        demand,pressure)
+                    wait_value=wait.terminal_cash
+                if now.terminal_cash<=wait_value:
                     continue
-                now = _resolve_feed(state, now, demand, pressure)
-                if not now.feasible:
-                    continue
-                now = _optimize_optional(state, now, demand, pressure, asset_ids={candidate.asset_id})
-                if not now.feasible:
-                    continue
-                advantage = now.terminal_cash - baseline.terminal_cash
-                if advantage <= 0:
-                    continue
-                reveal = next_reveal(start // 24)
-                wait_value = baseline.terminal_cash
-                if reveal < 31:
-                    delayed = (_animal_programme(state, kind, tile, existing=False, start_step=reveal * 24 + 1)
-                               if kind in rules.ANIMALS else
-                               _crop_programme(state, kind, tile, existing=False, start_step=reveal * 24 + 1))
-                    wait = _programme_from_assets(state, (*baseline.assets, delayed), baseline.events, baseline.land)
-                    wait = _finalize(state, wait, demand, pressure)
-                    wait = _resolve_feed(state, wait, demand, pressure)
-                    wait = _optimize_optional(state, wait, demand, pressure, asset_ids={delayed.asset_id})
-                    if wait.feasible:
-                        wait_value = wait.terminal_cash
-                if now.terminal_cash <= wait_value:
-                    continue
-                key = (advantage, -rules.distance_to_shed(tile, state.board_size), -tile[1], -tile[0], kind)
-                ranked.append((key, now))
+                key=(advantage,-rules.distance_to_shed(tile,state.board_size),
+                     -tile[1],-tile[0],kind)
+                ranked.append((key,now))
         if not ranked:
             return programme
-        committed = None
-        for _, candidate in sorted(ranked, key=lambda value: value[0], reverse=True):
-            checked = _finalize(state, candidate, demand, pressure, force=True)
+        committed=None
+        for _,candidate in sorted(ranked,key=lambda value:value[0],reverse=True):
+            checked=_finalize(state,candidate,demand,pressure,force=True)
             if checked.feasible:
-                committed = checked
+                committed=checked
                 break
         if committed is None:
             return programme
-        programme = _optimize_optional(state, committed, demand, pressure)
+        programme=_resolve_feed(state,committed,demand,pressure)
+        programme=_optimize_optional(state,programme,demand,pressure)
 
 
 def _fill_buffers(state: State, programme: Programme, demand, pressure):
@@ -882,7 +860,6 @@ def make_plan(state: State, config=None, **_ignored) -> Programme:
     _VALUE_CACHE.clear()
     _SALE_CACHE.clear()
     _ECONOMIC_CACHE.clear()
-    _FEED_CACHE.clear()
     clear_route_cache()
     clear_sale_cache()
     demand=known_demand_events(state); pressure=opponent_pressure(state)

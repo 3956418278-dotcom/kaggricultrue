@@ -63,8 +63,6 @@ def drop_arrivals(state: State, programme: Programme):
     real drop, recorded at the following state step rather than assigned to a
     generic daily close in advance.
     """
-    if not programme.routes:
-        return {}
     events_by_tile_day = defaultdict(list)
     for event in programme.events:
         if event.tile is not None and event.action and event.action[0] in {

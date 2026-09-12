@@ -179,8 +179,7 @@ def _product_dp(product: str, opening_stock: int, opening_inventory: int,
         inventory -= demand.get(step, 0)
         minimum = forced.get(step, 0)
         best = None
-        min_q = min(minimum, stock)
-        for quantity in range(min_q, stock + 1):
+        for quantity in range(minimum, stock + 1):
             revenue = sell_revenue(product, quantity, inventory)
             next_inventory = inventory
             for _ in range(quantity):
@@ -203,13 +202,12 @@ def _product_dp(product: str, opening_stock: int, opening_inventory: int,
 
 def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                    demand_events: Mapping[str, Iterable[tuple[int, int]]],
-                   pressure_events: Mapping[str, Iterable[tuple[int, int]]],
-                   commitments: Iterable[object] = ()) -> SalePlan:
-    """Solve each product DP, then enforce shared shed capacity and cash deadlines jointly.
+                   pressure_events: Mapping[str, Iterable[tuple[int, int]]]) -> SalePlan:
+    """Solve each product DP, then enforce shared shed capacity jointly.
 
-    At an overflow event or cash deficit event, forced sales are selected across all
-    products by their exact re-solved continuation loss, maintaining exact market
-    inventory trajectories.
+    At an overflow event the extra units to sell are selected across all
+    products by their exact re-solved continuation loss, rather than by an
+    independent per-product threshold.
     """
     demand = {p: dict(events) for p, events in demand_events.items()}
     pressure = {p: dict(events) for p, events in pressure_events.items()}
@@ -218,9 +216,8 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
         for product, quantity in amounts.items():
             by_product_arrivals[product][step] = by_product_arrivals[product].get(step, 0) + quantity
 
-    commit_list = [e for e in commitments if getattr(e, "kind", None) in {"BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_LAND", "HIRE"}]
-
     forced: dict[str, dict[int, int]] = {p: {} for p in rules.PRODUCTS}
+    solutions = {}
 
     def solve_all():
         total = 0
@@ -235,133 +232,50 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
 
     revenue, schedules = solve_all()
     event_steps = sorted({state.step, *arrivals, *(s for d in demand.values() for s in d),
-                          *(s for d in pressure.values() for s in d),
-                          *(e.step for e in commit_list if hasattr(e, "step")),
-                          rules.TERMINAL_ACTION_STEP})
-
+                          *(s for d in pressure.values() for s in d), rules.TERMINAL_ACTION_STEP})
     while True:
         stock = {p: state.shed.get(p, 0) for p in rules.PRODUCTS}
-        market_inv = {p: state.market.inventory[p] for p in rules.PRODUCTS}
-        money = state.money
-        hires = state.hires_today
-        land_unlocked_count = len(state.own.owned_land)
-
-        commit_by_step = defaultdict(list)
-        for e in commit_list:
-            commit_by_step[e.step].append(e)
-
         overflow = None
-        cash_deficit = None
-
         for step in event_steps:
             for product, quantity in arrivals.get(step, {}).items():
                 stock[product] += quantity
-            for product, quantity in pressure.get(step, {}).items():
-                market_inv[product] += quantity
-            for product, quantity in demand.get(step, {}).items():
-                market_inv[product] -= quantity
-
             for product in rules.PRODUCTS:
-                quantity = schedules[product].get(step, 0)
-                if quantity:
-                    stock[product] -= quantity
-                    for _ in range(quantity):
-                        price = rules.market_price(product, market_inv[product])
-                        money += price
-                        if price > rules.PRICE_FLOOR:
-                            market_inv[product] += 1
-
-            for e in commit_by_step.get(step, ()):
-                if e.kind == "HIRE":
-                    for _ in range(getattr(e, "quantity", 1)):
-                        cost = rules.fibonacci_hire_cost(hires)
-                        money -= cost
-                        hires += 1
-                elif e.kind == "BUY_LAND":
-                    if land_unlocked_count < 4:
-                        cost = rules.LAND_PRICES[land_unlocked_count - 1]
-                        money -= cost
-                        land_unlocked_count += 1
-                elif e.kind == "BUY_SEED":
-                    money -= rules.CROPS[e.item].seed_cost * getattr(e, "quantity", 1)
-                elif e.kind == "BUY_ANIMAL":
-                    money -= rules.ANIMALS[e.item].cost * getattr(e, "quantity", 1)
-                elif e.kind == "BUY_PRODUCT":
-                    for _ in range(getattr(e, "quantity", 1)):
-                        cost = rules.market_price(e.item, market_inv[e.item] - 1)
-                        money -= cost
-                        market_inv[e.item] -= 1
-
+                stock[product] -= schedules[product].get(step, 0)
             excess = sum(stock.values()) - rules.SHED_CAPACITY
             if excess > 0:
                 overflow = (step, excess)
                 break
-
-            if money < 0:
-                cash_deficit = (step, -money)
-                break
-
-        if overflow is None and cash_deficit is None:
+        if overflow is None:
             break
-
-        if overflow is not None:
-            step, excess = overflow
-            neutral = []
-            for product in rules.PRODUCTS:
-                already = forced[product].get(step, 0)
-                available = stock.get(product, 0)
-                avail_at_step = state.shed.get(product, 0) + sum(by_product_arrivals[product].get(s, 0) for s in by_product_arrivals[product] if s <= step)
-                sold_by_step = sum(schedules[product].get(s, 0) for s in schedules[product] if s <= step)
-                future_sales = [s for s, q in schedules[product].items() if s > step and q > 0]
-                if available <= 0 or avail_at_step <= sold_by_step or not future_sales:
-                    continue
-                future = min(future_sales)
-                if not any(step < s <= future for s in demand.get(product, {}) if demand[product][s]) and not any(
-                        step < s <= future for s in pressure.get(product, {}) if pressure[product][s]):
-                    neutral.append((product, available))
-            if neutral:
-                for product, available in neutral:
-                    take = min(excess, available)
-                    forced[product][step] = forced[product].get(step, 0) + take
-                    excess -= take
-                    if excess == 0:
-                        break
-                revenue, schedules = solve_all()
-                continue
-
-            for _ in range(excess):
-                choices = []
-                for product in rules.PRODUCTS:
-                    already = forced[product].get(step, 0)
-                    available = stock.get(product, 0)
-                    avail_at_step = state.shed.get(product, 0) + sum(by_product_arrivals[product].get(s, 0) for s in by_product_arrivals[product] if s <= step)
-                    sold_by_step = sum(schedules[product].get(s, 0) for s in schedules[product] if s <= step)
-                    if available <= 0 or avail_at_step <= sold_by_step:
-                        continue
-                    trial = {p: dict(v) for p, v in forced.items()}
-                    trial[product][step] = already + 1
-                    result = _product_dp(product, state.shed.get(product, 0), state.market.inventory[product],
-                        by_product_arrivals[product], demand.get(product, {}), pressure.get(product, {}),
-                        state.step, trial[product])
-                    old = _product_dp(product, state.shed.get(product, 0), state.market.inventory[product],
-                        by_product_arrivals[product], demand.get(product, {}), pressure.get(product, {}),
-                        state.step, forced[product])
-                    choices.append((old[0] - result[0], product))
-                if not choices:
-                    break
-                _, chosen = min(choices)
-                forced[chosen][step] = forced[chosen].get(step, 0) + 1
-            revenue, schedules = solve_all()
+        step, excess = overflow
+        # If no exogenous inventory event occurs before this product's later
+        # planned sale, moving any prefix here is exactly revenue-neutral. This
+        # common fertilizer-capacity case can be forced in one operation.
+        neutral=[]
+        for product in rules.PRODUCTS:
+            already=forced[product].get(step,0)
+            available=stock.get(product,0)
+            future_sales=[s for s,q in schedules[product].items() if s>step and q>0]
+            if available<=0 or not future_sales:continue
+            future=min(future_sales)
+            if not any(step<s<=future for s in demand.get(product,{}) if demand[product][s]) and not any(
+                    step<s<=future for s in pressure.get(product,{}) if pressure[product][s]):
+                neutral.append((product,available))
+        if neutral:
+            for product,available in neutral:
+                take=min(excess,available)
+                forced[product][step]=forced[product].get(step,0)+take
+                excess-=take
+                if excess==0:break
+            revenue,schedules=solve_all()
             continue
-
-        if cash_deficit is not None:
-            step, deficit = cash_deficit
+        # Jointly choose each forced unit by the smallest exact continuation loss.
+        for _ in range(excess):
             choices = []
             for product in rules.PRODUCTS:
                 already = forced[product].get(step, 0)
-                avail_at_step = state.shed.get(product, 0) + sum(by_product_arrivals[product].get(s, 0) for s in by_product_arrivals[product] if s <= step)
-                sold_by_step = sum(schedules[product].get(s, 0) for s in schedules[product] if s <= step)
-                if avail_at_step <= sold_by_step:
+                available = stock.get(product, 0)
+                if available <= 0:
                     continue
                 trial = {p: dict(v) for p, v in forced.items()}
                 trial[product][step] = already + 1
@@ -371,14 +285,12 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                 old = _product_dp(product, state.shed.get(product, 0), state.market.inventory[product],
                     by_product_arrivals[product], demand.get(product, {}), pressure.get(product, {}),
                     state.step, forced[product])
-                loss = old[0] - result[0]
-                choices.append((loss, product))
+                choices.append((old[0] - result[0], product))
             if not choices:
-                break
+                raise ValueError("shed overflow cannot be resolved by a legal sale")
             _, chosen = min(choices)
             forced[chosen][step] = forced[chosen].get(step, 0) + 1
-            revenue, schedules = solve_all()
-            continue
+        revenue, schedules = solve_all()
 
     planned: dict[int, dict[str, int]] = defaultdict(dict)
     trajectory: dict[int, dict[str, int]] = defaultdict(dict)
@@ -395,4 +307,3 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                     inventory += 1
             trajectory[step][product] = inventory
     return SalePlan(revenue, dict(planned), dict(trajectory))
-

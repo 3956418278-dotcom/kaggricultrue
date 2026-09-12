@@ -19,12 +19,10 @@ class PlanningFailure(RuntimeError):
 
 
 _DAY_ROUTE_CACHE = {}
-_INTRADAY_CACHE = {}
 
 
 def clear_route_cache():
     _DAY_ROUTE_CACHE.clear()
-    _INTRADAY_CACHE.clear()
 
 
 _ACTION_ORDER = {
@@ -166,44 +164,8 @@ def _needed(events: Iterable[ProgrammeEvent]):
     return need
 
 
-class ResourceAvailability:
-    def __init__(self, state: State, programme: Programme):
-        self.arrivals = defaultdict(list)
-        for item, qty in state.shed.items():
-            if qty > 0:
-                self.arrivals[item].append((state.step, qty))
-        for event in programme.events:
-            if event.kind in {"BUY_PRODUCT", "BUY_ANIMAL", "BUY_SEED"} and event.item and event.quantity > 0:
-                self.arrivals[event.item].append((event.step + 1, event.quantity))
-        from .simulation import drop_arrivals
-        drops = drop_arrivals(state, programme)
-        for step, amounts in drops.items():
-            for item, qty in amounts.items():
-                if qty > 0:
-                    self.arrivals[item].append((step, qty))
-        for item in self.arrivals:
-            self.arrivals[item].sort(key=lambda x: x[0])
-        self.consumed = Counter()
-
-    def signature(self):
-        return tuple(sorted((item, tuple(timeline)) for item, timeline in self.arrivals.items()))
-
-    def get_available_step(self, item: str, quantity_needed: int) -> int | None:
-        already = self.consumed[item]
-        target = already + quantity_needed
-        accum = 0
-        for step, qty in self.arrivals[item]:
-            accum += qty
-            if accum >= target:
-                return step
-        return None
-
-    def record_pickup(self, item: str, quantity: int):
-        self.consumed[item] += quantity
-
-
 def _compile_worker(state: State, day: int, worker: int, bundles: list[_Bundle], start: Position,
-                    available_step: int, resource_avail: ResourceAvailability):
+                    available_step: int, item_available):
     actions, current, cursor = {}, start, available_step
     inventory = Counter(state.workers[worker].inventory if day == state.day and worker < len(state.workers) else {})
     for bundle in bundles:
@@ -211,20 +173,13 @@ def _compile_worker(state: State, day: int, worker: int, bundles: list[_Bundle],
         need = _needed(bundle.events)
         missing = need - inventory
         if missing:
-            avail_steps = []
-            for item, qty in missing.items():
-                st = resource_avail.get_available_step(item, qty)
-                if st is None:
-                    return None
-                avail_steps.append(st)
-            cursor = max(cursor, max(avail_steps, default=cursor))
+            cursor = max(cursor, max((item_available.get(item, state.step) for item in missing), default=cursor))
             access = _nearest_access(current, state.board_size)
             for action in _move_path(current, access): actions[cursor] = action; cursor += 1
             current = access
             for item in sorted(missing):
                 actions[cursor] = ("PICKUP", item, missing[item]); cursor += 1
                 inventory[item] += missing[item]
-                resource_avail.record_pickup(item, missing[item])
         for action in _move_path(current, bundle.tile): actions[cursor] = action; cursor += 1
         current = bundle.tile
         for event in bundle.events:
@@ -250,13 +205,13 @@ def _compile_worker(state: State, day: int, worker: int, bundles: list[_Bundle],
     return actions
 
 
-def _day_signature(state: State, day: int, bundles, workforce: int, resource_avail: ResourceAvailability):
+def _day_signature(state: State, day: int, bundles, workforce: int, item_available):
     return (
         state.step if day == state.day else day * rules.TURNS_PER_DAY,
         workforce,
         tuple((worker.position, tuple(sorted(worker.inventory.items())))
               for worker in state.workers) if day == state.day else (),
-        resource_avail.signature(),
+        tuple(sorted(item_available.items())),
         tuple((bundle.tile, bundle.day, bundle.release, bundle.deadline, bundle.zone,
                bundle.return_required,
                tuple((event.step, event.event_id, event.action, event.item,
@@ -265,8 +220,8 @@ def _day_signature(state: State, day: int, bundles, workforce: int, resource_ava
     )
 
 
-def _compile_day(state: State, day: int, bundles, workforce: int, resource_avail: ResourceAvailability):
-    key = _day_signature(state, day, bundles, workforce, resource_avail)
+def _compile_day(state: State, day: int, bundles, workforce: int, item_available):
+    key = _day_signature(state, day, bundles, workforce, item_available)
     if key in _DAY_ROUTE_CACHE:
         return _DAY_ROUTE_CACHE[key]
     routes = []
@@ -294,7 +249,7 @@ def _compile_day(state: State, day: int, bundles, workforce: int, resource_avail
         if not (day == state.day and worker < len(state.workers)):
             available = day * rules.TURNS_PER_DAY + 1
         actions = _compile_worker(state, day, worker, work, starts[worker], available,
-                                  resource_avail)
+                                  item_available)
         if actions is None:
             _DAY_ROUTE_CACHE[key] = None
             return None
@@ -306,12 +261,15 @@ def _compile_day(state: State, day: int, bundles, workforce: int, resource_avail
 
 def _compile(state: State, programme: Programme, bundles, workforce: int):
     routes = []
-    resource_avail = ResourceAvailability(state, programme)
+    item_available = {item: state.step for item, quantity in state.shed.items() if quantity > 0}
+    for event in programme.events:
+        if event.kind in {"BUY_PRODUCT", "BUY_ANIMAL"} and event.item:
+            item_available[event.item] = min(item_available.get(event.item, 10**9), event.step + 1)
     for day in range(state.day, rules.TERMINAL_ACTION_STEP // 24 + 1):
         day_bundles = [b for b in bundles if b.day == day]
         if not day_bundles:
             continue
-        day_routes = _compile_day(state, day, day_bundles, workforce, resource_avail)
+        day_routes = _compile_day(state, day, day_bundles, workforce, item_available)
         if day_routes is None:
             return None
         routes.extend(day_routes)
@@ -319,27 +277,14 @@ def _compile(state: State, programme: Programme, bundles, workforce: int):
 
 
 def solve_intraday(state: State, programme: Programme, *, complete_actions: bool = True) -> Programme:
-    key = (
-        state.step,
-        tuple((w.position, tuple(sorted(w.inventory.items()))) for w in state.workers),
-        tuple(sorted((a.asset_id, a.tile, a.decision,
-                      tuple((e.step, e.action, e.deadline) for e in a.service_schedule))
-                     for a in programme.assets)),
-        tuple(sorted((e.step, e.kind, e.item, e.quantity, e.tile, e.action, e.deadline)
-                     for e in programme.events if e.kind != "HIRE")),
-        complete_actions,
-    )
-    if key in _INTRADAY_CACHE:
-        cached = _INTRADAY_CACHE[key]
-        if cached is None:
-            raise PlanningFailure("no worker count can realize every mandatory programme task")
-        return cached
-
     load = placement_load(programme)
     modes = return_modes(programme)
     inner, outer = zones(state, programme, modes)
     bundles = _bundles(state, programme, inner, modes)
     minimum = len(state.workers)
+    # At most ten HIRE entries can execute in a turn under the pinned market
+    # contract. Future days start with one farmer, so larger workforces are not
+    # legally constructible by this programme and need not be searched.
     maximum = max(minimum, min(minimum + 10, 11))
     for workforce in range(minimum, maximum + 1):
         routes = _compile(state, programme, bundles, workforce)
@@ -365,10 +310,7 @@ def solve_intraday(state: State, programme: Programme, *, complete_actions: bool
                 hire_events.append(ProgrammeEvent(step, -100, f"hire:{day}", "HIRE", quantity=quantity))
         base_events=tuple(event for event in programme.events if event.kind!="HIRE")
         unique={event.event_id:event for event in (*base_events,*hire_events)}
-        res = replace(programme, events=tuple(sorted(unique.values())),
-                      worker_count=workforce, inner=inner, outer=outer,
-                      placement_load=load, return_mode=modes, routes=routes)
-        _INTRADAY_CACHE[key] = res
-        return res
-    _INTRADAY_CACHE[key] = None
+        return replace(programme, events=tuple(sorted(unique.values())),
+                       worker_count=workforce, inner=inner, outer=outer,
+                       placement_load=load, return_mode=modes, routes=routes)
     raise PlanningFailure("no worker count can realize every mandatory programme task")
