@@ -1,132 +1,88 @@
-"""Lifecycle owner for one fixed daily Plan and its exact Realization."""
-
+"""Lifecycle owner for the daily frozen macro programme."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Mapping
 
-from .planner import Plan, PlannerConfig, make_plan
-from .realization import Realization, TurnDecision
-from .state import OwnedState
+from . import rules
+from .market import known_demand_events, opponent_pressure, optimize_sales
+from .planner import _arrivals, make_plan
+from .programme import Programme
+from .realization import TurnDecision
+from .state import State
 
 
-def _target_invalidation(state: OwnedState, plan: Plan) -> str | None:
-    """Return a reason only when a commitment's physical premise was invalidated."""
-
-    for commitment in plan.obligations:
-        if commitment.target is None:
+def programme_invalidation(state: State, programme: Programme) -> str | None:
+    if state.step < programme.formed_step:
+        return "new episode"
+    if tuple(state.shops) != tuple(programme.shops):
+        return "shop list changed"
+    for asset in programme.assets:
+        if asset.decision != "KEEP" or not asset.existing:
             continue
-        tile = state.tile_at(commitment.target)
-        if commitment.kind == "CROP_MAINTENANCE":
-            crop = str(commitment.metadata["crop"])
-            if tile.kind == "PLANT" and tile.raw.get("crop") == crop:
-                continue
-            if state.step >= commitment.time.completion_step:
-                continue
-            return f"existing {crop} commitment disappeared before completion"
-        if commitment.kind == "ANIMAL_MAINTENANCE":
-            animal = str(commitment.metadata["animal"])
-            if tile.animal != animal:
-                return f"existing {animal} commitment is no longer on its tile"
-        if commitment.kind == "ANIMAL_PLACEMENT":
-            animal = str(commitment.metadata["animal"])
-            structure = str(commitment.metadata["structure"])
-            if (
-                state.owned_total(animal) > 0
-                or any(candidate.animal == animal for candidate in state.animal_tiles())
-                or tile.is_empty
-                or (tile.kind == structure and tile.animal is None)
-            ):
-                continue
-            return f"pending {animal} placement lost its feasible target"
-
-    for commitment in plan.selected:
-        if commitment.target is None:
-            continue
-        tile = state.tile_at(commitment.target)
-        if commitment.kind == "CROP":
-            crop = str(commitment.metadata["crop"])
-            if tile.is_empty or (
-                tile.kind == "PLANT" and tile.raw.get("crop") == crop
-            ):
-                continue
-            return f"planned {crop} target {commitment.target} became unavailable"
-        if commitment.kind == "ANIMAL":
-            animal = str(commitment.metadata["animal"])
-            structure = str(commitment.metadata["structure"])
-            if (
-                tile.is_empty
-                or tile.animal == animal
-                or (tile.kind == structure and tile.animal is None)
-                or state.owned_total(animal) > 0
-            ):
-                continue
-            return f"planned {animal} target {commitment.target} became unavailable"
+        tile = state.tile_at(asset.tile)
+        if asset.asset_type in rules.ANIMALS and tile.animal != asset.asset_type:
+            return f"kept {asset.asset_id} no longer exists"
+        if asset.asset_type in rules.CROPS and tile.crop != asset.asset_type:
+            # A completed one-time harvest intentionally releases its tile.
+            if not any(e.step < state.step for e in asset.harvest_schedule):
+                return f"kept {asset.asset_id} no longer exists"
     return None
 
 
-def daily_plan_replan_reason(state: OwnedState, plan: Plan) -> str | None:
-    """Invalidate a fixed Plan target only when its physical premise changed.
+def _decision(state: State, programme: Programme) -> TurnDecision:
+    actions = [("PASS",) for _ in state.workers]
+    for route in programme.routes:
+        if route.worker < len(actions) and state.step in route.actions:
+            actions[route.worker] = tuple(route.actions[state.step])
+    orders = [("SELL", item, quantity)
+              for item, quantity in sorted(programme.planned_sale.get(state.step, {}).items()) if quantity]
+    for event in programme.events_at(state.step):
+        if event.kind == "HIRE": orders.extend(("HIRE",) for _ in range(event.quantity))
+        elif event.kind == "BUY_LAND": orders.append(("BUY_LAND",))
+        elif event.kind in {"BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT"}:
+            orders.append((event.kind, event.item, event.quantity))
+    return TurnDecision(tuple(actions), tuple(orders[:rules.MAX_MARKET_ORDERS]))
 
-    Intraday owns execution capacity not placement repair. Rebinding a target here
-    would silently replace the Plan's long-horizon layout decision.
-    """
-    return _target_invalidation(state, plan)
+
+def _refresh_sales(state: State, programme: Programme) -> Programme:
+    # All non-sale commitments, placements, services and staffing remain frozen.
+    sale = optimize_sales(state, _arrivals(state, programme),
+                          known_demand_events(state), opponent_pressure(state))
+    future = {step: amounts for step, amounts in sale.planned_sale.items() if step >= state.step}
+    past = {step: amounts for step, amounts in programme.planned_sale.items() if step < state.step}
+    return replace(programme, planned_sale={**past, **future},
+                   market_inventory=sale.market_inventory)
 
 
 @dataclass
 class DailyPlanningSession:
-    """Cache one ``Plan`` per player/day and permit a bounded invalidation repair."""
-
-    config: PlannerConfig = field(default_factory=PlannerConfig)
-    _plans: dict[int, Plan] = field(default_factory=dict, init=False)
+    _plans: dict[int, Programme] = field(default_factory=dict, init=False)
     _last_steps: dict[int, int] = field(default_factory=dict, init=False)
-    _realizations: dict[int, tuple[int, int, Realization]] = field(default_factory=dict, init=False)
 
-    def execution_for(self, state: OwnedState, plan: Plan) -> TurnDecision:
-        """Return the already solved action for this absolute turn.
+    def reset(self):
+        self._plans.clear(); self._last_steps.clear()
 
-        The lifecycle cache is not a second planner representation: its value is
-        exactly the public ``Realization`` returned by ``solve_intraday``.
-        """
-        from .intraday import solve_intraday
-
-        cached = self._realizations.get(state.player)
-        if cached is None or cached[0] != plan.day or cached[1] > state.step:
-            realization = solve_intraday(state, plan)
-            cached = (plan.day, state.step, realization)
-            self._realizations[state.player] = cached
-        _, start_step, realization = cached
-        offset = state.step - start_step
-        if not 0 <= offset < len(realization.turns):
-            return TurnDecision(tuple(("PASS",) for _ in state.workers))
-        return realization.turns[offset]
-
-    def reset(self) -> None:
-        self._plans.clear()
-        self._last_steps.clear()
-        self._realizations.clear()
-
-    def plan_for(self, state: OwnedState) -> Plan:
+    def plan_for(self, state: State) -> Programme:
         prior = self._plans.get(state.player)
-        last_step = self._last_steps.get(state.player, -1)
-        new_episode = state.step < last_step
-        new_day = prior is None or prior.day != state.day
-
-        if new_episode or new_day:
-            plan = make_plan(state, self.config)
-        else:
-            plan = prior
-            # Even an impossible target stays fixed; realization reports it.
-
-        self._plans[state.player] = plan
+        last = self._last_steps.get(state.player, -1)
+        reason = None if prior is None else programme_invalidation(state, prior)
+        if prior is None or state.step < last or prior.day != state.day or reason is not None:
+            prior = make_plan(state)
+        self._plans[state.player] = prior
         self._last_steps[state.player] = state.step
-        return plan
+        return prior
+
+    def execution_for(self, state: State, programme: Programme) -> TurnDecision:
+        if programme.planned_sale.get(state.step):
+            programme = _refresh_sales(state, programme)
+            self._plans[state.player] = programme
+        return _decision(state, programme)
 
     @property
-    def plans(self) -> Mapping[int, Plan]:
+    def plans(self) -> Mapping[int, Programme]:
         return dict(self._plans)
 
     @property
-    def planning_diagnostics(self) -> tuple[dict, ...]:
-        return ()
+    def planning_diagnostics(self):
+        return tuple(plan.diagnostics for plan in self._plans.values())

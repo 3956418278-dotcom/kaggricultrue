@@ -1,0 +1,8 @@
+{
+  "d5_d10": "kaggriculture_d5_d10_presets.json",
+  "d11": "kaggriculture_d11_liquidation_presets.json",
+  "lookup_contract": {
+    "D5-D10": "lookup exact preset by day/shop-history/cash interval; no planner/intraday",
+    "D11": "lookup by parent D10 history+variant; exactly 10 workers; fixed liquidation to Wheat buffer"
+  }
+}

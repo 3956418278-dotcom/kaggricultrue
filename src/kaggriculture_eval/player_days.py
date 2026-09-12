@@ -19,12 +19,12 @@ from pathlib import Path
 from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official
 
-from src.kaggriculture_agent.economics import (
+from .plan_schema import (
     ActionDimension, CashDimension, EconomicCommitment, LandDimension,
     OccupancyInterval, PhysicalDimension, RevenueDimension, TimeDimension,
     TimedAmount,
 )
-from src.kaggriculture_agent.planner import Plan
+from .plan_schema import Plan
 
 SCHEMA_VERSION = "player-day-v3"
 

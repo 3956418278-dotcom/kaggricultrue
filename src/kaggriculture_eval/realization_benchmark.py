@@ -10,11 +10,7 @@ from pathlib import Path
 from time import perf_counter
 
 from src.kaggriculture_agent import rules
-from src.kaggriculture_agent.execution import execute_realization
-from src.kaggriculture_agent.intraday import solve_intraday
-from src.kaggriculture_agent.realization import PlanningFailure
 from src.kaggriculture_agent.state import reconstruct
-from src.kaggriculture_agent.valuation import end_value
 
 from .plan_io import plan_from_sample
 
@@ -68,7 +64,10 @@ def _effort(initial, turns):
     }
 
 
-def compare_intraday_sample(sample, solver=solve_intraday):
+def compare_intraday_sample(sample, solver=None):
+    raise RuntimeError(
+        "the frozen Daily Plan benchmark is incompatible with the D11+ Programme contract"
+    )
     opening = reconstruct(sample["day_start_state"])
     plan = plan_from_sample(sample)
     reference_end = reconstruct(sample["day_end_state"])

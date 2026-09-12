@@ -8,6 +8,7 @@ from drifting into subtly different games.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import Mapping
 
@@ -119,6 +120,7 @@ def _shape(name: str, displacement: float, throughput: float) -> float:
     raise ValueError(f"unknown market curve: {name}")
 
 
+@lru_cache(maxsize=None)
 def market_price(item: str, inventory: int) -> int:
     """Return the exact default-environment price at an inventory level."""
     rule = MARKET[item]
@@ -139,43 +141,6 @@ def market_price(item: str, inventory: int) -> int:
             fn, inventory - MARKET_I0, rule.throughput
         )
     return max(PRICE_FLOOR, int(round(price)))
-
-
-def town_demand_per_day(item: str, unlocked_shops: tuple[str, ...]) -> float:
-    """Known demand only: town center plus already unlocked shop instances."""
-    demand = 0.0 if item == "FERTILIZER" else 1.0
-    for shop in unlocked_shops:
-        products = SHOPS.get(shop, ())
-        if item in products:
-            per_tick = 2 if len(products) == 1 else 1
-            demand += per_tick * (TURNS_PER_DAY / 4)
-    return demand
-
-
-def projected_sale_revenue(
-    item: str,
-    quantity: int,
-    current_inventory: int,
-    sale_step: int,
-    current_step: int,
-    unlocked_shops: tuple[str, ...],
-    prior_own_sales: int = 0,
-) -> int:
-    """Estimate proceeds from sequential own sales after known town demand.
-
-    Opponent trades and future random shops are deliberately absent in this first
-    baseline.  A floor-price sale does not add market supply, matching the engine.
-    """
-    days = max(0.0, (sale_step - current_step) / TURNS_PER_DAY)
-    known_demand = int(town_demand_per_day(item, unlocked_shops) * days)
-    inventory = current_inventory - known_demand + prior_own_sales
-    revenue = 0
-    for _ in range(max(0, quantity)):
-        price = market_price(item, inventory)
-        revenue += price
-        if price > PRICE_FLOOR:
-            inventory += 1
-    return revenue
 
 
 def fibonacci_hire_cost(index: int) -> int:
@@ -291,6 +256,33 @@ def one_time_water_gain(
     return min(bonus, rule.max_yield - yield_units)
 
 
+def animal_production_on_refresh(raw: Mapping[str, object], current_day: int) -> int:
+    """Official base/CARE output created by this day's closing refresh."""
+    animal = str(raw["animal"])
+    rule = ANIMALS[animal]
+    since = current_day + 1 - int(raw["placed_day"]) - rule.first_yield_day
+    if since < 0 or since % rule.interval:
+        return 0
+    fed = bool(raw.get("fed_today", False))
+    return 1 + (int(raw.get("pending_care_bonus", 0)) if fed else 0)
+
+
+def crop_production_on_refresh(raw: Mapping[str, object], current_day: int) -> int:
+    """Official ongoing-crop output created by this day's closing refresh."""
+    crop = str(raw["crop"])
+    rule = CROPS[crop]
+    if not rule.ongoing:
+        return 0
+    since = current_day + 1 - int(raw["planted_day"]) - rule.first_yield_day
+    if since < 0 or since % rule.interval:
+        return 0
+    count = since // rule.interval + 1
+    if count > rule.max_yield:
+        return 0
+    fertilized = bool(raw.get("watered_today", False)) and int(raw.get("fertilized_until_day", -1)) >= current_day
+    return 2 if fertilized else 1
+
+
 def quadrant(position: tuple[int, int], board_size: int = BOARD_SIZE) -> str:
     x, y = position
     half = board_size // 2
@@ -341,7 +333,7 @@ def advance_owned(state, actions, orders=(), *, unit_only=False):
     from dataclasses import replace
     from .state import TileState, WorkerState
 
-    tiles = [dict(t.raw) if isinstance(t.raw, Mapping) else t.raw for t in state.tiles]
+    tiles = [dict(t.raw) if isinstance(t.raw, dict) else t.raw for t in state.tiles]
     positions = [w.position for w in state.workers]
     inventories = [dict(w.inventory) for w in state.workers]
     shed, seeds, market = dict(state.shed), dict(state.seeds), dict(state.market_inventory)
@@ -446,9 +438,21 @@ def advance_owned(state, actions, orders=(), *, unit_only=False):
     if unit_only:
         # Shared primitive projection for semantic planning/validation. No
         # second rule implementation, market transaction, clock or refresh.
-        return replace(state, shed=shed, seeds=seeds,
-            tiles=tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles)),
-            workers=tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories))))
+        new_tiles = tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles))
+        new_workers = tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories)))
+        animals, crops = _asset_records(new_tiles)
+        own = replace(
+            state.own,
+            shed_inventory=shed,
+            seeds=seeds,
+            workers=new_workers,
+            worker_positions=tuple(w.position for w in new_workers),
+            worker_inventory=tuple(w.inventory for w in new_workers),
+            animals=animals,
+            crops=crops,
+            tiles=new_tiles,
+        )
+        return replace(state, own=own)
 
     for order in orders[:MAX_MARKET_ORDERS]:
         op = order[0]
@@ -539,8 +543,51 @@ def advance_owned(state, actions, orders=(), *, unit_only=False):
             drop(inv)
         positions, inventories, hires = [access[0]], [{}], 0
     step = state.step + 1
-    return replace(state, step=step, day=step // TURNS_PER_DAY, hour=step % TURNS_PER_DAY,
-        money=money, hires_today=hires, unlocked_quadrants=tuple(unlocked), shed=shed, seeds=seeds,
-        market_inventory=market, market_prices={i: market_price(i, n) for i, n in market.items()},
-        tiles=tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles)),
-        workers=tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories))))
+    new_tiles = tuple(TileState(t.position, raw) for t, raw in zip(state.tiles, tiles))
+    new_workers = tuple(WorkerState(i, p, inv) for i, (p, inv) in enumerate(zip(positions, inventories)))
+    animals, crops = _asset_records(new_tiles)
+    usable = tuple(tile.position for tile in new_tiles if not tile.is_locked)
+    own = replace(
+        state.own,
+        money=money,
+        shed_inventory=shed,
+        seeds=seeds,
+        workers=new_workers,
+        worker_positions=tuple(w.position for w in new_workers),
+        worker_inventory=tuple(w.inventory for w in new_workers),
+        animals=animals,
+        crops=crops,
+        owned_land=tuple(unlocked),
+        usable_tiles=usable,
+        tiles=new_tiles,
+        hires_today=hires,
+    )
+    market_state = replace(
+        state.market,
+        inventory=market,
+        price={item: market_price(item, amount) for item, amount in market.items()},
+    )
+    return replace(
+        state,
+        step=step,
+        day=step // TURNS_PER_DAY,
+        turn=step % TURNS_PER_DAY,
+        own=own,
+        market=market_state,
+    )
+
+
+def _asset_records(tiles):
+    """Rebuild canonical exact asset records after an official transition."""
+    from .state import AssetState
+
+    animals, crops = [], []
+    for tile in tiles:
+        if not isinstance(tile.raw, dict):
+            continue
+        official = dict(tile.raw)
+        if "animal" in official:
+            animals.append(AssetState(str(official["animal"]), tile.position, official))
+        elif official.get("kind") == "PLANT":
+            crops.append(AssetState(str(official["crop"]), tile.position, official))
+    return tuple(animals), tuple(crops)

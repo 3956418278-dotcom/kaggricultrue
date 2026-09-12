@@ -1,53 +1,24 @@
-# Planning implementation guide
+# D11+ programme controller
 
-`PROJECT.md` owns architecture; `STATE.md` owns current capability and evidence.
-
-| Concern | Owner |
-| --- | --- |
-| Observation/action contract | `state.py`, `contract.py`, root `main.py` |
-| Exact owned-state transition | `rules.py` |
-| Economic dimensions and Daily Plan | `economics.py`, `planner.py` |
-| Intraday optimization | `intraday.py` |
-| Public solved trajectory | `realization.py` |
-| Exact execution/completion validation | `execution.py` |
-| Reached-state value | `valuation.py` |
-| Plan lifecycle and runtime composition | `operating.py`, `agent.py` |
-
-The production boundary is exactly:
+The maintained runtime boundary is:
 
 ```text
-OwnedState + Plan
-        -> solve_intraday()
-        -> Realization
-        -> execute_realization()
-        -> S_end
+observation -> canonical State -> macro Programme -> intraday routes -> action
 ```
 
-`Plan` describes the day's required economic/farm outcomes, their exact project
-placements, required outputs/deadlines, and any exceptional `EconomicWindow`.
-`ActionDimension` is only a macro labor estimate. `Realization` contains the
-fixed placement commitments and actual per-turn worker/market actions. Worker
-assignment, order, travel and sparse resource logistics are private solver
-decisions. Failure to find a fully executable Plan raises `PlanningFailure`; no
-partial realization crosses the API.
+- `state.py` retains complete official animal/crop records for both visible farms.
+- `rules.py` owns pinned `kaggle-environments==1.32.7` transitions and prices.
+- `market.py` owns reveal timing, known demand events, visible opponent pressure,
+  and sequential sale DP with shared shed-capacity repair.
+- `programme.py` is the frozen macro/executor contract.
+- `planner.py` owns KEEP/EXIT, mandatory/optional service, W_FEED, W/C buffers,
+  exact-tile long candidates, land+use comparisons, and terminal-cash selection.
+- `intraday.py` may assign workers and construct routes, but cannot alter macro
+  asset, placement, service, fertilizer, CARE, or lifecycle decisions.
+- `simulation.py` performs the final complete pinned-rule replay and maintains
+  separate output, field, worker, shed, sale, and market trajectories.
+- `operating.py` freezes the programme within a day and only re-solves remaining
+  sales at a real SELL checkpoint.
 
-The solver privately derives one shortest legal local chain for each outcome by
-calling the exact unit transition. It then constrains fixed-position event
-assignment/order, Manhattan travel and sparse source/pickup/transfer relations.
-Normal acquisition, hiring and land orders are placed at the earliest required
-turn; market timing exists only for an explicit economic window. Workforce is
-tried from low to high and the first complete exact realization is selected by
-transparent execution effort, never by `V(S_end)`.
-
-Run focused checks with the OR-Tools environment:
-
-```bash
-.cache/planner-runtime/bin/python -m unittest tests.test_intraday tests.test_planner_model -v
-```
-
-Run the frozen development-only benchmark with:
-
-```bash
-.cache/planner-runtime/bin/python scripts/benchmark_intraday.py \
-  .cache/reference-pilot-20260905/dataset-v1 runs/<unique-id>
-```
+The prior programme/target tables and fixed-count policy are not present. D5-D10
+pass after the existing fixed four-day opening; this controller starts at D11.

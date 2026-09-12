@@ -11,8 +11,6 @@ from src.kaggriculture_eval.player_days import (
 )
 from src.kaggriculture_eval.reference_pipeline import qualify_sides
 from src.kaggriculture_eval.reference_audit import audit_sample
-from src.kaggriculture_agent.planner import make_plan, PlannerConfig
-from src.kaggriculture_agent.state import reconstruct, TileState
 
 
 class PlayerDayTests(unittest.TestCase):
@@ -111,24 +109,6 @@ class PlayerDayTests(unittest.TestCase):
             mutate(sample)
             with self.assertRaises(ValueError):
                 audit_sample(sample)
-
-
-class FixedBoundaryTests(unittest.TestCase):
-    def test_existing_structure_is_fixed_by_plan(self):
-        state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
-        tiles = list(state.tiles)
-        for pos in ((0, 0), (0, 1)):
-            tiles[pos[1]*10+pos[0]] = TileState(pos, {"kind": "PASTURE"})
-        state = replace(state, tiles=tuple(tiles), shed={"COW": 1})
-        plan = make_plan(state, PlannerConfig(cash_reserve=100000))
-        project = next(p for p in plan.obligations if p.kind == "ANIMAL_PLACEMENT")
-        self.assertEqual(project.target, (0, 0))
-        self.assertFalse(hasattr(plan, "routes"))
-
-    def test_no_opportunistic_work_outside_fixed_daily_intent(self):
-        state = reconstruct(make("kaggriculture", configuration={"seed": 4}).reset(2)[0].observation)
-        plan = replace(make_plan(state), obligations=(), selected=(), support=())
-        self.assertEqual(plan.obligations + plan.selected + plan.support, ())
 
 
 if __name__ == "__main__":

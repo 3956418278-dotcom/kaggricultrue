@@ -1,4 +1,4 @@
-"""Deterministic baseline composition with episode-local daily plans."""
+"""Fixed opening followed by the D11+ programme controller."""
 
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ def decide(
         from .scripted_opening import scripted_opening_action
 
         return scripted_opening_action(observation)
+    if state.day < 10:
+        # D5-D10 strategy is intentionally outside this change; do not retain
+        # the deleted programme/target-table policy in that interval.
+        return pass_action(len(state.workers)-1)
     owner = session or _DEFAULT_SESSION
     operating_plan = owner.plan_for(state)
     return construct_action(state, owner.execution_for(state, operating_plan))

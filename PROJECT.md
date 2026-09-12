@@ -169,17 +169,31 @@ The maintained agent should have one owner for each of these concerns:
 
 Opponent inference may be used by the decision core, but only from observable state. It is not a separate authority for game rules.
 
-The decision core represents every economic commitment through six semantic dimensions `(C, T, L, A, Q, R)`: cash commitments and timing; relevant time structure and horizon; land occupancy over time; dated service work plus an explicit travel approximation; physical inputs and outputs; and realizable revenue or terminal-cash effects. These dimensions retain schedules, intervals, and structured records where the game requires them. Terminal profit, profit per action, and profit per tile-day are derived comparisons after feasibility checks, not replacements for the underlying record or an arbitrary weighted utility.
+The D11+ runtime direction is strictly `canonical State -> macro Programme ->
+intraday executor -> executable actions`. `Programme` owns KEEP/EXIT, asset type
+and count, exact tile, release turn, CARE/FERTILIZE decisions, service/output/
+harvest/stock/sale schedules, feed and buffer Wheat, land+use, and the minimum
+worker count. The intraday executor owns only assignment, movement, task order,
+and exact pickup/drop logistics; it cannot change a macro commitment.
 
-The same representation covers crop and animal production, fertilizer allocation, daily hiring, land expansion, and liquidation. An already-purchased seed, animal, crop, structure, or inventory item is a sunk commitment: planning records its historical cost for diagnosis but evaluates only the marginal cash, work, timing, storage, and realizable value of maintaining, moving, harvesting, using, or liquidating it.
+The macro planner compares programmes solely by terminal cash after complete
+pinned-rule simulation. Existing purchase costs are sunk. EXIT, optional service,
+exact-tile long assets and land+use are accepted one at a time by positive
+marginal programme value and all remaining choices are recomputed after each
+acceptance. Future unrevealed shops are never predicted.
 
-The runtime direction is strictly `current real state -> Daily Plan -> intraday planner -> executable trajectory`. At day start, the economic planner uses the complete real farm state, including layout, land availability, structures, assets, inventories and time, to decide what should be accomplished today. `Plan` owns the required farm/economic outcomes, exact placement of every affected project, required outputs and asset changes, deadlines, and any exceptional economically important turn window. It does not own worker identities, routes, pickup organization or primitive action order. Production is limited by estimated resource/capacity feasibility, not a fixed project-count quota.
+Physical flows remain distinct: production, field stock, worker stock, shed
+stock, planned sale and shared-market inventory are separate dated records. Only
+an actual sale adds own supply to the market. Known demand is represented as
+official-turn events. Opponent pressure comes only from currently visible assets
+under base production, without new assets, CARE, fertilizer, replacement or
+route prediction.
 
-Placement is a long-horizon farm-layout decision and is complete before `solve_intraday()` is called. `ActionDimension` remains part of `(C,T,L,A,Q,R)` for economic scoring, labor estimation and capacity planning, but its `WorkAmount` records are not an execution prescription. Intraday derives the primitive local work mechanically from `OwnedState`, each commitment's canonical outcome, fixed target and the exact rules. It then decides worker assignment, route/order and only the sparse resource precedences or logistics choices that remain real.
-
-Ordinary purchases, hires and land orders are scheduled mechanically at the earliest required legal turn; ordinary market timing is not an intraday optimization dimension. A Plan may declare a small `EconomicWindow` for a specified order, shed delivery or cash condition when timing has economic significance. Selling otherwise remains outside intraday. `end_value()` is diagnostic for intraday evaluation, not its objective: the solver first requires full exact Plan completion, then prefers lower workforce and transparent execution effort.
-
-The controller retains a valid trajectory and repairs execution when observed state materially diverges. It must not change the fixed Plan: lost assets, missing resources and incomplete work remain visible shortfalls. The next post-refresh day starts a fresh economic Plan. `rules.py` remains the single policy rule owner; official transitions remain the evaluation oracle. Search respects automatic inventory drop, shed overflow, hand removal, farmer reset and the step-718/719 boundary, without forecasting opponent trades or future random unlocks.
+The controller replans fully at a day boundary, a shop-list change, or when the
+frozen programme can no longer continue from real state. Ordinary intraday market
+movement does not reopen macro choices. At a SELL checkpoint only the remaining
+sale DP may change from real stock and real shared inventory. `rules.py` remains
+the single submitted owner of pinned transition and price semantics.
 
 Local environment adapters, arenas, opponent loaders, replay parsers, statistics, and reports are evaluation infrastructure rather than submission-policy components. They must be able to compare an unchanged packaged agent without importing private implementation hooks.
 

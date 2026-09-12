@@ -1,8 +1,8 @@
 """Loading of canonical Plans and explicit migration of old reference samples."""
 from collections import Counter
 
-from src.kaggriculture_agent import economics as e
-from src.kaggriculture_agent.planner import EconomicWindow, Plan
+from . import plan_schema as e
+from .plan_schema import EconomicWindow, Plan
 
 
 def plan_from_dict(raw):
