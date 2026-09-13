@@ -7,14 +7,16 @@ from typing import Iterable
 
 from . import rules
 from .current_assets import (
+    _minimum_survival_feed_units,
     animal_daily_value,
     animal_locality_bonus,
+    conservative_f_price,
     crop_daily_value,
     current_asset_programmes,
     read_current_assets,
 )
 from .intraday import PlanningFailure, clear_route_cache, solve_intraday
-from .market import next_reveal, optimize_short_sales
+from .market import buy_cost, forecast_inventory, next_reveal, optimize_short_sales
 from .midgame_config import (
     MidgameParameters,
     coerce_midgame_parameters,
@@ -284,7 +286,7 @@ def _resolve_inputs(
     assets = programme.assets
     feed_events = [
         event for event in events if event.kind == "FEED"]
-    current_wheat = state.owned_total("WHEAT")
+    current_wheat = state.shed.get("WHEAT", 0)
     needed_from_harvest = max(0, len(feed_events) - current_wheat)
     promoted: set[str] = set()
     for event in sorted(events):
@@ -367,7 +369,7 @@ def _resolve_inputs(
     collect_events = [
         event for event in events if event.kind == "COLLECT_F"]
     collected_for_use = min(
-        max(0, fertilizer_need - state.owned_total("FERTILIZER")),
+        max(0, fertilizer_need - state.shed.get("FERTILIZER", 0)),
         len(collect_events),
     )
     relay_ids = {
@@ -388,7 +390,7 @@ def _resolve_inputs(
     fertilizer_deficit = max(
         0,
         fertilizer_need
-        - state.owned_total("FERTILIZER")
+        - state.shed.get("FERTILIZER", 0)
         - collected_for_use,
     )
     if fertilizer_deficit:
@@ -415,8 +417,75 @@ def _asset_daily_value(
     state: State, kind: str, params: MidgameParameters
 ) -> float:
     if kind in rules.ANIMALS:
-        return animal_daily_value(state, kind, params)
-    return crop_daily_value(state, kind).selected
+        return _forecast_animal_daily_value(state, kind, params)
+    return _forecast_crop_daily_value(state, kind)
+
+
+def _forecast_animal_daily_value(
+    state: State, animal: str, params: MidgameParameters
+) -> float:
+    """Forecast-aware animal daily value for new placement decisions."""
+    rule = rules.ANIMALS[animal]
+    # Count productions achievable before terminal.
+    first_prod_day = state.day + rule.first_yield_day - 1
+    if first_prod_day > 28:
+        return 0.0
+    productions = 0
+    for k in range(rule.max_held):
+        prod_day = first_prod_day + k * rule.interval
+        if prod_day > 28:
+            break
+        productions += 1
+    if productions == 0:
+        return 0.0
+    # Target day = last production day for this animal.
+    target_day = first_prod_day + (productions - 1) * rule.interval
+    forecast_inv = forecast_inventory(
+        state, rule.product, target_day,
+        own_production_to_target=productions,
+    )
+    forecast_price = rules.market_price(rule.product, forecast_inv)
+    days = rule.first_yield_day + (productions - 1) * rule.interval
+    wheat_units = _minimum_survival_feed_units(days)
+    wheat_cost = buy_cost(
+        "WHEAT", wheat_units,
+        int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
+    realizable_f = max(1, wheat_units)
+    numerator = (
+        productions * forecast_price
+        + realizable_f * conservative_f_price(state, params)
+        - rule.cost
+        - wheat_cost
+    )
+    return numerator / max(1, days)
+
+
+def _forecast_crop_daily_value(state: State, crop: str) -> float:
+    """Forecast-aware crop daily value for new placement decisions."""
+    rule = rules.CROPS[crop]
+    if not rule.ongoing:
+        return crop_daily_value(state, crop).selected
+    # For ongoing crops, count achievable productions before terminal.
+    first_prod_day = state.day + rule.first_yield_day - 1
+    if first_prod_day > 28:
+        return 0.0
+    productions = 0
+    for k in range(rule.max_yield):
+        prod_day = first_prod_day + k * rule.interval
+        if prod_day > 28:
+            break
+        productions += 1
+    if productions == 0:
+        return 0.0
+    target_day = first_prod_day + (productions - 1) * rule.interval
+    forecast_inv = forecast_inventory(
+        state, crop, target_day,
+        own_production_to_target=productions,
+    )
+    forecast_price = rules.market_price(crop, forecast_inv)
+    days = max(1, rule.first_yield_day + (productions - 1) * rule.interval)
+    numerator = productions * forecast_price - rule.seed_cost
+    return numerator / days
 
 
 def _production_days(kind: str) -> int:
@@ -587,33 +656,19 @@ def _land_expansion(
     owned = len(_planned_quadrants(state, programme.land))
     if owned >= 4 or state.turn >= rules.TURNS_PER_DAY - 3:
         return programme
+    # Only allow land 2 or 3; land 4 disabled by default via max_land_quadrant.
+    if owned > params.max_land_quadrant:
+        return programme
     quadrant = rules.LAND_ORDER[owned - 1]
     price = rules.LAND_PRICES[owned - 1]
-    money = state.money - _committed_purchase_cost(state, programme)
-    if money <= price:
-        return programme
 
-    best = None
-    for kind in LONG_ASSETS:
-        daily = _asset_daily_value(state, kind, params)
-        remaining = _remaining_effective_days(state, kind)
-        if daily <= 0 or remaining <= 0:
-            continue
-        unit = _unit_cash_cost(state, kind)
-        deployable = min(
-            25,
-            max(0, (money - price) // max(1, unit)))
-        value = deployable * daily * remaining
-        candidate = (value, deployable, daily, kind)
-        if best is None or candidate > best:
-            best = candidate
-    if best is None:
-        return programme
-    value, deployable, _, kind = best
-    if (
-        deployable < params.land_min_deployable_count
-        or value <= price * params.land_value_cover_ratio
-    ):
+    # Compute free cash after all existing commitments.
+    free_cash = state.money - _committed_purchase_cost(state, programme)
+    # Full wheat seed fallback: cost to fill every free tile with wheat.
+    free_tiles = len(_unused_tiles(state, programme))
+    wheat_seed_fallback = free_tiles * rules.CROPS["WHEAT"].seed_cost
+    threshold = price + wheat_seed_fallback + params.fixed_cash_reserve
+    if free_cash <= threshold:
         return programme
 
     tiles = sorted(
@@ -630,7 +685,7 @@ def _land_expansion(
         item=quadrant, quantity=price, source="SCALE_EXPANSION")
     land = LandProgramme(
         quadrant, state.step, price, exact,
-        f"SCALE:{kind}:{deployable}")
+        f"SCALE:WHEAT:{free_tiles}")
     return replace(
         programme,
         events=tuple(sorted((*programme.events, event))),

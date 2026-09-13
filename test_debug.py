@@ -1,0 +1,3 @@
+import inspect
+from src.kaggriculture_agent.current_assets import current_asset_programmes
+print(inspect.signature(current_asset_programmes))

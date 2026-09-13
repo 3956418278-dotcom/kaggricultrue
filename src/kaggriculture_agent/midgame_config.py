@@ -19,6 +19,11 @@ class MidgameParameters:
     land_min_deployable_count: int = 8
     land_value_cover_ratio: float = 1.25
 
+    # New land purchase: cash reserve kept after land + fallback seed.
+    fixed_cash_reserve: int = 200
+    # Maximum land quadrant index to consider (2 = NE+SW, 3 = +SE).
+    max_land_quadrant: int = 2
+
 
 DEFAULT_MIDGAME_PARAMETERS = MidgameParameters()
 

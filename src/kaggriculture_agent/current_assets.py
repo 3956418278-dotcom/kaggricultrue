@@ -188,6 +188,25 @@ def _production_step(day: int | None) -> int | None:
     return None if day is None else (day + 1) * rules.TURNS_PER_DAY
 
 
+def completed_production_count(raw: Mapping[str, object], day: int) -> int:
+    """Count how many ongoing-crop productions have completed by end of `day`."""
+    crop = str(raw["crop"])
+    rule = rules.CROPS[crop]
+    if not rule.ongoing:
+        return 0
+    # Productions happen at end-of-day refresh for age = first_yield_day, first_yield_day+interval, etc.
+    # A production on day D means the refresh at end of D creates output.
+    # So production day = planted_day + first_yield_day + k*interval - 1 for k=0,1,...
+    # But the environment computes: age = (day+1) - planted_day - first_yield_day,
+    #   if age >= 0 and age % interval == 0 then count = age // interval + 1
+    # So the N-th production happens on day = planted_day + first_yield_day + (N-1)*interval - 1
+    first_production_day = int(raw["planted_day"]) + rule.first_yield_day - 1
+    if day < first_production_day:
+        return 0
+    count = (day - first_production_day) // rule.interval + 1
+    return min(count, rule.max_yield)
+
+
 def _next_crop_production_day(raw: Mapping[str, object], day: int) -> int | None:
     rule = rules.CROPS[str(raw["crop"])]
     if not rule.ongoing:
@@ -198,7 +217,13 @@ def _next_crop_production_day(raw: Mapping[str, object], day: int) -> int | None
     remainder = (candidate - first) % rule.interval
     if remainder:
         candidate += rule.interval - remainder
-    return candidate if candidate <= 28 else None
+    if candidate > 28:
+        return None
+    # Check if this production would exceed max_yield.
+    production_number = (candidate - first) // rule.interval + 1
+    if production_number > rule.max_yield:
+        return None
+    return candidate
 
 
 def _care_gain(state: State, asset: AssetState) -> tuple[int, bool]:
@@ -267,7 +292,13 @@ def _animal_current_state(
     if prior is not None and prior.mode == EXIT:
         mode = EXIT
     elif daily <= 0 or production_day is None:
-        mode = EXIT
+        # Pre-first-output animals: prohibit EXIT until the first production
+        # completes.  Abandoning before any output wastes the full purchase cost.
+        first_production = int(raw["placed_day"]) + rule.first_yield_day - 1
+        if state.day < first_production and held == 0:
+            mode = MAINTAIN
+        else:
+            mode = EXIT
     elif care_possible:
         mode = PRODUCE
     else:
@@ -480,15 +511,21 @@ def _crop_current_state(
     input_gain = 0
     next_harvest = None
     mode = GROW
+    lifecycle_done = False
 
     if rule.ongoing:
         production_day = _next_crop_production_day(raw, state.day)
         production_step = _production_step(production_day)
         production_tonight = production_step == (state.day + 1) * 24
+        # Lifecycle completion: all productions exhausted.
+        lifecycle_done = (
+            production_day is None
+            and completed_production_count(raw, state.day) >= rule.max_yield
+        )
         incoming = (
             rules.crop_production_on_refresh(raw, state.day)
             if production_tonight else 0)
-        terminal = state.day >= 29
+        terminal = state.day >= 29 or lifecycle_done
         survival_water = (
             not terminal
             and
@@ -532,16 +569,26 @@ def _crop_current_state(
         overflow = held > 0 and incoming > 0 and held + incoming > rule.max_yield
         lifespan = int(raw.get("max_lifespan_step", -1))
         expiring = 0 <= lifespan <= end
-        if held > 0 and (overflow or expiring or state.day >= 29):
+        if held > 0 and (overflow or expiring or state.day >= 29 or lifecycle_done):
             source = (
                 "HELD_OVERFLOW" if overflow else
-                "TERMINAL_LIQUIDATION" if state.day >= 29 else "EXPIRY")
+                "TERMINAL_LIQUIDATION" if state.day >= 29 else
+                "LIFECYCLE_DONE" if lifecycle_done else "EXPIRY")
             today.append(_event(
                 state.step, 30, identifier + ":harvest", "HARVEST",
                 tile=asset.position, asset_id=identifier, item=crop,
                 quantity=held, action=("HARVEST",), deadline=end,
                 source=source))
             mode = HARVEST
+            next_harvest = state.step
+        elif lifecycle_done and held == 0:
+            # No product left; schedule DIG to free the tile.
+            today.append(_event(
+                state.step, 31, identifier + ":dig", "DIG",
+                tile=asset.position, asset_id=identifier,
+                action=("DIG",), deadline=end,
+                source="LIFECYCLE_DONE"))
+            mode = HARVEST  # Reuse HARVEST mode to trigger release.
             next_harvest = state.step
         elif production_step is not None:
             next_events.append(_event(
@@ -588,7 +635,7 @@ def _crop_current_state(
 
     release = (
         min(state.step + 1, rules.TERMINAL_ACTION_STEP + 1)
-        if mode == HARVEST and not rule.ongoing else None)
+        if mode == HARVEST and (not rule.ongoing or lifecycle_done) else None)
     return CurrentAssetState(
         asset_id=identifier,
         asset_type=crop,

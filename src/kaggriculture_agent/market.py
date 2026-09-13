@@ -134,6 +134,48 @@ def opponent_pressure(state: State) -> dict[str, tuple[tuple[int, int], ...]]:
     return merged
 
 
+def forecast_inventory(
+    state: State,
+    product: str,
+    target_day: int,
+    *,
+    own_production_to_target: int = 0,
+    planned_new_production: int = 0,
+) -> int:
+    """Forecast market inventory of `product` at `target_day`.
+
+    Formula:
+        current market inventory
+        + own_production_to_target      (caller-supplied own output)
+        + opponent visible production   (theory max - 1 per visible asset)
+        + planned_new_production        (this-round planned new assets)
+        - known shop/town consumption   (exact demand events)
+
+    Does NOT mutate ``state.market.inventory``.
+    """
+    inventory = int(state.market.inventory.get(product, rules.MARKET_I0))
+
+    # Opponent visible production to target_day.
+    opponent = opponent_pressure(state)
+    target_step = min((target_day + 1) * rules.TURNS_PER_DAY,
+                      rules.TERMINAL_ACTION_STEP + 1)
+    opp_supply = sum(
+        max(0, qty - 1) for step, qty in opponent.get(product, ())
+        if step <= target_step
+    )
+    inventory += opp_supply
+
+    # Own production and planned new.
+    inventory += own_production_to_target + planned_new_production
+
+    # Known shop/town consumption (demand events that remove from market).
+    demand = known_demand_events(state, end_step=target_step)
+    consumption = sum(qty for _, qty in demand.get(product, ()))
+    inventory -= consumption
+
+    return inventory
+
+
 @dataclass(frozen=True)
 class SalePlan:
     revenue: int
@@ -584,8 +626,19 @@ def optimize_short_sales(
                 purchase_arrivals[event.item][arrival_step] = (
                     purchase_arrivals[event.item].get(arrival_step, 0)
                     + event.quantity)
+    # ── Fertilizer immediate sell rule ──
+    # Reserved F = approved FERTILIZE count in the frozen plan.
+    reserved_f = sum(
+        max(1, getattr(event, "quantity", 0))
+        for event in commitments
+        if getattr(event, "kind", None) == "FERTILIZE"
+    )
+    shed_f = int(state.shed.get("FERTILIZER", 0))
+    free_f = max(0, shed_f - reserved_f)
     forced: dict[str, dict[int, int]] = {
         product: {} for product in rules.PRODUCTS}
+    if free_f > 0:
+        forced["FERTILIZER"][state.step] = free_f
     blocked: dict[str, set[int]] = {
         product: set() for product in rules.PRODUCTS}
 
