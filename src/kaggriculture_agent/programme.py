@@ -57,19 +57,21 @@ class CurrentAssetState:
     official: Mapping[str, Any]
     held_product: str | None = None
     held_quantity: int = 0
-    animal_mode: str | None = None       # MAINTAIN / EXIT
-    base_gain: int | None = None
-    replacement_advantage: int = 0
+    mode: str | None = None              # PRODUCE / MAINTAIN / EXIT / GROW
+    daily_value: float = 0.0
     care_approved: bool = False
-    care_gain: int = 0
-    care_step: int | None = None
-    decision_event: str | None = None
+    input_gain: int = 0
     next_production_step: int | None = None
-    next_production_cashable: bool = False
+    next_harvest_step: int | None = None
     today_events: tuple[ProgrammeEvent, ...] = ()
     next_events: tuple[ProgrammeEvent, ...] = ()
-    economic_exit_step: int | None = None
+    liquidation_step: int | None = None
     physical_release_step: int | None = None
+
+    @property
+    def animal_mode(self) -> str | None:
+        """Compatibility spelling used by plan inspection code."""
+        return self.mode
 
 
 @dataclass(frozen=True)
@@ -110,7 +112,6 @@ class Programme:
     shed_stock: Mapping[int, Mapping[str, int]] = field(default_factory=dict)
     planned_sale: Mapping[int, Mapping[str, int]] = field(default_factory=dict)
     market_inventory: Mapping[int, Mapping[str, int]] = field(default_factory=dict)
-    wheat_feed: Mapping[Position, tuple[int, ...]] = field(default_factory=dict)
     wheat_buffer: Mapping[Position, tuple[int, ...]] = field(default_factory=dict)
     carrot_buffer: Mapping[Position, tuple[int, ...]] = field(default_factory=dict)
     fertilizer: FertilizerProgramme = field(default_factory=FertilizerProgramme)

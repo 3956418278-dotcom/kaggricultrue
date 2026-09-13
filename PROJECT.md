@@ -172,7 +172,7 @@ Opponent inference may be used by the decision core, but only from observable st
 The observation-driven midgame runtime direction is strictly `canonical State
 -> macro Programme -> intraday executor -> executable actions`. Existing assets
 are represented by `CurrentAssetState`: the complete official snapshot, today's
-actions, the next biological event, and a frozen next-cycle animal decision.
+actions, the next biological event, and the current operating mode.
 They are not expanded to terminal every day. `Programme` owns new commitments,
 exact placement, release turns, approved service, feed and buffer Wheat,
 land+use, sale timing, and worker count. The intraday executor owns only
@@ -180,29 +180,25 @@ assignment, movement, task order, and exact pickup/drop logistics; it cannot
 change a macro commitment.
 
 New commitments remain subject to the planner's pinned-rule economic checks.
-Existing purchase costs are sunk. Existing animals use an event-driven
-next-production-cycle comparison: next base-product value minus required Wheat
-and proven incremental hire cost is compared with an explicit positive
-replacement blocked by that tile. CARE is a separate one-cycle marginal check.
-No terminal programme comparison, shop bonus, animal-count penalty, or fixed
-action/movement shadow price enters that existing-animal decision. Future
-unrevealed shops are never predicted.
+Animal and crop ranking uses a current-price daily-value snapshot with explicit
+purchase/seed, Wheat, and fertilizer cash inputs. Existing animals operate as
+PRODUCE, MAINTAIN, or EXIT; CARE is a separate next-cycle marginal check and
+held product stays on the asset until capacity, liquidation, terminal, or a
+specific cash need requires harvest. No terminal programme comparison, shop
+bonus, animal-count penalty, or fixed action/movement shadow price enters the
+decision. Future unrevealed shops are never predicted.
 
 Physical flows remain distinct: production, field stock, worker stock, shed
 stock, planned sale and shared-market inventory are separate dated records. Only
 an actual sale adds own supply to the market. Known demand is represented as
-official-turn events. Opponent pressure comes only from currently visible assets
-under base production, without new assets, CARE, fertilizer, replacement or
-route prediction.
+official-turn events. Runtime trading never turns biological production into
+market supply and does not predict opponent harvests or sales.
 
-The controller can attach to any legal observation. It may rebuild the daily
-programme at a day boundary, a shop-list change, or when the frozen programme can
-no longer continue from real state, but an existing animal's MAINTAIN/EXIT and
-cycle CARE choice remain frozen until a shop reveal, completed production,
-held-capacity change, explicit replacement opportunity, or terminal cashability
-change. At a SELL checkpoint only the remaining sale DP may change from real
-stock and real shared inventory. `rules.py` remains the single submitted owner
-of pinned transition and price semantics.
+The controller can attach to any legal observation. It rebuilds the short daily
+programme at a day boundary, a shop-list change, or when the frozen programme
+can no longer continue from real state. Every four turns the trade machine alone
+re-reads real shed and market state and resolves NOW/+4/+8 sales. `rules.py`
+remains the single submitted owner of pinned transition and price semantics.
 
 Local environment adapters, arenas, opponent loaders, replay parsers, statistics, and reports are evaluation infrastructure rather than submission-policy components. They must be able to compare an unchanged packaged agent without importing private implementation hooks.
 

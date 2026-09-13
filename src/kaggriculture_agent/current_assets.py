@@ -1,53 +1,31 @@
-"""Event-driven, next-cycle handling of assets already on the farm."""
+"""Lightweight observation-backed decisions for assets already on the farm."""
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 from . import rules
-from .market import buy_cost, known_demand_events, sell_revenue
+from .market import buy_cost, next_reveal, sell_revenue
 from .midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
 from .programme import AssetProgramme, CurrentAssetState, ProgrammeEvent
 from .state import AssetState, Position, State
 
+PRODUCE = "PRODUCE"
 MAINTAIN = "MAINTAIN"
 EXIT = "EXIT"
+GROW = "GROW"
+HARVEST = "HARVEST"
 
 
 @dataclass(frozen=True)
-class AnimalCycleValue:
-    next_production_step: int | None
-    forecast_inventory: int
-    product_value: int
-    wheat_units: int
-    wheat_cost: int
-    hire_cost: int
-
-    @property
-    def base_gain(self) -> int:
-        return self.product_value - self.wheat_cost - self.hire_cost
-
-
-@dataclass(frozen=True)
-class AnimalDecisionInputs:
-    """Facts proven by other planner owners, without route search here.
-
-    Replacement values and incremental hire costs are cash amounts, not scores,
-    worker counts, or locally invented shadow prices.
-    """
-
-    replacement_advantages: Mapping[Position, int] | None = None
-    base_incremental_hire_costs: Mapping[str, int] | None = None
-    care_incremental_hire_costs: Mapping[str, int] | None = None
-    liquidation_incremental_hire_costs: Mapping[str, int] | None = None
-
-    def replacement_at(self, tile: Position) -> int:
-        return max(0, int((self.replacement_advantages or {}).get(tile, 0)))
-
-    def hire_cost_for(self, mapping: Mapping[str, int] | None,
-                      asset_id: str) -> int:
-        return max(0, int((mapping or {}).get(asset_id, 0)))
+class DailyValue:
+    normal: float
+    fertilized: float
+    selected: float
+    production_days: int
+    normal_output: int
+    fertilized_output: int
+    fertilizer_units: int
 
 
 def _event(step: int, priority: int, event_id: str, kind: str, *,
@@ -69,11 +47,136 @@ def _day_end(state: State) -> int:
                rules.TERMINAL_ACTION_STEP)
 
 
-def next_animal_production_day(raw: Mapping[str, object], day: int) -> int | None:
-    """Return the next closing production day in O(1)."""
+def _price(state: State, item: str) -> int:
+    return int(state.market.price.get(
+        item, rules.market_price(item, state.market.inventory[item])))
+
+
+def conservative_f_price(
+    state: State,
+    params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+) -> int:
+    current = _price(state, "FERTILIZER")
+    return max(1, int(current * params.fertilizer_value_discount)) \
+        if current > 0 else 0
+
+
+def _fertilizer_use_cost(state: State, quantity: int) -> int:
+    owned = min(max(0, quantity), state.owned_total("FERTILIZER"))
+    deficit = max(0, quantity - owned)
+    return (
+        sell_revenue(
+            "FERTILIZER", owned,
+            int(state.market.inventory["FERTILIZER"]))
+        + buy_cost(
+            "FERTILIZER", deficit,
+            int(state.market.inventory["FERTILIZER"])))
+
+
+def _animal_cycle_days(animal: str) -> int:
+    rule = rules.ANIMALS[animal]
+    return rule.first_yield_day + (rule.max_held - 1) * rule.interval
+
+
+def _minimum_survival_feed_units(days: int) -> int:
+    consecutive = 0
+    units = 0
+    for _ in range(max(0, days)):
+        if consecutive:
+            units += 1
+            consecutive = 0
+        else:
+            consecutive = 1
+    return units
+
+
+def animal_daily_value(
+    state: State,
+    animal: str,
+    params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+) -> float:
+    """Current snapshot value of one maximum effective animal cycle."""
+    rule = rules.ANIMALS[animal]
+    days = _animal_cycle_days(animal)
+    wheat_units = _minimum_survival_feed_units(days)
+    wheat_cost = buy_cost(
+        "WHEAT", wheat_units,
+        int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
+    # Fertilizer cannot stack.  Count only the units available on already
+    # necessary maintenance/harvest visits, not every theoretical future night.
+    realizable_f = max(1, wheat_units)
+    numerator = (
+        rule.max_held * _price(state, rule.product)
+        + realizable_f * conservative_f_price(state, params)
+        - rule.cost
+        - wheat_cost
+    )
+    return numerator / max(1, days)
+
+
+def _fertilizer_applications(crop: str) -> int:
+    rule = rules.CROPS[crop]
+    window_start = (rule.max_yield_day + 1) // 2
+    if rule.ongoing:
+        output_days = [
+            rule.first_yield_day + offset * rule.interval
+            for offset in range(rule.max_yield)
+        ]
+        applications = 0
+        covered_through = -1
+        for day in output_days:
+            if day > covered_through:
+                applications += 1
+                covered_through = day + 2
+        return applications
+    units = 1
+    applications = 0
+    covered_through = -1
+    for day in range(window_start, rule.max_yield_day + 1):
+        if units >= rule.max_yield:
+            break
+        if day > covered_through:
+            applications += 1
+            covered_through = day + 2
+        units += min(2, rule.max_yield - units)
+    return applications
+
+
+def crop_daily_value(state: State, crop: str) -> DailyValue:
+    """Current maximum-production snapshot for a newly planted crop."""
+    rule = rules.CROPS[crop]
+    price = _price(state, crop)
+    days = max(1, (
+        rule.first_yield_day + (rule.max_yield - 1) * rule.interval
+        if rule.ongoing else rule.max_yield_day
+    ))
+    if rule.ongoing:
+        normal_output = rule.max_yield
+        # Maximum effective operation harvests before the official held cap
+        # would discard a fertilized production unit.
+        fertilized_output = 2 * rule.max_yield
+    else:
+        productive_days = max(
+            0, rule.max_yield_day - (rule.max_yield_day + 1) // 2 + 1)
+        normal_output = min(rule.max_yield, 1 + productive_days)
+        fertilized_output = min(rule.max_yield, 1 + 2 * productive_days)
+    fertilizer_units = _fertilizer_applications(crop)
+    normal = (normal_output * price - rule.seed_cost) / days
+    fertilized = (
+        fertilized_output * price - rule.seed_cost
+        - _fertilizer_use_cost(state, fertilizer_units)
+    ) / days
+    return DailyValue(
+        normal, fertilized, max(normal, fertilized), days,
+        normal_output, fertilized_output, fertilizer_units)
+
+
+def next_animal_production_day(
+    raw: Mapping[str, object], day: int, *, strictly_after: bool = False
+) -> int | None:
     rule = rules.ANIMALS[str(raw["animal"])]
     first = int(raw["placed_day"]) + rule.first_yield_day - 1
-    candidate = max(day, first)
+    candidate = max(day + int(strictly_after), first)
     remainder = (candidate - first) % rule.interval
     if remainder:
         candidate += rule.interval - remainder
@@ -81,366 +184,8 @@ def next_animal_production_day(raw: Mapping[str, object], day: int) -> int | Non
     return candidate if candidate <= last_refresh_day else None
 
 
-def _production_step(production_day: int | None) -> int | None:
-    return None if production_day is None else (
-        production_day + 1) * rules.TURNS_PER_DAY
-
-
-def _production_is_cashable(state: State, tile: Position,
-                            output_step: int | None) -> bool:
-    if output_step is None:
-        return False
-    distance = rules.distance_to_shed(tile, state.board_size)
-    earliest_drop = output_step + 2 * distance + 2
-    return earliest_drop <= rules.TERMINAL_ACTION_STEP
-
-
-def _minimal_feed_days(raw: Mapping[str, object], start_day: int,
-                       production_day: int) -> tuple[int, ...]:
-    consecutive = int(raw.get("consecutive_unfed", 0))
-    result = []
-    for day in range(start_day, production_day + 1):
-        if day == start_day and bool(raw.get("fed_today", False)):
-            consecutive = 0
-        elif consecutive >= 1:
-            result.append(day)
-            consecutive = 0
-        else:
-            consecutive += 1
-    return tuple(result)
-
-
-def _animal_output_days(raw: Mapping[str, object], start_day: int,
-                        last_output_step: int) -> Iterable[int]:
-    day = next_animal_production_day(raw, start_day)
-    interval = rules.ANIMALS[str(raw["animal"])].interval
-    while day is not None and (day + 1) * 24 < last_output_step:
-        yield day
-        day += interval
-
-
-def _crop_output_days(raw: Mapping[str, object], start_day: int,
-                      last_output_step: int) -> Iterable[int]:
-    crop = str(raw["crop"])
-    rule = rules.CROPS[crop]
-    if not rule.ongoing:
-        return
-    first = int(raw["planted_day"]) + rule.first_yield_day - 1
-    day = max(start_day, first)
-    while (day + 1) * 24 < last_output_step:
-        age = day + 1 - int(raw["planted_day"]) - rule.first_yield_day
-        if age >= 0 and age % rule.interval == 0:
-            count = age // rule.interval + 1
-            if count <= rule.max_yield:
-                yield day
-        day += 1
-
-
-def _base_supply_calendar(state: State, last_step: int
-                          ) -> Mapping[str, Mapping[int, int]]:
-    calendar = defaultdict(lambda: defaultdict(int))
-    for animal in (*state.own.animals, *state.opp.visible_animals):
-        product = rules.ANIMALS[animal.asset_type].product
-        for day in _animal_output_days(animal.official, state.day, last_step):
-            calendar[product][(day + 1) * 24] += 1
-    for crop in (*state.own.crops, *state.opp.visible_crops):
-        for day in _crop_output_days(crop.official, state.day, last_step):
-            calendar[crop.asset_type][(day + 1) * 24] += 1
-    return {product: dict(events) for product, events in calendar.items()}
-
-
-def _forecast_inventory(state: State, product: str, output_step: int,
-                        supply, demand) -> int:
-    inventory = int(state.market.inventory.get(product, rules.MARKET_I0))
-    inventory += sum(quantity for step, quantity in
-                     supply.get(product, {}).items() if step < output_step)
-    inventory -= sum(quantity for step, quantity in demand.get(product, ())
-                     if step <= output_step)
-    return inventory
-
-
-def _cycle_value(state: State, asset: AssetState, output_step: int | None,
-                 supply, demand, incremental_hire_cost: int
-                 ) -> AnimalCycleValue:
-    raw = asset.official
-    product = rules.ANIMALS[asset.asset_type].product
-    opening = int(state.market.inventory.get(product, rules.MARKET_I0))
-    if output_step is None or not _production_is_cashable(
-            state, asset.position, output_step):
-        return AnimalCycleValue(output_step, opening, 0, 0, 0, 0)
-    production_day = output_step // 24 - 1
-    feed_days = _minimal_feed_days(raw, state.day, production_day)
-    wheat_units = len(feed_days)
-    wheat_cost = buy_cost("WHEAT", wheat_units,
-                          int(state.market.inventory.get(
-                              "WHEAT", rules.MARKET_I0)))
-    forecast = _forecast_inventory(state, product, output_step, supply, demand)
-    value = sell_revenue(product, 1, forecast)
-    hire_cost = max(0, incremental_hire_cost)
-    return AnimalCycleValue(output_step, forecast, value, wheat_units,
-                            wheat_cost, hire_cost)
-
-
-def _care_decision(state: State, asset: AssetState, cycle: AnimalCycleValue,
-                   incremental_hire_cost: int
-                   ) -> tuple[bool, int, int | None]:
-    raw = asset.official
-    rule = rules.ANIMALS[asset.asset_type]
-    if (cycle.next_production_step is None or cycle.product_value <= 0 or
-            int(raw.get("pending_care_bonus", 0)) > 0 or
-            bool(raw.get("cared_today", False))):
-        return False, 0, None
-    production_day = cycle.next_production_step // 24 - 1
-    if production_day <= state.day:
-        return False, 0, None
-    held = int(raw.get("yield_units", 0))
-    if held + 2 > rule.max_held:
-        return False, 0, None
-
-    base_feed = set(_minimal_feed_days(raw, state.day, production_day))
-    reusable = sorted(day for day in base_feed if day < production_day)
-    care_day = reusable[0] if reusable else state.day
-    care_feed = {care_day, production_day}
-    extra_wheat_units = len(care_feed - base_feed)
-    extra_wheat_cost = buy_cost(
-        "WHEAT", extra_wheat_units,
-        int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
-    after_base_inventory = cycle.forecast_inventory
-    if rules.market_price(rule.product, after_base_inventory) > rules.PRICE_FLOOR:
-        after_base_inventory += 1
-    bonus_value = sell_revenue(rule.product, 1, after_base_inventory)
-    hire_cost = max(0, incremental_hire_cost)
-    gain = bonus_value - extra_wheat_cost - hire_cost
-    return gain > 0, gain, care_day * rules.TURNS_PER_DAY
-
-
-def animal_locality_bonus(asset_type: str, tile: Position, day: int,
-                          board_size: int = rules.BOARD_SIZE,
-                          params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS) -> float:
-    if asset_type not in rules.ANIMALS:
-        return 0.0
-    if day <= params.locality_full_through_day:
-        day_factor = 1.0
-    elif day >= params.locality_zero_day:
-        day_factor = 0.0
-    else:
-        span = params.locality_zero_day - params.locality_full_through_day
-        day_factor = (params.locality_zero_day - day) / span
-    distance = rules.distance_to_shed(tile, board_size)
-    distance_factor = max(0.0, 1.0 - distance /
-                          max(1, params.locality_distance_span))
-    return params.locality_peak_bonus * day_factor * distance_factor
-
-
-def _decision_event(state: State, raw: Mapping[str, object],
-                    prior: CurrentAssetState | None, shops_changed: bool,
-                    replacement_advantage: int,
-                    next_production_step: int | None,
-                    next_production_cashable: bool) -> str | None:
-    if prior is None:
-        return "ATTACH"
-    if int(raw.get("placed_day", -1)) != int(
-            prior.official.get("placed_day", -1)):
-        return "ATTACH"
-    if shops_changed:
-        return "SHOP_REVEAL"
-    if (prior.next_production_step is not None and
-            state.step >= prior.next_production_step):
-        return "PRODUCTION"
-    if int(raw.get("yield_units", 0)) != prior.held_quantity:
-        return "HELD_CAPACITY_CHANGE"
-    if replacement_advantage > 0 and (
-            prior.replacement_advantage <= 0 or
-            replacement_advantage != prior.replacement_advantage):
-        return "REPLACEMENT"
-    if ((next_production_step is None and
-         prior.next_production_step is not None) or
-            (prior.next_production_cashable and
-             not next_production_cashable)):
-        return "TERMINAL"
-    return None
-
-
-def _animal_current_state(
-    state: State, asset: AssetState, prior: CurrentAssetState | None,
-    shops_changed: bool, inputs: AnimalDecisionInputs, supply, demand, *,
-    force_exit: bool = False,
-) -> CurrentAssetState:
-    raw = dict(asset.official)
-    identifier = _asset_id(asset)
-    rule = rules.ANIMALS[asset.asset_type]
-    held = int(raw.get("yield_units", 0))
-    production_day = next_animal_production_day(raw, state.day)
-    next_step = _production_step(production_day)
-    next_cashable = _production_is_cashable(
-        state, asset.position, next_step)
-    replacement = inputs.replacement_at(asset.position)
-    decision_reason = "FORCED_REPLACEMENT" if force_exit else _decision_event(
-        state, raw, prior, shops_changed, replacement, next_step,
-        next_cashable)
-
-    if decision_reason is None and prior is not None:
-        mode = prior.animal_mode or MAINTAIN
-        base_gain = prior.base_gain if prior.base_gain is not None else 0
-        replacement = prior.replacement_advantage
-        care_approved = prior.care_approved
-        care_gain = prior.care_gain
-        care_step = prior.care_step
-        next_step = prior.next_production_step
-        next_cashable = prior.next_production_cashable
-    else:
-        cycle = _cycle_value(
-            state, asset, next_step, supply, demand,
-            inputs.hire_cost_for(
-                inputs.base_incremental_hire_costs, identifier))
-        base_gain = cycle.base_gain
-        mode = EXIT if force_exit or base_gain <= replacement else MAINTAIN
-        if mode == MAINTAIN:
-            care_approved, care_gain, care_step = _care_decision(
-                state, asset, cycle,
-                inputs.hire_cost_for(
-                    inputs.care_incremental_hire_costs, identifier))
-        else:
-            care_approved, care_gain, care_step = False, 0, None
-
-    consecutive = int(raw.get("consecutive_unfed", 0))
-    fed = bool(raw.get("fed_today", False))
-    fertilizer = bool(raw.get("fertilizer_available", False))
-    today: list[ProgrammeEvent] = []
-    next_events: list[ProgrammeEvent] = []
-    end = _day_end(state)
-
-    if mode == MAINTAIN:
-        production_today = (next_step is not None and
-                            next_step == (state.day + 1) * 24)
-        care_today = (care_approved and care_step is not None and
-                      care_step // 24 == state.day and
-                      not raw.get("cared_today", False) and
-                      int(raw.get("pending_care_bonus", 0)) == 0)
-        realize_pending = (production_today and
-                           int(raw.get("pending_care_bonus", 0)) > 0)
-        must_feed = not fed and consecutive >= 1
-        if not fed and (must_feed or care_today or realize_pending):
-            today.append(_event(
-                state.step, 20, identifier + ":feed", "FEED",
-                tile=asset.position, asset_id=identifier, item="WHEAT",
-                quantity=1, action=("FEED",), mandatory=True,
-                deadline=end, source=("MINIMUM_MAINTENANCE" if must_feed
-                                      else "CARE_CYCLE")))
-        if care_today:
-            today.append(_event(
-                state.step, 21, identifier + ":care", "CARE",
-                tile=asset.position, asset_id=identifier, action=("CARE",),
-                mandatory=True, deadline=end, source="CARE_CYCLE"))
-
-    projected_raw = dict(raw)
-    if any(event.kind == "FEED" for event in today):
-        projected_raw["fed_today"] = True
-    production_tonight = next_step == (state.day + 1) * 24
-    incoming = (rules.animal_production_on_refresh(projected_raw, state.day)
-                if production_tonight else 0)
-    overflow = incoming > 0 and held + incoming > rule.max_held
-    terminal_liquidation = state.day >= 29 and held > 0
-    exit_stage = mode == EXIT and consecutive >= 1 and not fed
-    planned_visit = bool(today)
-
-    if mode == EXIT and held:
-        liquidation = sell_revenue(
-            rule.product, held,
-            int(state.market.inventory.get(rule.product, rules.MARKET_I0)))
-        hire_cost = inputs.hire_cost_for(
-            inputs.liquidation_incremental_hire_costs, identifier)
-        if planned_visit or exit_stage or liquidation > hire_cost:
-            today.append(_event(
-                state.step, 30, identifier + ":liquidate", "HARVEST",
-                tile=asset.position, asset_id=identifier, item=rule.product,
-                quantity=held, action=("HARVEST",), deadline=end,
-                source="EXIT_LIQUIDATION"))
-            planned_visit = True
-    elif held and (overflow or terminal_liquidation):
-        harvest_reason = ("HELD_OVERFLOW" if overflow else
-                          "TERMINAL_LIQUIDATION")
-        today.append(_event(
-            state.step, 30, identifier + ":harvest:" + harvest_reason,
-            "HARVEST", tile=asset.position, asset_id=identifier,
-            item=rule.product, quantity=held, action=("HARVEST",),
-            deadline=end, source=harvest_reason))
-        planned_visit = True
-
-    if fertilizer and planned_visit:
-        today.append(_event(
-            state.step, 35, identifier + ":collect-f", "COLLECT_F",
-            tile=asset.position, asset_id=identifier, item="FERTILIZER",
-            quantity=1, action=("COLLECT_FERTILIZER",), mandatory=False,
-            deadline=end, source="VISIT_ONLY"))
-
-    survives_refresh = mode != EXIT or consecutive < 1 or fed
-    if production_tonight and survives_refresh:
-        held_before_output = 0 if overflow else held
-        quantity = min(rule.max_held - held_before_output, incoming)
-        if quantity > 0:
-            next_events.append(_event(
-                next_step, 0, identifier + ":next-output", "OUTPUT",
-                tile=asset.position, asset_id=identifier, item=rule.product,
-                quantity=quantity, mandatory=False,
-                source="OFFICIAL_REFRESH"))
-    if survives_refresh:
-        next_events.append(_event(
-            (state.day + 1) * 24, 1, identifier + ":next-fertilizer",
-            "F_AVAILABLE", tile=asset.position, asset_id=identifier,
-            item="FERTILIZER", quantity=1, mandatory=False,
-            source="OFFICIAL_REFRESH"))
-
-    release = None
-    if mode == EXIT:
-        nights = 3 if fed else 1 if consecutive >= 1 else 2
-        release = min((state.day + nights) * 24,
-                      rules.TERMINAL_ACTION_STEP + 1)
-    elif production_day is not None:
-        feed_days = _minimal_feed_days(raw, state.day, production_day)
-        if feed_days:
-            next_feed_day = feed_days[0]
-            next_events.append(_event(
-                max(state.step, next_feed_day * 24), 20,
-                identifier + ":next-maintenance", "FEED_DUE",
-                tile=asset.position, asset_id=identifier, item="WHEAT",
-                quantity=1, mandatory=True,
-                deadline=min(next_feed_day * 24 + 23,
-                             rules.TERMINAL_ACTION_STEP),
-                source="MAINTAIN"))
-
-    economic_exit_step = None
-    if mode == EXIT:
-        economic_exit_step = (
-            prior.economic_exit_step
-            if prior is not None and prior.animal_mode == EXIT
-            else state.step)
-
-    return CurrentAssetState(
-        asset_id=identifier, asset_type=asset.asset_type, tile=asset.position,
-        official=raw, held_product=rule.product, held_quantity=held,
-        animal_mode=mode, base_gain=base_gain,
-        replacement_advantage=replacement, care_approved=care_approved,
-        care_gain=care_gain, care_step=care_step,
-        decision_event=decision_reason, next_production_step=next_step,
-        next_production_cashable=next_cashable,
-        today_events=tuple(sorted(today)), next_events=tuple(sorted(next_events)),
-        economic_exit_step=economic_exit_step,
-        physical_release_step=release,
-    )
-
-
-def exit_current_asset(
-    state: State, asset: AssetState,
-    inputs: AnimalDecisionInputs | None = None,
-) -> CurrentAssetState:
-    next_step = _production_step(next_animal_production_day(
-        asset.official, state.day))
-    demand = known_demand_events(state, end_step=next_step or state.step)
-    supply = _base_supply_calendar(state, next_step or state.step)
-    return _animal_current_state(
-        state, asset, None, False, inputs or AnimalDecisionInputs(),
-        supply, demand, force_exit=True)
+def _production_step(day: int | None) -> int | None:
+    return None if day is None else (day + 1) * rules.TURNS_PER_DAY
 
 
 def _next_crop_production_day(raw: Mapping[str, object], day: int) -> int | None:
@@ -456,7 +201,273 @@ def _next_crop_production_day(raw: Mapping[str, object], day: int) -> int | None
     return candidate if candidate <= 28 else None
 
 
-def _crop_current_state(state: State, asset: AssetState) -> CurrentAssetState:
+def _care_gain(state: State, asset: AssetState) -> tuple[int, bool]:
+    raw = asset.official
+    rule = rules.ANIMALS[asset.asset_type]
+    if bool(raw.get("cared_today", False)):
+        return 0, False
+    if int(raw.get("pending_care_bonus", 0)) > 0:
+        return _price(state, rule.product), True
+    production_day = next_animal_production_day(
+        raw, state.day, strictly_after=True)
+    if production_day is None:
+        return 0, False
+    held = int(raw.get("yield_units", 0))
+    # The next base unit and one CARE unit must both fit.
+    if held + 2 > rule.max_held:
+        return 0, False
+    extra_wheat = 0 if (
+        bool(raw.get("fed_today", False))
+        or int(raw.get("consecutive_unfed", 0)) >= 1
+    ) else 1
+    wheat_cost = buy_cost(
+        "WHEAT", extra_wheat,
+        int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
+    gain = _price(state, rule.product) - wheat_cost
+    return gain, gain > 0
+
+
+def animal_locality_bonus(
+    asset_type: str,
+    tile: Position,
+    day: int,
+    board_size: int = rules.BOARD_SIZE,
+    params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+) -> float:
+    if asset_type not in rules.ANIMALS:
+        return 0.0
+    if day <= params.locality_full_through_day:
+        day_factor = 1.0
+    elif day >= params.locality_zero_day:
+        day_factor = 0.0
+    else:
+        span = params.locality_zero_day - params.locality_full_through_day
+        day_factor = (params.locality_zero_day - day) / span
+    distance = rules.distance_to_shed(tile, board_size)
+    distance_factor = max(
+        0.0, 1.0 - distance / max(1, params.locality_distance_span))
+    return params.locality_peak_bonus * day_factor * distance_factor
+
+
+def _animal_current_state(
+    state: State,
+    asset: AssetState,
+    prior: CurrentAssetState | None,
+    params: MidgameParameters,
+) -> CurrentAssetState:
+    raw = dict(asset.official)
+    identifier = _asset_id(asset)
+    rule = rules.ANIMALS[asset.asset_type]
+    held = int(raw.get("yield_units", 0))
+    daily = animal_daily_value(state, asset.asset_type, params)
+    care_gain, care_possible = _care_gain(state, asset)
+    production_day = next_animal_production_day(raw, state.day)
+
+    # EXIT is sticky until the official escape transition releases the tile.
+    if prior is not None and prior.mode == EXIT:
+        mode = EXIT
+    elif daily <= 0 or production_day is None:
+        mode = EXIT
+    elif care_possible:
+        mode = PRODUCE
+    else:
+        mode = MAINTAIN
+
+    end = _day_end(state)
+    today: list[ProgrammeEvent] = []
+    next_events: list[ProgrammeEvent] = []
+    consecutive = int(raw.get("consecutive_unfed", 0))
+    fed = bool(raw.get("fed_today", False))
+    production_step = _production_step(production_day)
+    production_tonight = production_step == (state.day + 1) * 24
+
+    if mode != EXIT:
+        realize_pending = (
+            production_tonight
+            and int(raw.get("pending_care_bonus", 0)) > 0)
+        minimum_feed = not fed and consecutive >= 1
+        care_target_day = next_animal_production_day(
+            raw, state.day, strictly_after=True)
+        start_care = (
+            mode == PRODUCE and care_possible
+            and int(raw.get("pending_care_bonus", 0)) == 0
+            and care_target_day is not None)
+        if not fed and (minimum_feed or realize_pending or start_care):
+            today.append(_event(
+                state.step, 20, identifier + ":feed", "FEED",
+                tile=asset.position, asset_id=identifier, item="WHEAT",
+                quantity=1, action=("FEED",), deadline=end,
+                source=("MINIMUM_MAINTENANCE" if minimum_feed
+                        else "PRODUCTION_CYCLE")))
+        if start_care:
+            today.append(_event(
+                state.step, 21, identifier + ":care", "CARE",
+                tile=asset.position, asset_id=identifier,
+                action=("CARE",), deadline=end, source="PRODUCTION_CYCLE"))
+
+    projected = dict(raw)
+    if any(event.kind == "FEED" for event in today):
+        projected["fed_today"] = True
+    incoming = (
+        rules.animal_production_on_refresh(projected, state.day)
+        if production_tonight else 0)
+    overflow = incoming > 0 and held + incoming > rule.max_held
+
+    if mode == EXIT and held > 0:
+        today.append(_event(
+            state.step, 30, identifier + ":liquidate", "HARVEST",
+            tile=asset.position, asset_id=identifier, item=rule.product,
+            quantity=held, action=("HARVEST",), deadline=end,
+            source="EXIT_LIQUIDATION"))
+    elif held > 0 and (overflow or state.day >= 29):
+        source = "HELD_OVERFLOW" if overflow else "TERMINAL_LIQUIDATION"
+        today.append(_event(
+            state.step, 30, identifier + ":harvest", "HARVEST",
+            tile=asset.position, asset_id=identifier, item=rule.product,
+            quantity=held, action=("HARVEST",), deadline=end, source=source))
+
+    fertilizer_available = bool(raw.get("fertilizer_available", False))
+    if fertilizer_available and (
+        mode == EXIT or bool(today)
+    ) and conservative_f_price(state, params) > 0:
+        today.append(_event(
+            state.step, 35, identifier + ":collect-f", "COLLECT_F",
+            tile=asset.position, asset_id=identifier, item="FERTILIZER",
+            quantity=1, action=("COLLECT_FERTILIZER",), deadline=end,
+            source=("EXIT_LIQUIDATION" if mode == EXIT else "VISIT_ONLY")))
+
+    survives = mode != EXIT or consecutive < 1 or fed
+    if production_tonight and survives and incoming > 0:
+        held_after_harvest = 0 if any(
+            event.kind == "HARVEST" for event in today) else held
+        quantity = min(rule.max_held - held_after_harvest, incoming)
+        if quantity > 0:
+            next_events.append(_event(
+                production_step, 0, identifier + ":next-output", "OUTPUT",
+                tile=asset.position, asset_id=identifier, item=rule.product,
+                quantity=quantity, mandatory=False,
+                source="OFFICIAL_REFRESH"))
+    if survives:
+        next_events.append(_event(
+            (state.day + 1) * 24, 1, identifier + ":next-f", "F_AVAILABLE",
+            tile=asset.position, asset_id=identifier, item="FERTILIZER",
+            quantity=1, mandatory=False, source="OFFICIAL_REFRESH"))
+
+    release = None
+    liquidation = None
+    if mode == EXIT:
+        liquidation = state.step
+        nights = 1 if consecutive >= 1 and not fed else 2
+        release = min(
+            (state.day + nights) * 24,
+            rules.TERMINAL_ACTION_STEP + 1)
+
+    return CurrentAssetState(
+        asset_id=identifier,
+        asset_type=asset.asset_type,
+        tile=asset.position,
+        official=raw,
+        held_product=rule.product,
+        held_quantity=held,
+        mode=mode,
+        daily_value=daily,
+        care_approved=(mode == PRODUCE and care_possible),
+        input_gain=care_gain,
+        next_production_step=production_step,
+        today_events=tuple(sorted(today)),
+        next_events=tuple(sorted(next_events)),
+        liquidation_step=liquidation,
+        physical_release_step=release,
+    )
+
+
+def _one_time_plan(
+    state: State, asset: AssetState
+) -> tuple[int | None, bool, bool, int]:
+    """Return harvest day, WATER today, FERTILIZE today, incremental gain."""
+    raw = asset.official
+    crop = asset.asset_type
+    rule = rules.CROPS[crop]
+    planted = int(raw["planted_day"])
+    age = state.day - planted
+    held = int(raw.get("yield_units", 0))
+    first_day = planted + rule.first_yield_day
+    last_day = min(planted + rule.max_yield_day, 29)
+    if crop in {"WHEAT", "CARROT"}:
+        reveal = next_reveal(state.day)
+        last_day = min(last_day, reveal)
+    candidates = range(max(state.day, first_day), last_day + 1)
+    price = _price(state, crop)
+    land_daily = max(
+        0.0,
+        *(animal_daily_value(state, animal)
+          for animal in rules.ANIMALS),
+        *(crop_daily_value(state, candidate).selected
+          for candidate in ("TOMATO", "STRAWBERRY", "MELON")),
+    )
+    if state.day >= first_day and state.day > last_day and held > 0:
+        return state.day, False, False, held * price
+    best: tuple[int, int, int, bool, bool] | None = None
+    for harvest_day in candidates:
+        for use_f in (False, True):
+            quantity = held
+            applications = 0
+            covered = int(raw.get("fertilized_until_day", -1))
+            for day in range(state.day, harvest_day + 1):
+                day_age = day - planted
+                window_start = (rule.max_yield_day + 1) // 2
+                if not window_start <= day_age <= rule.max_yield_day:
+                    continue
+                if quantity >= rule.max_yield:
+                    continue
+                if use_f and day > covered:
+                    applications += 1
+                    covered = day + 2
+                quantity += min(
+                    2 if covered >= day else 1,
+                    rule.max_yield - quantity)
+            value = (
+                quantity * price
+                - _fertilizer_use_cost(state, applications)
+                - (harvest_day - state.day) * land_daily)
+            # Prefer earlier harvest, then no F, on exact cash ties.
+            candidate = (
+                value, -harvest_day, int(not use_f),
+                use_f, harvest_day == state.day)
+            if best is None or candidate[:3] > best[:3]:
+                best = candidate
+    if best is None:
+        return None, False, False, 0
+    _, neg_day, _, use_f, harvest_now = best
+    harvest_day = -neg_day
+    productive_water = rules.one_time_water_gain(
+        crop,
+        planted_day=planted,
+        day=state.day,
+        yield_units=held,
+        fertilized_until_day=(
+            state.day + 2 if use_f else
+            int(raw.get("fertilized_until_day", -1))),
+        watered_today=bool(raw.get("watered_today", False)),
+    ) > 0
+    water = (
+        not harvest_now
+        and not bool(raw.get("watered_today", False))
+        and (
+            productive_water
+            or int(raw.get("consecutive_unwatered", 0)) >= 1
+        )
+    )
+    fertilize = (
+        water and productive_water and use_f
+        and int(raw.get("fertilized_until_day", -1)) < state.day)
+    baseline = held * price if age >= rule.first_yield_day else 0
+    return harvest_day, water, fertilize, best[0] - baseline
+
+
+def _crop_current_state(
+    state: State, asset: AssetState
+) -> CurrentAssetState:
     raw = dict(asset.official)
     identifier = _asset_id(asset)
     crop = asset.asset_type
@@ -465,35 +476,133 @@ def _crop_current_state(state: State, asset: AssetState) -> CurrentAssetState:
     end = _day_end(state)
     today: list[ProgrammeEvent] = []
     next_events: list[ProgrammeEvent] = []
-    if (not raw.get("watered_today", False) and
-            int(raw.get("consecutive_unwatered", 0)) >= 1):
-        today.append(_event(
-            state.step, 20, identifier + ":water", "WATER",
-            tile=asset.position, asset_id=identifier, action=("WATER",),
-            deadline=end, source="SURVIVAL"))
-    next_day = _next_crop_production_day(raw, state.day)
-    if next_day is not None:
-        next_events.append(_event(
-            max(state.step, next_day * 24), 0, identifier + ":next-output",
-            "OUTPUT_DUE", tile=asset.position, asset_id=identifier,
-            item=crop, quantity=1, mandatory=False,
-            source="OFFICIAL_REFRESH"))
-    mature = state.day - int(raw.get("planted_day", state.day)) >= rule.first_yield_day
-    terminal = state.day >= 29
-    expiring = int(raw.get("max_lifespan_step", -1)) in range(
-        state.step, end + 2)
-    release = None
-    if held and mature and (terminal or expiring):
-        today.append(_event(
-            state.step, 30, identifier + ":harvest", "HARVEST",
-            tile=asset.position, asset_id=identifier, item=crop,
-            quantity=held, action=("HARVEST",), deadline=end,
-            source="TERMINAL" if terminal else "EXPIRY"))
-        if not rule.ongoing:
-            release = min(state.step + 1, rules.TERMINAL_ACTION_STEP + 1)
+    value = crop_daily_value(state, crop)
+    input_gain = 0
+    next_harvest = None
+    mode = GROW
+
+    if rule.ongoing:
+        production_day = _next_crop_production_day(raw, state.day)
+        production_step = _production_step(production_day)
+        production_tonight = production_step == (state.day + 1) * 24
+        incoming = (
+            rules.crop_production_on_refresh(raw, state.day)
+            if production_tonight else 0)
+        terminal = state.day >= 29
+        survival_water = (
+            not terminal
+            and
+            not bool(raw.get("watered_today", False))
+            and int(raw.get("consecutive_unwatered", 0)) >= 1)
+        fertilized = int(raw.get("fertilized_until_day", -1)) >= state.day
+        fertilize = False
+        bonus_water = False
+        if (not terminal and production_tonight
+                and not bool(raw.get("watered_today", False))):
+            if fertilized:
+                input_gain = _price(state, crop)
+                bonus_water = input_gain > 0
+            else:
+                input_gain = (
+                    _price(state, crop)
+                    - _fertilizer_use_cost(state, 1))
+                fertilize = input_gain > 0
+                bonus_water = fertilize
+        if fertilize:
+            today.append(_event(
+                state.step, 18, identifier + ":fertilize", "FERTILIZE",
+                tile=asset.position, asset_id=identifier,
+                item="FERTILIZER", quantity=1, action=("FERTILIZE",),
+                deadline=end, source="NEXT_PRODUCTION"))
+        if survival_water or bonus_water:
+            today.append(_event(
+                state.step, 20, identifier + ":water", "WATER",
+                tile=asset.position, asset_id=identifier,
+                action=("WATER",), deadline=end,
+                source=("SURVIVAL" if survival_water else
+                        "NEXT_PRODUCTION")))
+        projected = dict(raw)
+        if survival_water or bonus_water:
+            projected["watered_today"] = True
+        if fertilize:
+            projected["fertilized_until_day"] = state.day + 2
+        incoming = (
+            rules.crop_production_on_refresh(projected, state.day)
+            if production_tonight else 0)
+        overflow = held > 0 and incoming > 0 and held + incoming > rule.max_yield
+        lifespan = int(raw.get("max_lifespan_step", -1))
+        expiring = 0 <= lifespan <= end
+        if held > 0 and (overflow or expiring or state.day >= 29):
+            source = (
+                "HELD_OVERFLOW" if overflow else
+                "TERMINAL_LIQUIDATION" if state.day >= 29 else "EXPIRY")
+            today.append(_event(
+                state.step, 30, identifier + ":harvest", "HARVEST",
+                tile=asset.position, asset_id=identifier, item=crop,
+                quantity=held, action=("HARVEST",), deadline=end,
+                source=source))
+            mode = HARVEST
+            next_harvest = state.step
+        elif production_step is not None:
+            next_events.append(_event(
+                production_step, 0, identifier + ":next-output",
+                "OUTPUT_DUE", tile=asset.position, asset_id=identifier,
+                item=crop, quantity=1, mandatory=False,
+                source="OFFICIAL_REFRESH"))
+    else:
+        harvest_day, water, fertilize, input_gain = _one_time_plan(
+            state, asset)
+        next_harvest = (
+            None if harvest_day is None else
+            max(state.step, harvest_day * rules.TURNS_PER_DAY))
+        if fertilize:
+            today.append(_event(
+                state.step, 18, identifier + ":fertilize", "FERTILIZE",
+                tile=asset.position, asset_id=identifier,
+                item="FERTILIZER", quantity=1, action=("FERTILIZE",),
+                deadline=end, source="MAX_DAILY_VALUE"))
+        if water:
+            today.append(_event(
+                state.step, 20, identifier + ":water", "WATER",
+                tile=asset.position, asset_id=identifier,
+                action=("WATER",), deadline=end,
+                source=("SURVIVAL" if int(
+                    raw.get("consecutive_unwatered", 0)) >= 1
+                    else "MAX_DAILY_VALUE")))
+        if harvest_day == state.day and held > 0:
+            source = (
+                "TERMINAL_LIQUIDATION" if state.day >= 29
+                else "CURRENT_HARVEST_VALUE")
+            today.append(_event(
+                state.step, 30, identifier + ":harvest", "HARVEST",
+                tile=asset.position, asset_id=identifier, item=crop,
+                quantity=held, action=("HARVEST",), deadline=end,
+                source=source))
+            mode = HARVEST
+        elif harvest_day is not None:
+            next_events.append(_event(
+                next_harvest, 0, identifier + ":next-harvest",
+                "HARVEST_DUE", tile=asset.position, asset_id=identifier,
+                item=crop, quantity=held, mandatory=False,
+                source="CURRENT_HARVEST_VALUE"))
+
+    release = (
+        min(state.step + 1, rules.TERMINAL_ACTION_STEP + 1)
+        if mode == HARVEST and not rule.ongoing else None)
     return CurrentAssetState(
-        asset_id=identifier, asset_type=crop, tile=asset.position,
-        official=raw, held_product=crop, held_quantity=held,
+        asset_id=identifier,
+        asset_type=crop,
+        tile=asset.position,
+        official=raw,
+        held_product=crop,
+        held_quantity=held,
+        mode=mode,
+        daily_value=value.selected,
+        input_gain=input_gain,
+        next_production_step=(
+            _production_step(_next_crop_production_day(raw, state.day))
+            if rule.ongoing else None),
+        next_harvest_step=next_harvest,
         today_events=tuple(sorted(today)),
         next_events=tuple(sorted(next_events)),
         physical_release_step=release,
@@ -501,47 +610,37 @@ def _crop_current_state(state: State, asset: AssetState) -> CurrentAssetState:
 
 
 def read_current_assets(
-    state: State, *,
+    state: State,
+    *,
     prior_assets: Iterable[CurrentAssetState] = (),
     prior_shops: Iterable[str] = (),
-    inputs: AnimalDecisionInputs | None = None,
+    params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
 ) -> tuple[CurrentAssetState, ...]:
-    inputs = inputs or AnimalDecisionInputs()
+    # Prior state is used only to keep an in-progress EXIT sticky.  Every other
+    # decision is derived from the same real observation path used at runtime.
+    del prior_shops
     prior = {asset.asset_id: asset for asset in prior_assets}
-    shops_changed = bool(prior) and tuple(prior_shops) != tuple(state.shops)
-    next_steps = {
-        _asset_id(asset): _production_step(next_animal_production_day(
-            asset.official, state.day))
-        for asset in state.own.animals
-    }
-    needs_rejudge = any(
-        _decision_event(
-            state, asset.official, prior.get(identifier), shops_changed,
-            inputs.replacement_at(asset.position), next_steps[identifier],
-            _production_is_cashable(
-                state, asset.position, next_steps[identifier])) is not None
-        for asset in state.own.animals
-        for identifier in (_asset_id(asset),)
-    )
-    if needs_rejudge:
-        horizon = max((step for step in next_steps.values()
-                       if step is not None), default=state.step)
-        supply = _base_supply_calendar(state, horizon)
-        demand = known_demand_events(state, end_step=horizon)
-    else:
-        # A frozen cycle does not rebuild its supply or demand forecast.
-        supply = {}
-        demand = {}
-    assets = []
-    for animal in state.own.animals:
-        identifier = _asset_id(animal)
-        assets.append(_animal_current_state(
-            state, animal, prior.get(identifier), shops_changed, inputs,
-            supply, demand))
-    assets.extend(_crop_current_state(state, asset)
-                  for asset in state.own.crops)
-    return tuple(sorted(assets, key=lambda asset: (
-        asset.tile[1], asset.tile[0], asset.asset_id)))
+    assets = [
+        _animal_current_state(
+            state, animal, prior.get(_asset_id(animal)), params)
+        for animal in state.own.animals
+    ]
+    assets.extend(_crop_current_state(state, crop)
+                  for crop in state.own.crops)
+    return tuple(sorted(
+        assets,
+        key=lambda asset: (asset.tile[1], asset.tile[0], asset.asset_id)))
+
+
+def exit_current_asset(
+    state: State,
+    asset: AssetState,
+    params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+) -> CurrentAssetState:
+    prior = CurrentAssetState(
+        _asset_id(asset), asset.asset_type, asset.position,
+        dict(asset.official), mode=EXIT)
+    return _animal_current_state(state, asset, prior, params)
 
 
 def current_asset_programmes(
@@ -549,13 +648,22 @@ def current_asset_programmes(
 ) -> tuple[AssetProgramme, ...]:
     result = []
     for current in current_assets:
-        service = tuple(event for event in current.today_events
-                        if event.kind != "HARVEST")
-        harvest = tuple(event for event in current.today_events
-                        if event.kind == "HARVEST")
+        service = tuple(
+            event for event in current.today_events
+            if event.kind != "HARVEST")
+        harvest = tuple(
+            event for event in current.today_events
+            if event.kind == "HARVEST")
         result.append(AssetProgramme(
-            current.asset_id, current.asset_type, current.tile,
-            "EXIT" if current.animal_mode == EXIT else "KEEP", True,
-            "CURRENT", current.physical_release_step, service, (), harvest,
+            current.asset_id,
+            current.asset_type,
+            current.tile,
+            "EXIT" if current.mode == EXIT else "KEEP",
+            True,
+            "CURRENT",
+            current.physical_release_step,
+            service,
+            (),
+            harvest,
         ))
     return tuple(result)

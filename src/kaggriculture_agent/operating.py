@@ -5,8 +5,8 @@ from dataclasses import dataclass, field, replace
 from typing import Mapping
 
 from . import rules
-from .market import known_demand_events, opponent_pressure, optimize_sales
-from .planner import _arrivals, make_plan
+from .market import optimize_short_sales
+from .planner import _arrivals, _shed_consumptions, make_plan
 from .programme import Programme
 from .realization import TurnDecision
 from .state import State
@@ -27,15 +27,6 @@ def programme_invalidation(state: State, programme: Programme) -> str | None:
             # A completed one-time harvest intentionally releases its tile.
             if not any(e.step < state.step for e in asset.harvest_schedule):
                 return f"kept {asset.asset_id} no longer exists"
-    snapshots = {asset.asset_id: asset for asset in programme.current_assets}
-    for animal in state.own.animals:
-        x, y = animal.position
-        snapshot = snapshots.get(
-            f"current:{animal.asset_type}:{x}:{y}")
-        if (snapshot is not None and
-                int(animal.official.get("yield_units", 0)) !=
-                snapshot.held_quantity):
-            return f"held capacity changed for {snapshot.asset_id}"
     return None
 
 
@@ -51,13 +42,20 @@ def _decision(state: State, programme: Programme) -> TurnDecision:
         elif event.kind == "BUY_LAND": orders.append(("BUY_LAND",))
         elif event.kind in {"BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT"}:
             orders.append((event.kind, event.item, event.quantity))
-    return TurnDecision(tuple(actions), tuple(orders[:rules.MAX_MARKET_ORDERS]))
+    assert len(orders) <= rules.MAX_MARKET_ORDERS
+    return TurnDecision(tuple(actions), tuple(orders))
 
 
 def _refresh_sales(state: State, programme: Programme) -> Programme:
     # All non-sale commitments, placements, services and staffing remain frozen.
-    sale = optimize_sales(state, _arrivals(state, programme),
-                          known_demand_events(state), opponent_pressure(state))
+    sale = optimize_short_sales(
+        state, _arrivals(state, programme),
+        consumptions=_shed_consumptions(programme),
+        commitments=programme.events)
+    if not sale.feasible:
+        return replace(
+            programme, feasible=False,
+            diagnostics={**programme.diagnostics, "failure": sale.failure})
     future = {step: amounts for step, amounts in sale.planned_sale.items() if step >= state.step}
     past = {step: amounts for step, amounts in programme.planned_sale.items() if step < state.step}
     return replace(programme, planned_sale={**past, **future},
@@ -83,7 +81,7 @@ class DailyPlanningSession:
         return prior
 
     def execution_for(self, state: State, programme: Programme) -> TurnDecision:
-        if programme.planned_sale.get(state.step):
+        if state.step % 4 == 0:
             programme = _refresh_sales(state, programme)
             self._plans[state.player] = programme
         return _decision(state, programme)

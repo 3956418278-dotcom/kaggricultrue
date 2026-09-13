@@ -17,27 +17,30 @@ observation -> canonical State -> macro Programme -> intraday executor -> action
 
 `State` retains private own state, public opponent state, complete official
 animal/crop tile records, market inventory/prices, shops, land and worker state.
-`Programme` freezes KEEP/EXIT/NEW assets, exact tiles, service/output/harvest/
-stock/sale schedules, feed and buffer Wheat, Carrot buffers, fertilizer flows,
-land+use commitments, worker count, zones and routes.
+`Programme` freezes the current day's KEEP/EXIT/NEW assets, exact tiles,
+service/harvest commitments, land use, staffing, routes, route-proven DROP
+arrivals, and short-horizon sales. Existing assets remain observation-backed
+short states rather than terminal programmes.
 
 ## Implemented D11+ mechanisms
 
 - discrete known Town/shop demand events and the fixed reveal calendar;
-- visible existing-opponent base pressure without opponent route/new-strategy
-  prediction;
-- sequential official-price BUY/SELL accounting and event sale DP;
-- separated farm, field, worker, shed, sale and shared-market trajectories;
-- event-driven existing-animal MAINTAIN/EXIT decisions using only the next
-  production cycle, with frozen state between explicit key events;
-- separate one-cycle CARE checks, held-capacity harvest gates, bounded EXIT
-  liquidation tails, and minimum official survival FEED;
-- W_FEED sourcing, W/C/EMPTY buffers, exact-tile long candidates, WAIT_REVEAL,
-  and combined BUY_LAND+exact-use comparisons;
-- minimum feasible staffing search, exact pickups, bundled fixed-tile tasks,
-  INNER/OUTER derivation, nearest-neighbor outer sweep and strict 2-opt;
-- complete final pinned-rule replay and intraday programme freezing, with only
-  remaining sales re-solved at a real sale checkpoint.
+- current-price animal/crop daily-value formulas with discounted realizable F;
+- observation-backed animal PRODUCE/MAINTAIN/EXIT, minimum survival FEED,
+  one-cycle CARE, held-capacity harvest gates, and a two-night EXIT tail;
+- event-local decisions for existing Wheat/Carrot/Melon/Tomato/Strawberry;
+- feed sourcing from real stock or route-proven mature Wheat, followed only by
+  direct Wheat purchase for any deficit; no feed-purpose crop is created;
+- global seed accounting, positive current-value long-asset placement,
+  low-cost NOW/WAIT comparison, decaying animal locality ranking, and
+  scale-based land purchase;
+- restored runnable daily intraday assignment with exact PICKUP/DROP routes and
+  minimum feasible same-day staffing;
+- a runtime trade machine that re-reads real inventory every four turns and
+  evaluates only NOW/+4/+8, enforcing overflow, cash, terminal, and ten-order
+  constraints before discretionary timing;
+- the terminal sale DP remains available only for offline comparison and is not
+  on the submitted runtime path.
 
 The former `economics.py`, fixed programme/pace tables, generic D11+ heuristic
 planner and valuation layer are deleted. Frozen player-day research records use
@@ -45,23 +48,18 @@ an evaluation-local schema and do not enter the submitted strategy.
 
 ## Validation
 
-- 16 focused current-asset regressions pass. They cover attach-anytime behavior,
-  frozen no-event days,
-  shop/production/harvest/replacement triggers, long-cycle Cow valuation,
-  CARE capacity, EXIT liquidation, held-product harvest gates, unified land
-  placement, and locality decay.
-- The repository suite currently passes 67 of 69 tests. The two errors are the
-  existing D11 controller checks that call the intentionally disconnected
-  `intraday.solve_intraday` zonal integration stub; this current-asset change
-  does not modify that subsystem.
-- A prior synthetic empty D11 baseline produced and fully replayed a feasible
-  programme with 3 Cow, 1 Sheep and 4 W_FEED tiles before the intraday routing
-  replacement was disconnected.
+- The repository suite passes 93 tests, including the pinned environment,
+  controller, seed ledger, asset modes, crop inputs, EXIT liquidation,
+  short-horizon trade, order-limit, and runnable intraday regressions.
+- Three uncaught-exception full pinned episodes (seeds 119-121) completed through
+  D30 against PASS. Across each D11-D30 run, planner calls totaled 0.031-0.036s
+  with observed maximum calls at or below 0.0033s. These are integration smoke checks,
+  not competitive evidence.
 
 ## Limiting issue
 
-Runtime acceptance is not established. The zonal replacement currently leaves
-`intraday.solve_intraday` disconnected, so full programme replay and episode
-timing cannot be accepted. No claim of a complete runtime-ready controller or
-competitive strength is accepted until that separate subsystem is connected
-and a full pinned episode finishes without timeout or fallback passes.
+The production runtime is executable, but its intraday implementation is the
+restored pre-zonal daily executor; the hand-authored zonal template library is
+still independent and is intentionally not connected by this change. D5-D10
+also remain the previously declared PASS interval. No competitive strength or
+accepted-baseline claim has been established.

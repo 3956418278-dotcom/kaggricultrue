@@ -51,7 +51,8 @@ def _orders(programme: Programme, state: State):
             orders.append(("BUY_LAND",))
         elif event.kind == "HIRE":
             orders.extend(("HIRE",) for _ in range(event.quantity))
-    return tuple(orders[:rules.MAX_MARKET_ORDERS])
+    assert len(orders) <= rules.MAX_MARKET_ORDERS
+    return tuple(orders)
 
 
 def drop_arrivals(state: State, programme: Programme):

@@ -63,7 +63,7 @@ class D11ControllerTests(unittest.TestCase):
         self.assertEqual(solved.events_at(240)[0].tile,(0,0))
         self.assertTrue(all(route.actions for route in solved.routes))
         covered={step for route in solved.routes if route.worker==0 for step in route.actions}
-        self.assertEqual(covered,set(range(240,719)))
+        self.assertEqual(covered,set(range(240,264)))
 
     def test_simulator_keeps_production_and_market_inventory_separate(self):
         plan=Programme(240,10,())

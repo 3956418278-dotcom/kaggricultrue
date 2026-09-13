@@ -139,6 +139,8 @@ class SalePlan:
     revenue: int
     planned_sale: Mapping[int, Mapping[str, int]]
     market_inventory: Mapping[int, Mapping[str, int]]
+    feasible: bool = True
+    failure: str | None = None
 
 
 _PRODUCT_DP_CACHE = {}
@@ -402,4 +404,431 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                 if rules.market_price(product, inventory) > rules.PRICE_FLOOR:
                     inventory += 1
             trajectory[step][product] = inventory
+    return SalePlan(revenue, dict(planned), dict(trajectory))
+
+
+def _sale_inventory_after(product: str, quantity: int, inventory: int
+                          ) -> tuple[int, int]:
+    revenue = 0
+    for _ in range(max(0, quantity)):
+        price = rules.market_price(product, inventory)
+        revenue += price
+        if price > rules.PRICE_FLOOR:
+            inventory += 1
+    return revenue, inventory
+
+
+def _short_product_plan(
+    product: str,
+    opening_stock: int,
+    opening_inventory: int,
+    arrivals: Mapping[int, int],
+    departures: Mapping[int, int],
+    demand: Mapping[int, int],
+    checkpoints: tuple[int, ...],
+    forced: Mapping[int, int],
+    blocked: frozenset[int],
+):
+    """Exact three-window sale choice for one product."""
+    event_steps = tuple(sorted({
+        *checkpoints, *forced, *arrivals, *departures,
+        *(step for step in demand if step <= checkpoints[-1]),
+    }))
+    decisions = set(checkpoints)
+    last_checkpoint = checkpoints[-1]
+
+    @lru_cache(maxsize=None)
+    def value(index: int, stock: int, inventory: int):
+        step = event_steps[index]
+        stock -= departures.get(step, 0)
+        if stock < 0:
+            return -10**15, (), inventory
+        stock += arrivals.get(step, 0)
+        minimum = min(stock, forced.get(step, 0))
+        if step == last_checkpoint:
+            choices = (stock,)
+        elif step in blocked:
+            choices = (minimum,)
+        elif step in decisions:
+            choices = range(minimum, stock + 1)
+        else:
+            choices = (minimum,)
+        best = None
+        for quantity in choices:
+            immediate, after_sale = _sale_inventory_after(
+                product, quantity, inventory)
+            after_demand = after_sale - demand.get(step, 0)
+            if index + 1 == len(event_steps):
+                candidate = (
+                    immediate, -quantity, quantity, after_sale, ())
+            else:
+                future, schedule, _ = value(
+                    index + 1, stock - quantity, after_demand)
+                candidate = (
+                    immediate + future, -quantity, quantity, after_sale,
+                    schedule)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        assert best is not None
+        return (
+            best[0],
+            ((step, best[2]), *best[4]),
+            best[3],
+        )
+
+    revenue, schedule, _ = value(0, opening_stock, opening_inventory)
+    return revenue, dict(schedule)
+
+
+def _commitment_lines(commitments, step: int) -> int:
+    lines = 0
+    for event in commitments:
+        if getattr(event, "step", None) != step:
+            continue
+        kind = getattr(event, "kind", None)
+        if kind == "HIRE":
+            lines += max(0, int(getattr(event, "quantity", 0)))
+        elif kind in {
+                "BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_LAND"}:
+            lines += 1
+    return lines
+
+
+def _apply_commitment(
+    event, money: int, hires: int, land_count: int,
+    inventory: dict[str, int],
+) -> tuple[int, int, int]:
+    kind = event.kind
+    quantity = max(0, int(getattr(event, "quantity", 0)))
+    if kind == "HIRE":
+        for _ in range(quantity):
+            money -= rules.fibonacci_hire_cost(hires)
+            hires += 1
+    elif kind == "BUY_LAND":
+        cost = quantity or rules.LAND_PRICES[land_count - 1]
+        money -= cost
+        land_count += 1
+    elif kind == "BUY_ANIMAL":
+        money -= rules.ANIMALS[event.item].cost * quantity
+    elif kind == "BUY_SEED":
+        money -= rules.CROPS[event.item].seed_cost * quantity
+    elif kind == "BUY_PRODUCT":
+        for _ in range(quantity):
+            inventory[event.item] -= 1
+            money -= rules.market_price(
+                event.item, inventory[event.item])
+    return money, hires, land_count
+
+
+def optimize_short_sales(
+    state: State,
+    arrivals: Mapping[int, Mapping[str, int]],
+    *,
+    consumptions: Mapping[int, Mapping[str, int]] | None = None,
+    commitments: Iterable[object] = (),
+) -> SalePlan:
+    """Runtime trade machine for NOW, +4 and +8 only.
+
+    Biological output is absent unless a route has already proved its DROP
+    arrival.  The function starts from the real market inventory on every
+    invocation and never consumes opponent forecasts.
+    """
+    horizon = min(rules.TERMINAL_ACTION_STEP, state.step + 8)
+    checkpoints = tuple(dict.fromkeys((
+        state.step,
+        min(rules.TERMINAL_ACTION_STEP, state.step + 4),
+        horizon,
+    )))
+    demand_events = known_demand_events(state, end_step=horizon)
+    demand = {
+        product: dict(events)
+        for product, events in demand_events.items()
+    }
+    consumptions = consumptions or {}
+    by_product_arrivals = {product: {} for product in rules.PRODUCTS}
+    by_product_departures = {product: {} for product in rules.PRODUCTS}
+    for step, amounts in arrivals.items():
+        if step < state.step or step > horizon:
+            continue
+        for product, quantity in amounts.items():
+            if product in by_product_arrivals:
+                by_product_arrivals[product][step] = (
+                    by_product_arrivals[product].get(step, 0) + quantity)
+    for step, amounts in consumptions.items():
+        if step < state.step or step > min(
+                (state.day + 1) * rules.TURNS_PER_DAY - 1,
+                rules.TERMINAL_ACTION_STEP):
+            continue
+        reservation_step = min(step, horizon)
+        for product, quantity in amounts.items():
+            if product in by_product_departures:
+                by_product_departures[product][reservation_step] = (
+                    by_product_departures[product].get(
+                        reservation_step, 0) + quantity)
+    commit_list = tuple(
+        event for event in commitments
+        if getattr(event, "kind", None) in {
+            "BUY_SEED", "BUY_ANIMAL", "BUY_PRODUCT", "BUY_LAND", "HIRE"
+        } and state.step <= getattr(event, "step", -1) <= horizon
+    )
+    valuation_demand = {
+        product: dict(events) for product, events in demand.items()}
+    purchase_arrivals = {product: {} for product in rules.PRODUCTS}
+    for event in commit_list:
+        if event.kind == "BUY_PRODUCT":
+            valuation_demand[event.item][event.step] = (
+                valuation_demand[event.item].get(event.step, 0)
+                + event.quantity)
+            arrival_step = event.step + 1
+            if arrival_step <= horizon:
+                purchase_arrivals[event.item][arrival_step] = (
+                    purchase_arrivals[event.item].get(arrival_step, 0)
+                    + event.quantity)
+    forced: dict[str, dict[int, int]] = {
+        product: {} for product in rules.PRODUCTS}
+    blocked: dict[str, set[int]] = {
+        product: set() for product in rules.PRODUCTS}
+
+    def solve_all():
+        schedules = {}
+        total = 0
+        for product in rules.PRODUCTS:
+            stock_arrivals = dict(by_product_arrivals[product])
+            for step, quantity in purchase_arrivals[product].items():
+                stock_arrivals[step] = stock_arrivals.get(step, 0) + quantity
+            revenue, schedule = _short_product_plan(
+                product,
+                int(state.shed.get(product, 0)),
+                int(state.market.inventory[product]),
+                stock_arrivals,
+                by_product_departures[product],
+                valuation_demand[product],
+                checkpoints,
+                forced[product],
+                frozenset(blocked[product]),
+            )
+            total += revenue
+            schedules[product] = schedule
+        return total, schedules
+
+    def simulate(schedules):
+        stock = {
+            product: int(state.shed.get(product, 0))
+            for product in rules.PRODUCTS}
+        inventory = {
+            product: int(state.market.inventory[product])
+            for product in rules.PRODUCTS}
+        money = state.money
+        hires = state.hires_today
+        land_count = len(state.own.owned_land)
+        other_stock = sum(
+            quantity for item, quantity in state.shed.items()
+            if item not in rules.PRODUCTS)
+        commits = defaultdict(list)
+        for event in commit_list:
+            commits[event.step].append(event)
+        event_steps = sorted({
+            state.step, *checkpoints,
+            *(step for step in arrivals if step <= horizon),
+            *(step for step in consumptions
+              if state.step <= step <= horizon),
+            *(event.step for event in commit_list),
+            *(step for values in demand.values() for step in values
+              if step <= horizon),
+            *(step for schedule in schedules.values() for step in schedule),
+        })
+        for step in event_steps:
+            for item, quantity in consumptions.get(step, {}).items():
+                if item in stock:
+                    stock[item] -= quantity
+                    if stock[item] < 0:
+                        return (
+                            "STOCK", step, -stock[item], stock,
+                            inventory, money)
+                else:
+                    other_stock -= quantity
+                    if other_stock < 0:
+                        return (
+                            "STOCK", step, -other_stock, stock,
+                            inventory, money)
+            incoming = arrivals.get(step, {})
+            excess = (
+                other_stock + sum(stock.values()) + sum(incoming.values())
+                - rules.SHED_CAPACITY)
+            if excess > 0:
+                return ("OVERFLOW", step, excess, stock, inventory, money)
+            for product, quantity in incoming.items():
+                if product in stock:
+                    stock[product] += quantity
+            for product in rules.PRODUCTS:
+                quantity = schedules[product].get(step, 0)
+                if quantity > stock[product]:
+                    return ("STOCK", step, quantity, stock, inventory, money)
+                stock[product] -= quantity
+                earned, inventory[product] = _sale_inventory_after(
+                    product, quantity, inventory[product])
+                money += earned
+            for event in commits.get(step, ()):
+                money, hires, land_count = _apply_commitment(
+                    event, money, hires, land_count, inventory)
+                if money < 0:
+                    return (
+                        "CASH", step, -money, stock, inventory, money)
+                if event.kind == "BUY_ANIMAL":
+                    other_stock += event.quantity
+                elif event.kind == "BUY_PRODUCT":
+                    stock[event.item] += event.quantity
+                purchase_excess = (
+                    other_stock + sum(stock.values())
+                    - rules.SHED_CAPACITY)
+                if purchase_excess > 0:
+                    return (
+                        "ORDER_OVERFLOW", step, purchase_excess,
+                        stock, inventory, money)
+            for product in rules.PRODUCTS:
+                inventory[product] -= demand[product].get(step, 0)
+        return ("OK", stock, inventory, money)
+
+    def force_units(step: int, amount: int, schedules,
+                    stock, inventory) -> bool:
+        remaining = amount
+        while remaining > 0:
+            choices = []
+            for product in rules.PRODUCTS:
+                scheduled_now = schedules[product].get(step, 0)
+                available = stock.get(product, 0) + scheduled_now
+                already = forced[product].get(step, 0)
+                target = max(already, scheduled_now) + 1
+                if available < target:
+                    continue
+                current_price = rules.market_price(
+                    product, inventory[product])
+                future_step = next((
+                    future for future in sorted(schedules[product])
+                    if future >= step
+                    and schedules[product].get(future, 0) >
+                    forced[product].get(future, 0)
+                ), checkpoints[-1])
+                future_inventory = inventory[product]
+                for demand_step, quantity in valuation_demand[product].items():
+                    if step <= demand_step < future_step:
+                        future_inventory -= quantity
+                future_price = rules.market_price(
+                    product, future_inventory)
+                choices.append((
+                    future_price - current_price,
+                    -current_price,
+                    product,
+                ))
+            if not choices:
+                return False
+            product = min(choices)[2]
+            forced[product][step] = max(
+                forced[product].get(step, 0),
+                schedules[product].get(step, 0)) + 1
+            remaining -= 1
+        return True
+
+    for _ in range(rules.SHED_CAPACITY * 3 + 30):
+        revenue, schedules = solve_all()
+        result = simulate(schedules)
+        if result[0] == "OK":
+            # Market-line capacity: commitments are fixed; ordinary sale lines
+            # move to the next legal checkpoint instead of being truncated.
+            changed = False
+            for step in sorted({
+                    *checkpoints,
+                    *(s for schedule in schedules.values()
+                      for s, q in schedule.items() if q)}):
+                sale_products = [
+                    product for product in rules.PRODUCTS
+                    if schedules[product].get(step, 0)]
+                slots = rules.MAX_MARKET_ORDERS - _commitment_lines(
+                    commit_list, step)
+                hard_products = [
+                    product for product in sale_products
+                    if forced[product].get(step, 0)]
+                if slots < len(hard_products):
+                    return SalePlan(
+                        0, {}, {}, False,
+                        f"market order capacity cannot satisfy hard sales at {step}")
+                while len(sale_products) > slots:
+                    movable = [
+                        product for product in sale_products
+                        if not forced[product].get(step, 0)
+                        and step != checkpoints[-1]]
+                    if not movable:
+                        return SalePlan(
+                            0, {}, {}, False,
+                            f"market order capacity exceeded at {step}")
+                    product = min(
+                        movable,
+                        key=lambda item: (
+                            schedules[item].get(step, 0), item))
+                    blocked[product].add(step)
+                    sale_products.remove(product)
+                    changed = True
+            if changed:
+                continue
+            break
+        kind, step, amount, stock, inventory, _ = result
+        if kind in {"OVERFLOW", "ORDER_OVERFLOW"}:
+            sale_step = step - 1 if kind == "OVERFLOW" else step
+            if sale_step < state.step or not force_units(
+                    sale_step, amount, schedules, stock, inventory):
+                return SalePlan(
+                    0, {}, {}, False,
+                    f"shed overflow cannot be prevented before {step}")
+        elif kind == "CASH":
+            # Sales resolve before purchases on the same market turn.
+            prices = sorted(
+                (
+                    rules.market_price(product, inventory[product]),
+                    product,
+                )
+                for product in rules.PRODUCTS if stock.get(product, 0) > 0
+            )
+            if not prices:
+                return SalePlan(
+                    0, {}, {}, False,
+                    f"cash requirement cannot be funded at {step}")
+            needed = amount
+            while needed > 0:
+                before = sum(
+                    rules.market_price(product, inventory[product])
+                    for product in rules.PRODUCTS
+                    for _ in range(max(0, stock.get(product, 0))))
+                if before <= 0 or not force_units(
+                        step, 1, schedules, stock, inventory):
+                    return SalePlan(
+                        0, {}, {}, False,
+                        f"cash requirement cannot be funded at {step}")
+                # The loop re-solves and obtains the exact sequential revenue.
+                needed = 0
+        else:
+            return SalePlan(0, {}, {}, False, f"short sale failure: {kind}")
+    else:
+        return SalePlan(
+            0, {}, {}, False, "short sale constraints did not converge")
+
+    planned: dict[int, dict[str, int]] = defaultdict(dict)
+    trajectory: dict[int, dict[str, int]] = defaultdict(dict)
+    event_steps = sorted({
+        *checkpoints,
+        *(step for schedule in schedules.values() for step in schedule),
+        *(step for values in valuation_demand.values() for step in values
+          if step <= horizon),
+    })
+    inventories = {
+        product: int(state.market.inventory[product])
+        for product in rules.PRODUCTS}
+    for step in event_steps:
+        for product in rules.PRODUCTS:
+            quantity = schedules[product].get(step, 0)
+            if quantity:
+                planned[step][product] = quantity
+            _, inventories[product] = _sale_inventory_after(
+                product, quantity, inventories[product])
+            inventories[product] -= valuation_demand[product].get(step, 0)
+            trajectory[step][product] = inventories[product]
     return SalePlan(revenue, dict(planned), dict(trajectory))

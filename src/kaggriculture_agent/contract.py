@@ -19,8 +19,9 @@ def construct_action(state: OwnedState, decision: TurnDecision) -> dict[str, lis
         return pass_action()
     if len(actions) != len(state.workers):
         raise ValueError("TurnDecision worker count does not match OwnedState")
+    assert len(decision.market_orders) <= rules.MAX_MARKET_ORDERS
     return {
         "farmer": actions[0],
         "hands": actions[1:],
-        "market": [list(order) for order in decision.market_orders[: rules.MAX_MARKET_ORDERS]],
+        "market": [list(order) for order in decision.market_orders],
     }
