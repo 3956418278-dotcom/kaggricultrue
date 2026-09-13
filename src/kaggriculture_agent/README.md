@@ -1,4 +1,4 @@
-# D11+ programme controller
+# Observation-driven programme controller
 
 The maintained runtime boundary is:
 
@@ -10,7 +10,10 @@ observation -> canonical State -> macro Programme -> intraday routes -> action
 - `rules.py` owns pinned `kaggle-environments==1.32.7` transitions and prices.
 - `market.py` owns reveal timing, known demand events, visible opponent pressure,
   and sequential sale DP with shared shed-capacity repair.
-- `programme.py` is the frozen macro/executor contract.
+- `programme.py` is the frozen macro/executor contract; `CurrentAssetState`
+  carries existing assets without daily terminal expansion.
+- `current_assets.py` owns event-driven next-production MAINTAIN/EXIT and the
+  separate one-cycle CARE decision.
 - `planner.py` owns KEEP/EXIT, mandatory/optional service, W_FEED, W/C buffers,
   exact-tile long candidates, land+use comparisons, and terminal-cash selection.
 - `intraday.py` may assign workers and construct routes, but cannot alter macro
@@ -20,5 +23,7 @@ observation -> canonical State -> macro Programme -> intraday routes -> action
 - `operating.py` freezes the programme within a day and only re-solves remaining
   sales at a real SELL checkpoint.
 
-The prior programme/target tables and fixed-count policy are not present. D5-D10
-pass after the existing fixed four-day opening; this controller starts at D11.
+The prior programme/target tables and fixed-count policy are not present. The
+planner/current-asset APIs can attach to any legal day. The maintained submission
+currently chooses its handoff after the fixed opening; that activation policy is
+separate from the current-asset mechanism.

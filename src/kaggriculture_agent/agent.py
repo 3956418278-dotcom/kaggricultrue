@@ -1,4 +1,4 @@
-"""Fixed opening followed by the D11+ programme controller."""
+"""Fixed opening followed by an observation-driven midgame controller."""
 
 from __future__ import annotations
 

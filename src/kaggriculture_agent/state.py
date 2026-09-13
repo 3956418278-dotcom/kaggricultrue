@@ -1,4 +1,4 @@
-"""Canonical observation state for the D11+ controller.
+"""Canonical observation state for the observation-driven midgame controller.
 
 The adapter deliberately keeps every official tile field. Planning may derive
 counts, but never replaces transition-bearing animal/crop records by counts.

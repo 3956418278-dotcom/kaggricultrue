@@ -27,6 +27,15 @@ def programme_invalidation(state: State, programme: Programme) -> str | None:
             # A completed one-time harvest intentionally releases its tile.
             if not any(e.step < state.step for e in asset.harvest_schedule):
                 return f"kept {asset.asset_id} no longer exists"
+    snapshots = {asset.asset_id: asset for asset in programme.current_assets}
+    for animal in state.own.animals:
+        x, y = animal.position
+        snapshot = snapshots.get(
+            f"current:{animal.asset_type}:{x}:{y}")
+        if (snapshot is not None and
+                int(animal.official.get("yield_units", 0)) !=
+                snapshot.held_quantity):
+            return f"held capacity changed for {snapshot.asset_id}"
     return None
 
 
@@ -68,7 +77,7 @@ class DailyPlanningSession:
         last = self._last_steps.get(state.player, -1)
         reason = None if prior is None else programme_invalidation(state, prior)
         if prior is None or state.step < last or prior.day != state.day or reason is not None:
-            prior = make_plan(state)
+            prior = make_plan(state, prior_programme=prior)
         self._plans[state.player] = prior
         self._last_steps[state.player] = state.step
         return prior

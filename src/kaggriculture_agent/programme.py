@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Mapping
+from typing import Any, Mapping
 
 from .state import Position
 
@@ -40,6 +40,36 @@ class AssetProgramme:
     harvest_schedule: tuple[ProgrammeEvent, ...] = ()
     stock_schedule: tuple[ProgrammeEvent, ...] = ()
     sale_schedule: tuple[ProgrammeEvent, ...] = ()
+
+
+@dataclass(frozen=True)
+class CurrentAssetState:
+    """Observation-backed state for an asset that already exists.
+
+    ``official`` is the complete transition-bearing tile record.  The two event
+    collections are deliberately short: executable commitments for the current
+    day and the next biologically relevant event only.
+    """
+
+    asset_id: str
+    asset_type: str
+    tile: Position
+    official: Mapping[str, Any]
+    held_product: str | None = None
+    held_quantity: int = 0
+    animal_mode: str | None = None       # MAINTAIN / EXIT
+    base_gain: int | None = None
+    replacement_advantage: int = 0
+    care_approved: bool = False
+    care_gain: int = 0
+    care_step: int | None = None
+    decision_event: str | None = None
+    next_production_step: int | None = None
+    next_production_cashable: bool = False
+    today_events: tuple[ProgrammeEvent, ...] = ()
+    next_events: tuple[ProgrammeEvent, ...] = ()
+    economic_exit_step: int | None = None
+    physical_release_step: int | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +124,7 @@ class Programme:
     terminal_cash: int = 0
     feasible: bool = False
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    current_assets: tuple[CurrentAssetState, ...] = ()
 
     def with_events(self, *events: ProgrammeEvent) -> "Programme":
         return replace(self, events=tuple(sorted((*self.events, *events))))

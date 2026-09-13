@@ -35,9 +35,14 @@ def buy_cost(product: str, quantity: int, inventory: int) -> int:
     return cost
 
 
-def known_demand_events(state: State) -> dict[str, tuple[tuple[int, int], ...]]:
+def known_demand_events(
+    state: State, *, end_step: int | None = None,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    """Return exact known demand, optionally bounded to a caller's horizon."""
     events: dict[str, list[tuple[int, int]]] = {item: [] for item in rules.PRODUCTS}
-    for step in range(state.step, rules.TERMINAL_ACTION_STEP + 1):
+    last_step = rules.TERMINAL_ACTION_STEP if end_step is None else min(
+        rules.TERMINAL_ACTION_STEP, max(state.step, end_step))
+    for step in range(state.step, last_step + 1):
         amounts: dict[str, int] = defaultdict(int)
         if step % 4 == 0:
             for shop in state.shops:
@@ -398,4 +403,3 @@ def optimize_sales(state: State, arrivals: Mapping[int, Mapping[str, int]],
                     inventory += 1
             trajectory[step][product] = inventory
     return SalePlan(revenue, dict(planned), dict(trajectory))
-
