@@ -25,15 +25,20 @@ short states rather than terminal programmes.
 ## Implemented D11+ mechanisms
 
 - discrete known Town/shop demand events and the fixed reveal calendar;
-- current-price animal/crop daily-value formulas with discounted realizable F;
+- first/next-output macro supply estimates for animal/new long-asset product
+  prices, with terminal-truncated new output and discounted realizable F;
 - observation-backed animal PRODUCE/MAINTAIN/EXIT, minimum survival FEED,
-  one-cycle CARE, held-capacity harvest gates, and a two-night EXIT tail;
-- event-local decisions for existing Wheat/Carrot/Melon/Tomato/Strawberry;
+  pre-first-output protection, one-cycle CARE, held-capacity harvest gates,
+  and a two-night EXIT tail;
+- event-local decisions for existing Wheat/Carrot/Melon/Tomato/Strawberry,
+  including actual HARVEST/DIG cleanup and same-day ongoing-crop replacement;
 - feed sourcing from real stock or route-proven mature Wheat, followed only by
   direct Wheat purchase for any deficit; no feed-purpose crop is created;
 - global seed accounting, positive current-value long-asset placement,
   low-cost NOW/WAIT comparison, decaying animal locality ranking, and
-  scale-based land purchase;
+  cash-gated second/third land purchase after existing-land funding;
+- private worker carry is reconciled against real routes before retaining W/F
+  purchases; only future shed F pickups reserve F, and free shed F sells NOW;
 - restored runnable daily intraday assignment with exact PICKUP/DROP routes and
   minimum feasible same-day staffing;
 - a runtime trade machine that re-reads real inventory every four turns and
@@ -48,13 +53,14 @@ an evaluation-local schema and do not enter the submitted strategy.
 
 ## Validation
 
-- The repository suite passes 93 tests, including the pinned environment,
+- The repository suite passes 107 tests, including the pinned environment,
   controller, seed ledger, asset modes, crop inputs, EXIT liquidation,
   short-horizon trade, order-limit, and runnable intraday regressions.
-- Three uncaught-exception full pinned episodes (seeds 119-121) completed through
-  D30 against PASS. Across each D11-D30 run, planner calls totaled 0.031-0.036s
-  with observed maximum calls at or below 0.0033s. These are integration smoke checks,
-  not competitive evidence.
+- Two full pinned episodes (seeds 119-120) completed through D30 against PASS
+  in the regression suite, checking feasible daily plans and four-turn trade
+  refreshes with uncaught controller calls (no exception fallback). These are
+  integration smoke checks, not competitive evidence; prior-version planning
+  time measurements do not describe this revision.
 
 ## Limiting issue
 

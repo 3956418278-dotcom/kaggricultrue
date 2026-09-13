@@ -235,7 +235,12 @@ def _unused_tiles(state: State, programme: Programme):
             or rules.quadrant(tile.position, state.board_size) in unlocked
         )
         and tile.animal is None
-        and tile.crop is None
+        and (tile.crop is None or any(
+            a.tile == tile.position and a.release_turn is not None
+            and a.release_turn <= _day_end(state)
+            and (not rules.CROPS[a.asset_type].ongoing or any(
+                e.kind == "DIG" for e in a.service_schedule))
+            for a in programme.assets if a.asset_type in rules.CROPS))
     )
 
 
@@ -282,7 +287,8 @@ def _resolve_inputs(
     programme: Programme,
 ) -> Programme:
     """Use real stock, then mature Wheat, then BUY; never plant for FEED."""
-    events = list(programme.events)
+    events = [e for e in programme.events if not (
+        e.kind == "BUY_PRODUCT" and e.item in {"WHEAT", "FERTILIZER"})]
     assets = programme.assets
     feed_events = [
         event for event in events if event.kind == "FEED"]
@@ -414,15 +420,15 @@ def _resolve_inputs(
 
 
 def _asset_daily_value(
-    state: State, kind: str, params: MidgameParameters
+    state: State, kind: str, params: MidgameParameters, programme=None
 ) -> float:
     if kind in rules.ANIMALS:
-        return _forecast_animal_daily_value(state, kind, params)
-    return _forecast_crop_daily_value(state, kind)
+        return _forecast_animal_daily_value(state, kind, params, programme)
+    return _forecast_crop_daily_value(state, kind, params, programme)
 
 
 def _forecast_animal_daily_value(
-    state: State, animal: str, params: MidgameParameters
+    state: State, animal: str, params: MidgameParameters, programme=None
 ) -> float:
     """Forecast-aware animal daily value for new placement decisions."""
     rule = rules.ANIMALS[animal]
@@ -438,11 +444,10 @@ def _forecast_animal_daily_value(
         productions += 1
     if productions == 0:
         return 0.0
-    # Target day = last production day for this animal.
-    target_day = first_prod_day + (productions - 1) * rule.interval
     forecast_inv = forecast_inventory(
-        state, rule.product, target_day,
-        own_production_to_target=productions,
+        state, rule.product, (first_prod_day + 1) * 24,
+        planned_assets=programme.additions if programme else (),
+        commitments=programme.events if programme else (), params=params,
     )
     forecast_price = rules.market_price(rule.product, forecast_inv)
     days = rule.first_yield_day + (productions - 1) * rule.interval
@@ -460,11 +465,30 @@ def _forecast_animal_daily_value(
     return numerator / max(1, days)
 
 
-def _forecast_crop_daily_value(state: State, crop: str) -> float:
+def _forecast_crop_daily_value(state: State, crop: str, params=None, programme=None) -> float:
     """Forecast-aware crop daily value for new placement decisions."""
     rule = rules.CROPS[crop]
+    params = coerce_midgame_parameters(params)
+    target_step = (state.day + rule.first_yield_day) * 24
+    if target_step > rules.TERMINAL_ACTION_STEP:
+        return 0.0
+    forecast_price = rules.market_price(crop, forecast_inventory(
+        state, crop, target_step,
+        planned_assets=programme.additions if programme else (),
+        commitments=programme.events if programme else (), params=params))
     if not rule.ongoing:
-        return crop_daily_value(state, crop).selected
+        # Preserve the existing Melon normal/fertilized day convention, but
+        # cap both yields to the water window still reachable before terminal.
+        days = min(rule.max_yield_day, 29 - state.day)
+        productive = max(0, days - (rule.max_yield_day + 1) // 2 + 1)
+        normal_output = min(rule.max_yield, 1 + productive)
+        fertilized_output = min(rule.max_yield, 1 + 2 * productive)
+        snapshot = crop_daily_value(state, crop)
+        # Use the same explicit F input ledger as the existing crop snapshot.
+        from .current_assets import _fertilizer_use_cost
+        f_cost = _fertilizer_use_cost(state, snapshot.fertilizer_units)
+        return max(normal_output * forecast_price - rule.seed_cost,
+                   fertilized_output * forecast_price - rule.seed_cost - f_cost) / max(1, days)
     # For ongoing crops, count achievable productions before terminal.
     first_prod_day = state.day + rule.first_yield_day - 1
     if first_prod_day > 28:
@@ -477,12 +501,6 @@ def _forecast_crop_daily_value(state: State, crop: str) -> float:
         productions += 1
     if productions == 0:
         return 0.0
-    target_day = first_prod_day + (productions - 1) * rule.interval
-    forecast_inv = forecast_inventory(
-        state, crop, target_day,
-        own_production_to_target=productions,
-    )
-    forecast_price = rules.market_price(crop, forecast_inv)
     days = max(1, rule.first_yield_day + (productions - 1) * rule.interval)
     numerator = productions * forecast_price - rule.seed_cost
     return numerator / days
@@ -558,6 +576,9 @@ def _candidate_tile(
     def terrain_rank(tile: Position):
         raw = _tile_raw_for_plan(
             state, tile, _planned_quadrants(state, programme.land))
+        if any(a.tile == tile and a.release_turn is not None
+               and a.release_turn <= _day_end(state) for a in programme.assets):
+            raw = None
         tile_kind = raw.get("kind") if isinstance(raw, dict) else None
         if kind in rules.ANIMALS:
             rank = 0 if tile_kind == expected else 1 if raw is None else 2
@@ -608,13 +629,16 @@ def _new_asset(
     programme: Programme,
 ) -> AssetProgramme:
     unlocked = _planned_quadrants(state, programme.land)
+    release = max((a.release_turn for a in programme.assets
+                   if a.tile == tile and a.release_turn is not None),
+                  default=state.step + 1)
     if kind in rules.ANIMALS:
         return _animal_programme(
             state, kind, tile, existing=False,
-            unlocked_quadrants=unlocked)
+            unlocked_quadrants=unlocked, start_step=release)
     return _crop_programme(
         state, kind, tile, existing=False,
-        unlocked_quadrants=unlocked)
+        unlocked_quadrants=unlocked, start_step=release)
 
 
 def _ranked_kind(
@@ -626,7 +650,7 @@ def _ranked_kind(
         return None
     candidates = []
     for kind in LONG_ASSETS:
-        daily = _asset_daily_value(state, kind, params)
+        daily = _asset_daily_value(state, kind, params, programme)
         if daily <= 0 or _remaining_effective_days(state, kind) <= 0:
             continue
         if not _wait_reveal_allows_start(state, kind, daily):
@@ -654,18 +678,17 @@ def _land_expansion(
     params: MidgameParameters,
 ) -> Programme:
     owned = len(_planned_quadrants(state, programme.land))
-    if owned >= 4 or state.turn >= rules.TURNS_PER_DAY - 3:
-        return programme
-    # Only allow land 2 or 3; land 4 disabled by default via max_land_quadrant.
-    if owned > params.max_land_quadrant:
+    if owned >= 3 or state.turn >= rules.TURNS_PER_DAY - 3:
         return programme
     quadrant = rules.LAND_ORDER[owned - 1]
     price = rules.LAND_PRICES[owned - 1]
 
     # Compute free cash after all existing commitments.
     free_cash = state.money - _committed_purchase_cost(state, programme)
-    # Full wheat seed fallback: cost to fill every free tile with wheat.
-    free_tiles = len(_unused_tiles(state, programme))
+    # BUY_LAND immediately converts the new quadrant's LOCKED tiles to EMPTY.
+    free_tiles = sum(
+        rules.quadrant(tile.position, state.board_size) == quadrant
+        and (tile.is_locked or tile.is_empty) for tile in state.own.tiles)
     wheat_seed_fallback = free_tiles * rules.CROPS["WHEAT"].seed_cost
     threshold = price + wheat_seed_fallback + params.fixed_cash_reserve
     if free_cash <= threshold:
@@ -682,10 +705,10 @@ def _land_expansion(
     exact = tiles[0]
     event = _pe(
         state.step, -40, f"land:{quadrant}", "BUY_LAND",
-        item=quadrant, quantity=price, source="SCALE_EXPANSION")
+        item=quadrant, quantity=price, source="CASH_FUNDED_EXPANSION")
     land = LandProgramme(
         quadrant, state.step, price, exact,
-        f"SCALE:WHEAT:{free_tiles}")
+        "CONTINUE_PLACEMENT")
     return replace(
         programme,
         events=tuple(sorted((*programme.events, event))),
@@ -750,11 +773,8 @@ def _buffer_loop(state: State, programme: Programme) -> Programme:
         tile = _candidate_tile(state, programme, crop)
         if tile is None:
             return programme
-        candidate = _crop_programme(
-            state, crop, tile, existing=False,
-            purpose="W_BUFFER" if crop == "WHEAT" else "C_BUFFER",
-            unlocked_quadrants=_planned_quadrants(state, programme.land),
-        )
+        candidate = replace(_new_asset(state, crop, tile, programme),
+                            purpose="W_BUFFER" if crop == "WHEAT" else "C_BUFFER")
         trial = _programme_from_assets(
             state,
             (*programme.assets, candidate),
@@ -807,26 +827,120 @@ def _validate_market_capacity(programme: Programme) -> Programme:
     return programme
 
 
-def _enforce_land_scale(
-    state: State,
-    programme: Programme,
-    params: MidgameParameters,
-) -> Programme:
-    if not programme.land:
-        return programme
-    purchased = {entry.quadrant for entry in programme.land}
-    deployed = [
-        asset for asset in programme.additions
-        if rules.quadrant(asset.tile, state.board_size) in purchased]
-    if len(deployed) >= params.land_min_deployable_count:
-        return programme
-    remaining = tuple(
-        asset for asset in programme.assets
-        if rules.quadrant(asset.tile, state.board_size) not in purchased)
-    rebuilt = _programme_from_assets(
-        state, remaining, (), (), programme.current_assets)
-    rebuilt = _resolve_inputs(state, rebuilt)
-    return _long_candidate_loop(state, rebuilt, params)
+def _route_input_deficits(state: State, programme: Programme):
+    """Replay private carry and shared shed in official worker action order.
+
+    Missing pickup units are counted as required JIT purchases. They are never
+    borrowed from a different worker's inventory. No route search occurs here.
+    """
+    items = {"WHEAT", "FERTILIZER"}
+    shed = Counter({p: state.shed.get(p, 0) for p in items})
+    inventory = {w: Counter(state.workers[w].inventory if w < len(state.workers) else {})
+                 for w in range(programme.worker_count)}
+    required = Counter()
+    positions = {w: state.workers[w].position if w < len(state.workers)
+                 else rules.shed_access(state.board_size)[w % 4]
+                 for w in inventory}
+    harvests = {a.tile: {e.item: e.quantity for e in a.harvest_schedule}
+                for a in programme.assets if a.harvest_schedule}
+    moves = {"NORTH": (0, -1), "SOUTH": (0, 1), "WEST": (-1, 0), "EAST": (1, 0)}
+    actions = sorted((step, route.worker, action) for route in programme.routes
+                     for step, action in route.actions.items() if step >= state.step)
+    for step, worker, action in actions:
+        op = action[0]
+        inv = inventory[worker]
+        if op in moves:
+            dx, dy = moves[op]
+            x, y = positions[worker]
+            positions[worker] = (x + dx, y + dy)
+        elif op == "PICKUP" and action[1] in items:
+            item, qty = action[1], int(action[2])
+            missing = max(0, qty - shed[item])
+            required[item] += missing
+            shed[item] += missing - qty
+            inv[item] += qty
+        elif op == "DROP":
+            for item in items:
+                shed[item] += inv[item]
+                inv[item] = 0
+        elif op == "HARVEST":
+            for item, qty in harvests.get(positions[worker], {}).items():
+                if item in items:
+                    inv[item] += qty
+        elif op == "COLLECT_FERTILIZER":
+            inv["FERTILIZER"] += 1
+        elif op in {"FEED", "FERTILIZE"}:
+            item = "WHEAT" if op == "FEED" else "FERTILIZER"
+            if inv[item] <= 0:
+                raise PlanningFailure("route consumes an input not carried by its worker")
+            inv[item] -= 1
+    return required
+
+
+def _reconcile_carried_inputs(state: State, solved: Programme) -> Programme:
+    required = _route_input_deficits(state, solved)
+    purchased = Counter()
+    for event in solved.events:
+        if event.kind == "BUY_PRODUCT":
+            purchased[event.item] += event.quantity
+    if any(required[p] > purchased[p] for p in ("WHEAT", "FERTILIZER")):
+        raise PlanningFailure("route's actual pickup precedes its available input supply")
+    events = tuple(replace(e, quantity=min(e.quantity, required[e.item]))
+                   if e.kind == "BUY_PRODUCT" and e.item in {"WHEAT", "FERTILIZER"}
+                   else e for e in solved.events)
+    events = tuple(e for e in events if e.kind != "BUY_PRODUCT" or e.quantity > 0)
+    if events == solved.events:
+        return solved
+    # At most one recompilation. If the reduced purchase changes assignment in
+    # a way that loses the proven resource path, retain the conservative plan.
+    try:
+        adjusted = solve_intraday(state, replace(solved, events=events))
+        needs = _route_input_deficits(state, adjusted)
+        buys = Counter()
+        for e in adjusted.events:
+            if e.kind == "BUY_PRODUCT":
+                buys[e.item] += e.quantity
+        if any(needs[p] > buys[p] for p in ("WHEAT", "FERTILIZER")):
+            return solved
+        return adjusted
+    except PlanningFailure:
+        return solved
+
+
+def _actual_cleanup_releases(state: State, solved: Programme) -> Programme:
+    releases = {}
+    ids = {a.asset_id for a in solved.current_assets
+           if any(e.kind == "DIG" and e.source == "LIFECYCLE_DONE"
+                  for e in a.today_events)}
+    cleanup_tiles = {a.tile for a in solved.current_assets if a.asset_id in ids}
+    retimed = {}
+    for route in solved.routes:
+        position = (state.workers[route.worker].position
+                    if route.worker < len(state.workers) else
+                    rules.shed_access(state.board_size)[route.worker % 4])
+        moves = {"NORTH": (0, -1), "SOUTH": (0, 1), "WEST": (-1, 0), "EAST": (1, 0)}
+        for step, action in sorted(route.actions.items()):
+            if action[0] in moves:
+                dx, dy = moves[action[0]]
+                position = (position[0] + dx, position[1] + dy)
+            elif action[0] == "DIG":
+                releases[position] = step + 1
+            if position in cleanup_tiles and action[0] not in moves and action[0] != "PASS":
+                event = next((e for e in solved.events if e.tile == position
+                              and e.action == action and e.event_id not in retimed), None)
+                if event is not None:
+                    retimed[event.event_id] = replace(event, step=step)
+    def events(values):
+        return tuple(sorted(retimed.get(e.event_id, e) for e in values))
+    return replace(solved,
+        events=events(solved.events),
+        assets=tuple(replace(a,
+                     release_turn=releases.get(a.tile) if a.asset_id in ids else a.release_turn,
+                     service_schedule=events(a.service_schedule),
+                     harvest_schedule=events(a.harvest_schedule)) for a in solved.assets),
+        current_assets=tuple(replace(a, physical_release_step=releases.get(a.tile),
+                             today_events=events(a.today_events))
+                             if a.asset_id in ids else a for a in solved.current_assets))
 
 
 def _solve_daily(
@@ -835,6 +949,8 @@ def _solve_daily(
 ) -> Programme:
     try:
         solved = solve_intraday(state, programme)
+        solved = _reconcile_carried_inputs(state, solved)
+        solved = _actual_cleanup_releases(state, solved)
     except PlanningFailure as exc:
         return replace(
             programme,
@@ -893,12 +1009,8 @@ def make_plan(
         state, assets, current_assets=current)
     programme = _resolve_inputs(state, programme)
 
-    # Rank the scalable activity first, then decide land before committing
-    # placement on either old or newly unlocked tiles.
-    programme = _land_expansion(state, programme, params)
     programme = _long_candidate_loop(state, programme, params)
     programme = _resolve_inputs(state, programme)
-    programme = _enforce_land_scale(state, programme, params)
     programme = _buffer_loop(state, programme)
     programme = _resolve_inputs(state, programme)
 
@@ -906,10 +1018,23 @@ def make_plan(
     # If it breaks cash feasibility, remove the latest new commitment and
     # rebuild the same daily line; no asset is accepted on paper and funded by
     # a nonexistent balance.
+    without_land = None
     while True:
         solved = _solve_daily(state, programme)
         if solved.feasible:
+            if without_land is None:
+                # Existing land is completely funded, including real hires,
+                # before the strict cash gate considers one new quadrant.
+                without_land = solved
+                expanded = _land_expansion(state, solved, params)
+                if expanded.land != solved.land:
+                    programme = _long_candidate_loop(state, expanded, params)
+                    programme = _buffer_loop(state, programme)
+                    programme = _resolve_inputs(state, programme)
+                    continue
             return _annotate_buffers(solved)
+        if without_land is not None:
+            return _annotate_buffers(without_land)
         additions = [
             asset for asset in programme.assets if not asset.existing]
         if additions:
@@ -924,7 +1049,6 @@ def make_plan(
                 state, remaining, land_events, programme.land,
                 programme.current_assets)
             programme = _resolve_inputs(state, programme)
-            programme = _enforce_land_scale(state, programme, params)
             continue
         if programme.land:
             programme = _programme_from_assets(

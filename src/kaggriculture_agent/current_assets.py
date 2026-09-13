@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 from . import rules
-from .market import buy_cost, next_reveal, sell_revenue
+from .market import buy_cost, forecast_inventory, next_reveal, sell_revenue
 from .midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
 from .programme import AssetProgramme, CurrentAssetState, ProgrammeEvent
 from .state import AssetState, Position, State
@@ -94,6 +94,7 @@ def animal_daily_value(
     state: State,
     animal: str,
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+    *, product_price: int | None = None,
 ) -> float:
     """Current snapshot value of one maximum effective animal cycle."""
     rule = rules.ANIMALS[animal]
@@ -106,7 +107,7 @@ def animal_daily_value(
     # necessary maintenance/harvest visits, not every theoretical future night.
     realizable_f = max(1, wheat_units)
     numerator = (
-        rule.max_held * _price(state, rule.product)
+        rule.max_held * (_price(state, rule.product) if product_price is None else product_price)
         + realizable_f * conservative_f_price(state, params)
         - rule.cost
         - wheat_cost
@@ -189,18 +190,13 @@ def _production_step(day: int | None) -> int | None:
 
 
 def completed_production_count(raw: Mapping[str, object], day: int) -> int:
-    """Count how many ongoing-crop productions have completed by end of `day`."""
+    """Count productions already completed in the observation on `day`."""
     crop = str(raw["crop"])
     rule = rules.CROPS[crop]
     if not rule.ongoing:
         return 0
-    # Productions happen at end-of-day refresh for age = first_yield_day, first_yield_day+interval, etc.
-    # A production on day D means the refresh at end of D creates output.
-    # So production day = planted_day + first_yield_day + k*interval - 1 for k=0,1,...
-    # But the environment computes: age = (day+1) - planted_day - first_yield_day,
-    #   if age >= 0 and age % interval == 0 then count = age // interval + 1
-    # So the N-th production happens on day = planted_day + first_yield_day + (N-1)*interval - 1
-    first_production_day = int(raw["planted_day"]) + rule.first_yield_day - 1
+    # A refresh on closing day D becomes visible on observation day D+1.
+    first_production_day = int(raw["planted_day"]) + rule.first_yield_day
     if day < first_production_day:
         return 0
     count = (day - first_production_day) // rule.interval + 1
@@ -284,21 +280,22 @@ def _animal_current_state(
     identifier = _asset_id(asset)
     rule = rules.ANIMALS[asset.asset_type]
     held = int(raw.get("yield_units", 0))
-    daily = animal_daily_value(state, asset.asset_type, params)
     care_gain, care_possible = _care_gain(state, asset)
     production_day = next_animal_production_day(raw, state.day)
+    first_output_complete = state.day >= int(raw["placed_day"]) + rule.first_yield_day
+    forecast_price = (rules.market_price(rule.product, forecast_inventory(
+        state, rule.product, _production_step(production_day), params=params))
+        if production_day is not None else 0)
+    daily = animal_daily_value(
+        state, asset.asset_type, params, product_price=forecast_price)
 
     # EXIT is sticky until the official escape transition releases the tile.
-    if prior is not None and prior.mode == EXIT:
+    if not first_output_complete:
+        mode = MAINTAIN
+    elif prior is not None and prior.mode == EXIT:
         mode = EXIT
     elif daily <= 0 or production_day is None:
-        # Pre-first-output animals: prohibit EXIT until the first production
-        # completes.  Abandoning before any output wastes the full purchase cost.
-        first_production = int(raw["placed_day"]) + rule.first_yield_day - 1
-        if state.day < first_production and held == 0:
-            mode = MAINTAIN
-        else:
-            mode = EXIT
+        mode = EXIT
     elif care_possible:
         mode = PRODUCE
     else:
@@ -581,14 +578,15 @@ def _crop_current_state(
                 source=source))
             mode = HARVEST
             next_harvest = state.step
-        elif lifecycle_done and held == 0:
-            # No product left; schedule DIG to free the tile.
+        if lifecycle_done:
+            # Ongoing HARVEST never removes the plant. Keep cleanup in the
+            # same tile bundle, strictly after the final harvest if needed.
             today.append(_event(
-                state.step, 31, identifier + ":dig", "DIG",
+                state.step + int(held > 0), 31, identifier + ":dig", "DIG",
                 tile=asset.position, asset_id=identifier,
                 action=("DIG",), deadline=end,
                 source="LIFECYCLE_DONE"))
-            mode = HARVEST  # Reuse HARVEST mode to trigger release.
+            mode = HARVEST
             next_harvest = state.step
         elif production_step is not None:
             next_events.append(_event(
@@ -634,7 +632,7 @@ def _crop_current_state(
                 source="CURRENT_HARVEST_VALUE"))
 
     release = (
-        min(state.step + 1, rules.TERMINAL_ACTION_STEP + 1)
+        state.step + 1 + int(rule.ongoing and held > 0)
         if mode == HARVEST and (not rule.ongoing or lifecycle_done) else None)
     return CurrentAssetState(
         asset_id=identifier,

@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Iterable, Mapping
 
 from . import rules
+from .midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
 from .state import AssetState, State
 
 REVEAL_DAYS = (4, 7, 10, 13, 16, 19, 22, 25)
@@ -134,46 +135,121 @@ def opponent_pressure(state: State) -> dict[str, tuple[tuple[int, int], ...]]:
     return merged
 
 
-def forecast_inventory(
-    state: State,
-    product: str,
-    target_day: int,
-    *,
-    own_production_to_target: int = 0,
-    planned_new_production: int = 0,
-) -> int:
-    """Forecast market inventory of `product` at `target_day`.
+def asset_output_to(state: State, asset: AssetState, target_step: int,
+                    commitments=()) -> int:
+    """Biological supply pressure, not predicted SELL or market transactions.
 
-    Formula:
-        current market inventory
-        + own_production_to_target      (caller-supplied own output)
-        + opponent visible production   (theory max - 1 per visible asset)
-        + planned_new_production        (this-round planned new assets)
-        - known shop/town consumption   (exact demand events)
-
-    Does NOT mutate ``state.market.inventory``.
+    Base operation assumes minimum survival maintenance. Bonuses require an
+    observed active input or an explicitly committed action; held opening stock
+    is not a new production. Recurring productions stop at the official cap.
     """
-    inventory = int(state.market.inventory.get(product, rules.MARKET_I0))
+    raw = asset.official
+    animal = asset.asset_type in rules.ANIMALS
+    rule = (rules.ANIMALS if animal else rules.CROPS)[asset.asset_type]
+    planted = int(raw["placed_day" if animal else "planted_day"])
+    first_step = (planted + rule.first_yield_day) * rules.TURNS_PER_DAY
+    end = min(target_step, rules.TERMINAL_ACTION_STEP)
+    if end < state.step:
+        return 0
+    events = [e for e in commitments if e.tile == asset.position]
+    if not animal and not rule.ongoing:
+        if first_step <= state.step or first_step > end:
+            return 0
+        # No hypothetical future WATER/FERTILIZE. Only approved water changes
+        # the observed one-time yield before its first harvestable state.
+        quantity = int(raw.get("yield_units", 1))
+        covered = int(raw.get("fertilized_until_day", -1))
+        watered_days = set()
+        for event in sorted(events):
+            if event.step > end:
+                continue
+            day = event.step // 24
+            if event.kind == "FERTILIZE":
+                covered = max(covered, day + 2)
+            elif event.kind == "WATER" and day not in watered_days:
+                quantity += rules.one_time_water_gain(
+                    asset.asset_type, planted_day=planted, day=day,
+                    yield_units=quantity, fertilized_until_day=covered,
+                    watered_today=(day == state.day and bool(raw.get("watered_today"))))
+                watered_days.add(day)
+        return quantity
+    interval = rule.interval * 24
+    first_index = max(0, (state.step - first_step) // interval + 1)
+    last_index = (end - first_step) // interval
+    if not animal:
+        last_index = min(last_index, rule.max_yield - 1)
+    quantity = 0
+    pending = int(raw.get("pending_care_bonus", 0))
+    care_days = {e.step // 24 for e in events if e.kind == "CARE"}
+    if raw.get("cared_today", False):
+        care_days.add(state.day)
+    fed_days = {e.step // 24 for e in events if e.kind == "FEED"}
+    if raw.get("fed_today", False):
+        fed_days.add(state.day)
+    approved_banks = care_days & fed_days
+    previous_closing = state.day - 1
+    for index in range(first_index, last_index + 1):
+        closing_day = (first_step + index * interval) // 24 - 1
+        projected = dict(raw)
+        if animal:
+            pending += sum(previous_closing <= day < closing_day
+                           for day in approved_banks)
+            projected["pending_care_bonus"] = pending
+            projected["fed_today"] = (
+                (closing_day == state.day and bool(raw.get("fed_today")))
+                or any(e.kind == "FEED" and e.step // 24 == closing_day for e in events))
+            quantity += rules.animal_production_on_refresh(projected, closing_day)
+            pending = 0
+            previous_closing = closing_day
+        else:
+            projected["watered_today"] = (
+                (closing_day == state.day and bool(raw.get("watered_today")))
+                or any(e.kind == "WATER" and e.step // 24 == closing_day for e in events))
+            projected["fertilized_until_day"] = max(
+                int(raw.get("fertilized_until_day", -1)),
+                max((e.step // 24 + 2 for e in events if e.kind == "FERTILIZE"
+                     and e.step // 24 <= closing_day), default=-1))
+            quantity += rules.crop_production_on_refresh(projected, closing_day)
+    return quantity
 
-    # Opponent visible production to target_day.
-    opponent = opponent_pressure(state)
-    target_step = min((target_day + 1) * rules.TURNS_PER_DAY,
-                      rules.TERMINAL_ACTION_STEP + 1)
-    opp_supply = sum(
-        max(0, qty - 1) for step, qty in opponent.get(product, ())
-        if step <= target_step
-    )
-    inventory += opp_supply
 
-    # Own production and planned new.
-    inventory += own_production_to_target + planned_new_production
+def forecast_inventory(state: State, product: str, target_step: int, *,
+                       planned_assets=(), commitments=(),
+                       params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS) -> float:
+    """Macro-only next-output supply estimate at the post-refresh state T.
 
-    # Known shop/town consumption (demand events that remove from market).
-    demand = known_demand_events(state, end_step=target_step)
-    consumption = sum(qty for _, qty in demand.get(product, ()))
-    inventory -= consumption
+    Demand is applied on [now,T); biological outputs on (now,T]. The candidate
+    being evaluated is absent: only previously accepted additions are passed.
+    """
+    def matches(asset):
+        return (rules.ANIMALS[asset.asset_type].product
+                if asset.asset_type in rules.ANIMALS else asset.asset_type) == product
 
-    return inventory
+    own = sum(asset_output_to(state, a, target_step, commitments)
+              for a in (*state.own.animals, *state.own.crops) if matches(a))
+    opponent = sum(max(0, asset_output_to(state, a, target_step) - 1)
+                   for a in (*state.opp.visible_animals, *state.opp.visible_crops)
+                   if matches(a))
+    planned = 0
+    for asset in planned_assets:
+        if asset.existing or not matches(asset):
+            continue
+        start = next((e for e in asset.service_schedule
+                      if e.kind in {"PLACE", "PLANT"}), None)
+        if start is None:
+            continue
+        animal = asset.asset_type in rules.ANIMALS
+        raw = {"animal" if animal else "crop": asset.asset_type,
+               "placed_day" if animal else "planted_day": start.step // 24,
+               "yield_units": 0 if animal or rules.CROPS[asset.asset_type].ongoing else 1}
+        planned += asset_output_to(
+            state, AssetState(asset.asset_type, asset.tile, raw), target_step,
+            asset.service_schedule)
+    demand = known_demand_events(state, end_step=target_step - 1)
+    consumed = sum(q for step, q in demand[product] if step < target_step)
+    reveals = sum(state.step < day * 24 <= target_step for day in REVEAL_DAYS)
+    expected = reveals * params.expected_shop_demand_per_reveal.get(product, 0.0)
+    return state.market.inventory[product] + own + opponent + planned - consumed - expected
 
 
 @dataclass(frozen=True)
@@ -627,11 +703,11 @@ def optimize_short_sales(
                     purchase_arrivals[event.item].get(arrival_step, 0)
                     + event.quantity)
     # ── Fertilizer immediate sell rule ──
-    # Reserved F = approved FERTILIZE count in the frozen plan.
+    # Only future real shed pickups reserve F: carried/relay F and completed
+    # actions do not reserve the new observation's shed stock.
     reserved_f = sum(
-        max(1, getattr(event, "quantity", 0))
-        for event in commitments
-        if getattr(event, "kind", None) == "FERTILIZE"
+        amounts.get("FERTILIZER", 0)
+        for step, amounts in consumptions.items() if step >= state.step
     )
     shed_f = int(state.shed.get("FERTILIZER", 0))
     free_f = max(0, shed_f - reserved_f)

@@ -1,7 +1,8 @@
 """Replay-tunable parameters for the observation-driven midgame controller."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -15,14 +16,16 @@ class MidgameParameters:
     locality_zero_day: int = 24
     locality_distance_span: int = 8
 
-    # A 25-tile quadrant is bought only for a genuine scale deployment.
-    land_min_deployable_count: int = 8
-    land_value_cover_ratio: float = 1.25
-
     # New land purchase: cash reserve kept after land + fallback seed.
     fixed_cash_reserve: int = 200
-    # Maximum land quadrant index to consider (2 = NE+SW, 3 = +SE).
-    max_land_quadrant: int = 2
+    # Units per future reveal, initially one average basket tick across the
+    # eight official shop types. This is a tunable weight, not a shop forecast.
+    expected_shop_demand_per_reveal: Mapping[str, float] = field(
+        default_factory=lambda: {
+            "WHEAT": 0.625, "CARROT": 0.375, "TOMATO": 0.25,
+            "STRAWBERRY": 0.5, "MELON": 0.0, "EGG": 0.25,
+            "MILK": 0.375, "WOOL": 0.25,
+        })
 
 
 DEFAULT_MIDGAME_PARAMETERS = MidgameParameters()

@@ -180,13 +180,23 @@ assignment, movement, task order, and exact pickup/drop logistics; it cannot
 change a macro commitment.
 
 New commitments remain subject to the planner's pinned-rule economic checks.
-Animal and crop ranking uses a current-price daily-value snapshot with explicit
-purchase/seed, Wheat, and fertilizer cash inputs. Existing animals operate as
+Animal and crop ranking uses a lightweight daily-value formula with explicit
+purchase/seed, Wheat, and fertilizer cash inputs. New long assets price their
+realizable, terminal-truncated output at a first-output supply estimate;
+existing animals use their individual next-output estimate. That macro-only
+estimate includes own existing assets, previously accepted new assets, visible
+opponent base supply with a per-asset one-unit discount, known demand, and a
+centralized product weight for each future reveal. It never alters real market
+inventory or enters the short-horizon trade machine. Existing animals operate as
 PRODUCE, MAINTAIN, or EXIT; CARE is a separate next-cycle marginal check and
 held product stays on the asset until capacity, liquidation, terminal, or a
 specific cash need requires harvest. No terminal programme comparison, shop
 bonus, animal-count penalty, or fixed action/movement shadow price enters the
-decision. Future unrevealed shops are never predicted.
+decision. No concrete future shop or opponent strategy is predicted. Before an
+animal's first production has completed, it stays in minimum-maintenance mode.
+Completed ongoing crops are harvested if necessary, then actually dug before
+same-day replacement. Land purchases are cash-gated after the existing-land
+plan is funded, and only the second and third quadrants are eligible.
 
 Physical flows remain distinct: production, field stock, worker stock, shed
 stock, planned sale and shared-market inventory are separate dated records. Only

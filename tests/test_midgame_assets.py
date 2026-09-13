@@ -198,14 +198,14 @@ class MidgameAssetTests(unittest.TestCase):
 
     def test_runtime_path_reaches_produce_maintain_and_exit(self):
         produce = self.current(self.state(
-            day=20, animals=(self.cow(placed_day=13),),
+            day=20, animals=(self.cow(placed_day=12),),
             shed={"WHEAT": 2}))
         maintain = self.current(self.state(
-            day=20, animals=(self.cow(placed_day=13),),
+            day=20, animals=(self.cow(placed_day=12),),
             shed={"WHEAT": 2},
             inventories={"MILK": 30_000}))
         exit_asset = self.current(self.state(
-            day=20, animals=(self.cow(placed_day=13),),
+            day=20, animals=(self.cow(placed_day=12),),
             shed={"WHEAT": 2},
             inventories={
                 "MILK": 30_000,
@@ -219,12 +219,12 @@ class MidgameAssetTests(unittest.TestCase):
     def test_only_produce_cares_and_maintain_feeds_minimally(self):
         produce = self.current(self.state(
             day=20,
-            animals=(self.cow(placed_day=13, consecutive=0),),
+            animals=(self.cow(placed_day=12, consecutive=0),),
             shed={"WHEAT": 2}))
         maintain = self.current(self.state(
             day=20,
             animals=(self.cow(
-                held=5, placed_day=13, consecutive=1),),
+                held=5, placed_day=12, consecutive=1),),
             shed={"WHEAT": 2},
             inventories={"MILK": 30_000}))
         self.assertIn("CARE", {e.kind for e in produce.today_events})
@@ -233,7 +233,7 @@ class MidgameAssetTests(unittest.TestCase):
         self.assertNotIn("CARE", kinds)
 
     def test_exit_first_night_keeps_last_official_production(self):
-        cow = self.cow(placed_day=21, consecutive=0)
+        cow = self.cow(placed_day=19, consecutive=0)
         state = self.state(
             day=28, animals=(cow,),
             inventories={
@@ -259,7 +259,7 @@ class MidgameAssetTests(unittest.TestCase):
 
     def test_exit_collects_last_f_without_another_visit_reason(self):
         cow = self.cow(
-            held=0, consecutive=1, fertilizer=True, placed_day=21)
+            held=0, consecutive=1, fertilizer=True, placed_day=19)
         state = self.state(
             day=28, animals=(cow,),
             inventories={
@@ -275,7 +275,7 @@ class MidgameAssetTests(unittest.TestCase):
 
     def test_exit_second_day_liquidates_product_and_f_together(self):
         cow = self.cow(
-            held=1, consecutive=1, fertilizer=True, placed_day=21)
+            held=1, consecutive=1, fertilizer=True, placed_day=19)
         state = self.state(
             day=28, animals=(cow,),
             inventories={
@@ -703,184 +703,357 @@ class TradeAndExecutionTests(unittest.TestCase):
             refreshed.market_inventory,
             session.plans[state.player].market_inventory)
 
+class SubmitRegressionTests(unittest.TestCase):
+    setUpClass = classmethod(MidgameAssetTests.setUpClass.__func__)
+    state = MidgameAssetTests.state
+    cow = staticmethod(MidgameAssetTests.cow)
+    crop = staticmethod(MidgameAssetTests.crop)
+
+    def test_ongoing_cleanup_replay_and_same_day_replant(self):
+        from src.kaggriculture_agent.current_assets import completed_production_count
+        from src.kaggriculture_agent.operating import programme_invalidation
+        for kind in ("TOMATO", "STRAWBERRY"):
+            rule = rules.CROPS[kind]
+            completed_day = 2 + rule.first_yield_day + 3 * rule.interval
+            for held in (0, 2):
+                with self.subTest(kind=kind, held=held):
+                    crop = self.crop(kind, planted_day=2, held=held, position=(4, 4))
+                    state = self.state(day=completed_day, crops=(crop,), money=1000)
+                    current = read_current_assets(state)[0]
+                    self.assertEqual(completed_production_count(crop.official, completed_day - 1), 3)
+                    self.assertEqual(completed_production_count(crop.official, completed_day), 4)
+                    self.assertIsNone(current.next_production_step)
+                    self.assertFalse(any(e.kind.startswith("OUTPUT") for e in current.next_events))
+                    cleanup = [e for e in current.today_events if e.kind in {"HARVEST", "DIG"}]
+                    self.assertEqual([e.kind for e in cleanup],
+                                     ["HARVEST", "DIG"] if held else ["DIG"])
+                    if held:
+                        self.assertGreater(cleanup[1].step, cleanup[0].step)
+                    plan = make_plan(state)
+                    self.assertTrue(plan.feasible, plan.diagnostics)
+                    self.assertTrue(any(a.tile == crop.position for a in plan.additions))
+                    dig_commitment = next(e for e in plan.events
+                                          if e.tile == crop.position and e.kind == "DIG")
+                    for e in plan.events:
+                        if e.tile == crop.position and e.kind in {"PLANT", "PLACE"}:
+                            self.assertGreater(e.step, dig_commitment.step)
+                    dig_step = None
+                    planted_step = None
+                    for _ in range(24):
+                        decision = _decision(state, plan)
+                        before = state
+                        state = rules.advance_owned(state, decision.worker_actions, decision.market_orders)
+                        for worker, action in zip(before.workers, decision.worker_actions):
+                            if worker.position != crop.position:
+                                continue
+                            if action[0] == "DIG":
+                                dig_step = before.step
+                                self.assertIsNone(state.tile_at(crop.position).raw)
+                                self.assertEqual(plan.current_assets[0].physical_release_step, state.step)
+                                self.assertIsNone(programme_invalidation(state, plan))
+                            elif action[0] in {"PLANT", "PLACE"}:
+                                planted_step = before.step
+                                self.assertIsNotNone(dig_step)
+                                self.assertGreater(planted_step, dig_step)
+                                self.assertIsInstance(state.tile_at(crop.position).raw, dict)
+                    self.assertIsNotNone(dig_step)
+                    self.assertIsNotNone(planted_step)
+
+    def test_opponent_subtracts_one_per_asset_before_sum(self):
+        from src.kaggriculture_agent.market import forecast_inventory
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+        params = MidgameParameters(expected_shop_demand_per_reveal={})
+        baseline = self.state(day=10)
+        for count, target, expected in ((1, 13, 0), (1, 15, 1), (2, 15, 2)):
+            cows = tuple(self.cow(placed_day=5, position=(i, 0)) for i in range(count))
+            state = replace(baseline, opp=replace(baseline.opp, visible_animals=cows))
+            actual = forecast_inventory(state, "MILK", target * 24, params=params)
+            empty = forecast_inventory(baseline, "MILK", target * 24, params=params)
+            self.assertEqual(actual - empty, expected)
+
+    def test_own_planned_supply_and_candidate_not_double_counted(self):
+        from src.kaggriculture_agent.market import forecast_inventory
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+        params = MidgameParameters(expected_shop_demand_per_reveal={})
+        base = self.state(day=10)
+        target = 18 * 24
+        own = self.cow(placed_day=5)
+        state = self.state(day=10, animals=(own,))
+        empty = forecast_inventory(base, "MILK", target, params=params)
+        self.assertEqual(forecast_inventory(state, "MILK", target, params=params) - empty, 3)
+        a = _animal_programme(state, "COW", (2, 2), existing=False)
+        b = _animal_programme(state, "COW", (3, 2), existing=False)
+        before = dict(state.market.inventory)
+        one = forecast_inventory(state, "MILK", target, planned_assets=(a,), params=params)
+        two = forecast_inventory(state, "MILK", target, planned_assets=(a, b), params=params)
+        self.assertEqual(one - empty, 4)
+        self.assertEqual(two - one, 1)
+        self.assertEqual(state.market.inventory, before)
+        # Candidate is NOT added unless accepted and explicitly passed.
+        self.assertEqual(forecast_inventory(state, "MILK", target, params=params), empty + 3)
+
+    def test_known_demand_and_reveal_weights_are_exact(self):
+        from src.kaggriculture_agent.market import forecast_inventory
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+        state = self.state(day=11)
+        state = replace(state, shops=("PIZZA_SHOP", "SMOOTHIE_SHOP"))
+        params = MidgameParameters(expected_shop_demand_per_reveal={"MILK": 3})
+        # [D11,D14): 18 shop ticks * 2 + 3 Town; one reveal D13.
+        self.assertEqual(forecast_inventory(state, "MILK", 14 * 24, params=params),
+                         10000 - 36 - 3 - 3)
+        # [D11,D17): 36 shop ticks * 2 + 6 Town; D13 and D16.
+        self.assertEqual(forecast_inventory(state, "MILK", 17 * 24, params=params),
+                         10000 - 72 - 6 - 6)
+
+    def test_all_new_long_assets_use_first_output_and_truncated_count(self):
+        from unittest.mock import patch
+        from src.kaggriculture_agent import planner
+        from src.kaggriculture_agent.current_assets import conservative_f_price, _minimum_survival_feed_units
+        from src.kaggriculture_agent.market import buy_cost, forecast_inventory
+        from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS as params
+        for kind in planner.LONG_ASSETS:
+            state = self.state(day=10)
+            rule = (rules.ANIMALS if kind in rules.ANIMALS else rules.CROPS)[kind]
+            with patch.object(planner, "forecast_inventory", wraps=forecast_inventory) as forecast:
+                planner._asset_daily_value(state, kind, params)
+            self.assertEqual(forecast.call_args.args[2], (10 + rule.first_yield_day) * 24)
+            self.assertEqual(forecast.call_args.kwargs["planned_assets"], ())
+            late = self.state(day=29 - rule.first_yield_day)
+            value = planner._asset_daily_value(late, kind, params)
+            price = rules.market_price(
+                rule.product if kind in rules.ANIMALS else kind,
+                forecast_inventory(late, rule.product if kind in rules.ANIMALS else kind, 29 * 24))
+            if kind in rules.ANIMALS:
+                days = rule.first_yield_day
+                wheat = _minimum_survival_feed_units(days)
+                expected = (price + max(1, wheat) * conservative_f_price(late)
+                            - rule.cost - buy_cost("WHEAT", wheat, late.market.inventory["WHEAT"])) / days
+                self.assertAlmostEqual(value, expected)
+            elif rule.ongoing:
+                self.assertAlmostEqual(value, (price - rule.seed_cost) / rule.first_yield_day)
+            self.assertEqual(planner._asset_daily_value(
+                self.state(day=30 - rule.first_yield_day), kind, params), 0.0)
+            if kind in rules.ANIMALS or rule.ongoing:
+                two = self.state(day=29 - rule.first_yield_day - rule.interval)
+                product = rule.product if kind in rules.ANIMALS else kind
+                price = rules.market_price(product, forecast_inventory(
+                    two, product, (two.day + rule.first_yield_day) * 24))
+                days = rule.first_yield_day + rule.interval
+                if kind in rules.ANIMALS:
+                    wheat = _minimum_survival_feed_units(days)
+                    expected = (2 * price + max(1, wheat) * conservative_f_price(two)
+                                - rule.cost - buy_cost("WHEAT", wheat, two.market.inventory["WHEAT"])) / days
+                else:
+                    expected = (2 * price - rule.seed_cost) / days
+                self.assertAlmostEqual(planner._asset_daily_value(two, kind, params), expected)
+
+    def test_runtime_fill_keeps_accepted_supply_across_land_purchase(self):
+        from unittest.mock import patch
+        from src.kaggriculture_agent import planner
+        original = planner._asset_daily_value
+        seen = []
+        def record(state, kind, params, programme=None):
+            seen.append((bool(programme.land), tuple(a.asset_id for a in programme.additions)))
+            return original(state, kind, params, programme)
+        state = self.state(day=11, money=20000)
+        with patch.object(planner, "_asset_daily_value", side_effect=record):
+            plan = make_plan(state)
+        self.assertTrue(plan.feasible, plan.diagnostics)
+        old = [set(ids) for land, ids in seen if not land and ids]
+        new = [set(ids) for land, ids in seen if land]
+        self.assertTrue(old)
+        self.assertTrue(new)
+        self.assertTrue(any(ids <= new[0] for ids in old))
+
+    def test_first_output_protection_includes_production_night(self):
+        for day in range(20, 28):
+            animal = self.cow(placed_day=20, consecutive=1)
+            state = self.state(day=day, animals=(animal,), money=500,
+                               inventories={"MILK": 30000, "FERTILIZER": 30000, "WHEAT": 0})
+            plan = make_plan(state)
+            self.assertEqual(plan.current_assets[0].mode, MAINTAIN)
+            self.assertTrue(any(e.kind == "FEED" for e in plan.events))
+            self.assertFalse(any(e.kind == "CARE" for e in plan.events))
+        state = self.state(day=28, animals=(self.cow(placed_day=20),),
+                           inventories={"MILK": 30000, "FERTILIZER": 30000, "WHEAT": 0})
+        self.assertEqual(make_plan(state).current_assets[0].mode, EXIT)
+
+    def test_existing_animals_use_individual_next_output(self):
+        from src.kaggriculture_agent.market import forecast_inventory
+        from src.kaggriculture_agent.current_assets import next_animal_production_day
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+        params = MidgameParameters(expected_shop_demand_per_reveal={})
+        cows = (self.cow(placed_day=2, position=(3, 4)),
+                self.cow(placed_day=3, position=(4, 4)))
+        # Large known demand separates the two next-output prices enough to
+        # cross the existing zero base-value boundary.
+        state = self.state(day=13, animals=cows, money=1000,
+                           inventories={"MILK": 10103, "FERTILIZER": 30000})
+        state = replace(state, shops=("SMOOTHIE_SHOP",) * 8)
+        targets = [(next_animal_production_day(a.official, state.day) + 1) * 24 for a in cows]
+        self.assertEqual(targets, [14 * 24, 15 * 24])
+        prices = [rules.market_price("MILK", forecast_inventory(state, "MILK", t, params=params))
+                  for t in targets]
+        self.assertGreater(prices[1], prices[0])
+        modes = [a.mode for a in read_current_assets(state, params=params)]
+        self.assertEqual(modes[0], EXIT)
+        self.assertIn(modes[1], (PRODUCE, MAINTAIN))
+
+    def test_land_gate_runs_after_old_land_costs_and_hires(self):
+        from unittest.mock import patch
+        from src.kaggriculture_agent import planner
+        calls = []
+        original = planner._land_expansion
+        def record(state, programme, params):
+            calls.append(programme)
+            return original(state, programme, params)
+        state = self.state(day=11, money=10000)
+        with patch.object(planner, "_land_expansion", side_effect=record):
+            plan = make_plan(state)
+        self.assertTrue(plan.feasible, plan.diagnostics)
+        self.assertEqual(len(calls), 1)
+        old = calls[0]
+        self.assertTrue(old.routes)
+        self.assertTrue(old.additions)
+        self.assertTrue(all(rules.quadrant(a.tile) == "NW" for a in old.additions))
+        self.assertGreater(planner._committed_purchase_cost(state, old), 0)
+        self.assertTrue(all(a.asset_id in {b.asset_id for b in plan.assets} for a in old.assets))
+        # Opening cash passes the naked land gate, but existing-land inputs
+        # consume the margin: the complete runtime must not buy.
+        lower = make_plan(self.state(day=11, money=1800))
+        self.assertTrue(lower.feasible, lower.diagnostics)
+        self.assertTrue(lower.additions)
+        self.assertFalse(lower.land)
+
+    def test_land_strict_threshold_new_quadrant_and_fourth_disabled(self):
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+        from src.kaggriculture_agent import planner
+        self.assertNotIn("land_min_deployable_count", MidgameParameters.__dataclass_fields__)
+        self.assertNotIn("land_value_cover_ratio", MidgameParameters.__dataclass_fields__)
+        self.assertFalse(hasattr(planner, "_enforce_land_scale"))
+        # D28: no affordable production can mature before terminal; no buffer.
+        for size in (10, 8):
+            half = size // 2
+            for extra, buys in ((0, False), (1, True)):
+                threshold = 1000 + half * half * rules.CROPS["WHEAT"].seed_cost + 200
+                state = self.state(day=28, money=threshold + extra)
+                tiles = tuple(TileState((x, y), None if x < half and y < half else "LOCKED")
+                              for y in range(size) for x in range(size))
+                worker = replace(state.workers[0], position=(half - 1, half - 1))
+                state = replace(state, board_size=size, own=replace(
+                    state.own, tiles=tiles, workers=(worker,),
+                    usable_tiles=tuple(t.position for t in tiles if not t.is_locked)))
+                plan = make_plan(state)
+                self.assertTrue(plan.feasible, plan.diagnostics)
+                self.assertEqual(bool(plan.land), buys)
+        state = self.state(day=28, money=50000)
+        state = replace(state, own=replace(state.own, owned_land=("NW", "NE", "SW")))
+        self.assertFalse(make_plan(state).land)
+
+    def test_same_worker_carry_avoids_buy_through_make_plan(self):
+        for item in ("WHEAT", "FERTILIZER"):
+            if item == "WHEAT":
+                state = self.state(day=28, money=100, animals=(
+                    self.cow(placed_day=21, consecutive=1),))
+                expected = "FEED"
+            else:
+                state = self.state(day=28, money=100, crops=(
+                    self.crop("TOMATO", planted_day=20, held=0, consecutive=1, position=(4, 4)),),
+                    inventories={"FERTILIZER": 30000})
+                expected = "FERTILIZE"
+            worker = replace(state.workers[0], position=(4, 4), inventory={item: 1})
+            state = replace(state, own=replace(state.own, workers=(worker,)))
+            plan = make_plan(state)
+            self.assertTrue(plan.feasible, plan.diagnostics)
+            self.assertFalse(any(e.kind == "BUY_PRODUCT" and e.item == item for e in plan.events))
+            actions = [(s, a) for r in plan.routes for s, a in r.actions.items()]
+            self.assertTrue(any(a[0] == expected for _, a in actions))
+            for _ in range(4):
+                decision = _decision(state, plan)
+                state = rules.advance_owned(state, decision.worker_actions, decision.market_orders)
+            raw = state.tile_at((4, 4)).raw
+            self.assertTrue(raw["fed_today"] if item == "WHEAT"
+                            else raw["fertilized_until_day"] >= state.day)
+
+    def test_cross_worker_inputs_require_real_drop_pickup(self):
+        from src.kaggriculture_agent.planner import _route_input_deficits
+        from src.kaggriculture_agent.programme import WorkerRoute
+        from src.kaggriculture_agent.state import WorkerState
+        for item, op in (("WHEAT", "FEED"), ("FERTILIZER", "FERTILIZE")):
+            animal = self.cow(placed_day=21, consecutive=1, position=(4, 3))
+            crop = self.crop("TOMATO", planted_day=20, held=0, position=(4, 3))
+            state = self.state(day=28, animals=(animal,) if item == "WHEAT" else (),
+                               crops=(crop,) if item == "FERTILIZER" else ())
+            workers = (WorkerState(0, (4, 4), {item: 1}), WorkerState(1, (4, 4), {}))
+            state = replace(state, own=replace(state.own, workers=workers))
+            for relay in (False, True):
+                routes = (WorkerRoute(0, 28, "INNER", {state.step: ("DROP",) if relay else ("PASS",)}),
+                          WorkerRoute(1, 28, "INNER", {
+                              state.step + 1: ("PICKUP", item, 1),
+                              state.step + 2: ("NORTH",), state.step + 3: (op,)}))
+                plan = Programme(state.step, state.day, (), routes=routes, worker_count=2)
+                self.assertEqual(_route_input_deficits(state, plan)[item], 0 if relay else 1)
+                actual = state
+                for _ in range(4):
+                    d = _decision(actual, plan)
+                    actual = rules.advance_owned(actual, d.worker_actions, d.market_orders)
+                raw = actual.tile_at((4, 3)).raw
+                self.assertEqual(bool(raw["fed_today"]) if item == "WHEAT"
+                                 else raw["fertilized_until_day"] >= state.day, relay)
+
+    def test_f_reserve_expires_after_real_pickup(self):
+        from src.kaggriculture_agent.operating import _refresh_sales
+        from src.kaggriculture_agent.programme import WorkerRoute
+        state = self.state(day=28, shed={"FERTILIZER": 1}, crops=(
+            self.crop("TOMATO", planted_day=20, held=0, position=(4, 4)),))
+        route = WorkerRoute(0, 28, "INNER", {
+            state.step + 1: ("PICKUP", "FERTILIZER", 1),
+            state.step + 2: ("FERTILIZE",)})
+        old_event = ProgrammeEvent(state.step, 0, "f", "FERTILIZE", quantity=1)
+        plan = Programme(state.step, state.day, (), events=(old_event,), routes=(route,), feasible=True)
+        refreshed = _refresh_sales(state, plan)
+        self.assertTrue(refreshed.feasible, refreshed.diagnostics)
+        self.assertFalse(any(q.get("FERTILIZER", 0) for q in refreshed.planned_sale.values()))
+        actual = state
+        for _ in range(4):
+            decision = _decision(actual, refreshed)
+            actual = rules.advance_owned(actual, decision.worker_actions, decision.market_orders)
+        self.assertEqual(actual.tile_at((4, 4)).raw["fertilized_until_day"], state.day + 2)
+        self.assertEqual(actual.shed.get("FERTILIZER", 0), 0)
+        for offset in (4, 8):
+            later = replace(actual, step=state.step + offset, turn=offset,
+                            own=replace(actual.own, shed_inventory={"FERTILIZER": 1, "MILK": 2}))
+            refreshed = _refresh_sales(later, plan)
+            self.assertEqual(refreshed.planned_sale[later.step]["FERTILIZER"], 1)
+            self.assertTrue(all(s in {later.step, later.step + 4, later.step + 8}
+                                for s, q in refreshed.planned_sale.items() if q.get("MILK")))
+
+    def test_full_pinned_controller_episode_without_exception_fallback(self):
+        from src.kaggriculture_agent.scripted_opening import scripted_opening_action
+        for seed in (119, 120):
+            env = make("kaggriculture", configuration={"seed": seed})
+            env.reset(2)
+            session = DailyPlanningSession()
+            midgame_days = set()
+            while not env.done:
+                observation = env.state[0].observation
+                if observation.day < 10:
+                    action = scripted_opening_action(observation)
+                else:
+                    state = reconstruct(observation)
+                    plan = session.plan_for(state)
+                    self.assertTrue(plan.feasible, (seed, state.step, plan.diagnostics))
+                    decision = session.execution_for(state, plan)
+                    self.assertTrue(session.plans[state.player].feasible,
+                                    (seed, state.step, session.plans[state.player].diagnostics))
+                    action = {"farmer": list(decision.worker_actions[0]),
+                              "hands": [list(a) for a in decision.worker_actions[1:]],
+                              "market": [list(o) for o in decision.market_orders]}
+                    midgame_days.add(state.day)
+                env.step([action, {"farmer": ["PASS"], "hands": [], "market": []}])
+            self.assertEqual(midgame_days, set(range(10, 30)))
+            self.assertEqual(env.state[0].status, "DONE")
+
 
 if __name__ == "__main__":
     unittest.main()
-
-class NewFixTests(MidgameAssetTests):
-    # --- Item 1: Tomato/Strawberry Lifecycle ---
-    def test_tomato_ongoing_next_production(self):
-        from src.kaggriculture_agent.current_assets import _next_crop_production_day, completed_production_count
-        # Tomato planted day 3. first_yield_day=8, interval=1, max_yield=4.
-        # Productions: day 10, 11, 12, 13
-        raw = {"crop": "TOMATO", "planted_day": 3}
-        self.assertEqual(completed_production_count(raw, 10), 1)
-        self.assertEqual(_next_crop_production_day(raw, 11), 11)
-        self.assertEqual(completed_production_count(raw, 13), 4)
-        # On day 13, it will still return 13 because production happens AT THE END of day 13.
-        self.assertEqual(_next_crop_production_day(raw, 13), 13)
-        # On day 14, it should return None.
-        self.assertIsNone(_next_crop_production_day(raw, 14))
-
-    def test_tomato_lifecycle_done_held(self):
-        from src.kaggriculture_agent.current_assets import HARVEST
-        # Day 14, planted day 3 (completed 4 productions on day 13). Held = 1.
-        tomato = self.crop("TOMATO", planted_day=3, held=1)
-        state = self.state(day=14, crops=[tomato])
-        current = self.current(state)
-        self.assertEqual(current.mode, HARVEST)
-        self.assertTrue(any(e.source == "LIFECYCLE_DONE" for e in current.today_events))
-
-    def test_tomato_lifecycle_done_empty(self):
-        from src.kaggriculture_agent.current_assets import HARVEST
-        # Day 14, planted day 3, held = 0.
-        tomato = self.crop("TOMATO", planted_day=3, held=0)
-        state = self.state(day=14, crops=[tomato])
-        current = self.current(state)
-        self.assertEqual(current.mode, HARVEST)
-        self.assertTrue(any(e.action == ("DIG",) for e in current.today_events))
-
-    def test_terminal_harvest_still_works(self):
-        from src.kaggriculture_agent.current_assets import HARVEST
-        # Day 29, not done yet
-        tomato = self.crop("TOMATO", planted_day=26, held=1)
-        state = self.state(day=29, crops=[tomato])
-        current = self.current(state)
-        self.assertEqual(current.mode, HARVEST)
-        self.assertTrue(any(e.source == "TERMINAL_LIQUIDATION" for e in current.today_events))
-
-    # --- Item 2: Forecast Valuation & Pre-first-output EXIT ---
-    def test_forecast_inventory_basic(self):
-        from src.kaggriculture_agent.market import forecast_inventory
-        state = self.state(day=10, inventories={"MILK": 10})
-        # Basic forecast with no opponent or demand
-        val1 = forecast_inventory(state, "MILK", 14)
-        val2 = forecast_inventory(state, "MILK", 14, own_production_to_target=2)
-        self.assertEqual(val2, val1 + 2)
-
-    def test_forecast_inventory_opponent(self):
-        from src.kaggriculture_agent.market import forecast_inventory
-        opp_cow = self.cow(placed_day=5)
-        raw_state = self.state(day=10)
-        # Manually inject opponent visible animal
-        from dataclasses import replace
-        opp = replace(raw_state.opp, visible_animals=(opp_cow,))
-        state = replace(raw_state, opp=opp)
-        val1 = forecast_inventory(raw_state, "MILK", 14)
-        val2 = forecast_inventory(state, "MILK", 14)
-        # Opponent cow (placed 5) first yield at day 12. Theory max = 1. So 1-1 = 0 supply? Wait, if theory max is 1, max(0, 1-1) = 0.
-        # But wait, max_held is 6. If it produced on day 12 and 14...
-        self.assertIsInstance(val2, int)
-
-    def test_forecast_animal_valuation(self):
-        from src.kaggriculture_agent.planner import _forecast_animal_daily_value
-        from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS
-        state = self.state(day=10)
-        val = _forecast_animal_daily_value(state, "COW", DEFAULT_MIDGAME_PARAMETERS)
-        self.assertGreater(val, -100)
-
-    def test_late_game_animal_valuation(self):
-        from src.kaggriculture_agent.planner import _forecast_animal_daily_value
-        from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS
-        state = self.state(day=26)
-        # Placed on day 26, first yield is 26+8-1 = 33 > 28, so 0 productions
-        val = _forecast_animal_daily_value(state, "COW", DEFAULT_MIDGAME_PARAMETERS)
-        self.assertEqual(val, 0.0)
-
-    def test_late_game_crop_valuation(self):
-        from src.kaggriculture_agent.planner import _forecast_crop_daily_value
-        state = self.state(day=28)
-        # Planted day 28, TOMATO first yield 28+8-1 = 35 > 28
-        val = _forecast_crop_daily_value(state, "TOMATO")
-        self.assertEqual(val, 0.0)
-
-    def test_pre_first_output_exit_prohibition(self):
-        from src.kaggriculture_agent.current_assets import MAINTAIN
-        # Place cow at day 25. Check at day 26.
-        # It has 0 productions achievable before terminal (first output > 28).
-        # Daily value will be <= 0.
-        cow = self.cow(placed_day=25, held=0)
-        state = self.state(day=26, animals=[cow])
-        current = self.current(state)
-        self.assertEqual(current.mode, MAINTAIN)
-
-    def test_post_first_output_exit(self):
-        from src.kaggriculture_agent.current_assets import EXIT
-        # Place cow at day 20. First output is 27. Check at day 28.
-        # It has produced once. No more productions left before terminal. Daily value <= 0.
-        cow = self.cow(placed_day=20, held=0)
-        state = self.state(day=28, animals=[cow])
-        current = self.current(state)
-        self.assertEqual(current.mode, EXIT)
-
-    # --- Item 3: Land Purchase ---
-    def test_land_purchase_thresholds(self):
-        from src.kaggriculture_agent.planner import _land_expansion
-        from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS
-        from src.kaggriculture_agent.programme import Programme
-        
-        state_no = self.state(day=10, money=1400)
-        prog_no = _land_expansion(state_no, Programme(state_no.step, 0, ()), DEFAULT_MIDGAME_PARAMETERS)
-        self.assertEqual(len(prog_no.land), 0)
-
-        # Money = 10000 > 1700, purchase
-        state_yes = self.state(day=10, money=10000)
-        prog_yes = _land_expansion(state_yes, Programme(state_yes.step, 0, ()), DEFAULT_MIDGAME_PARAMETERS)
-        self.assertEqual(len(prog_yes.land), 1)
-        self.assertEqual(prog_yes.land[0].quadrant, "NE")
-
-    def test_land_4_disabled(self):
-        from src.kaggriculture_agent.planner import _land_expansion
-        from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS
-        from src.kaggriculture_agent.programme import Programme, LandProgramme
-        # Assume 3 lands owned
-        state = self.state(day=10, money=10000)
-        prog = Programme(state.step, 0, (), land=(LandProgramme("NE", 0, 0, (0,0), ""), LandProgramme("SW", 0, 0, (0,0), "")))
-        prog = _land_expansion(state, prog, DEFAULT_MIDGAME_PARAMETERS)
-        self.assertEqual(len(prog.land), 2) # No 4th land added
-
-    # --- Item 4: Resolve Inputs Shed Semantics ---
-    def test_resolve_inputs_uses_shed_wheat(self):
-        from src.kaggriculture_agent.planner import _resolve_inputs, current_asset_programmes
-        from src.kaggriculture_agent.programme import Programme
-        # Shed has 0 WHEAT, worker carries 10 WHEAT.
-        cow = self.cow(placed_day=3, held=0)
-        state = self.state(day=10, animals=[cow], shed={}, money=1000)
-        from dataclasses import replace
-        worker = replace(state.own.workers[0], inventory={"WHEAT": 10})
-        state = replace(state, own=replace(state.own, workers=(worker,)))
-        
-        current = (self.current(state),)
-        assets = current_asset_programmes(current)
-        prog = _programme_from_assets(state, assets, (), (), current)
-        prog = _resolve_inputs(state, prog)
-        self.assertTrue(any(e.kind == "BUY_PRODUCT" and e.item == "WHEAT" for e in prog.events))
-
-    def test_resolve_inputs_uses_shed_fertilizer(self):
-        from src.kaggriculture_agent.planner import _resolve_inputs, current_asset_programmes
-        from src.kaggriculture_agent.programme import Programme, ProgrammeEvent
-        state = self.state(day=10, shed={}, money=1000)
-        from dataclasses import replace
-        worker = replace(state.own.workers[0], inventory={"FERTILIZER": 1})
-        state = replace(state, own=replace(state.own, workers=(worker,)))
-        
-        event = ProgrammeEvent(state.step, 0, "f", "FERTILIZE", item="FERTILIZER", quantity=1)
-        current = ()
-        assets = current_asset_programmes(current)
-        prog = _programme_from_assets(state, assets, (event,), (), current)
-        prog = _resolve_inputs(state, prog)
-        self.assertTrue(any(e.kind == "BUY_PRODUCT" and e.item == "FERTILIZER" for e in prog.events))
-
-    # --- Item 5: Fertilizer Immediate Sell ---
-    def test_fertilizer_immediate_sell(self):
-        from src.kaggriculture_agent.market import optimize_short_sales
-        from src.kaggriculture_agent.programme import ProgrammeEvent
-        state = self.state(day=10, shed={"FERTILIZER": 5})
-        commitments = [
-            ProgrammeEvent(state.step, 0, "f1", "FERTILIZE", quantity=1),
-            ProgrammeEvent(state.step, 0, "f2", "FERTILIZE", quantity=1),
-        ]
-        # optimize_short_sales(state, arrivals, consumptions=None, commitments=())
-        plan = optimize_short_sales(state, {}, commitments=commitments)
-        self.assertEqual(plan.planned_sale.get(state.step, {}).get("FERTILIZER", 0), 3)
-

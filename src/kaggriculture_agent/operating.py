@@ -24,6 +24,8 @@ def programme_invalidation(state: State, programme: Programme) -> str | None:
         if asset.asset_type in rules.ANIMALS and tile.animal != asset.asset_type:
             return f"kept {asset.asset_id} no longer exists"
         if asset.asset_type in rules.CROPS and tile.crop != asset.asset_type:
+            if asset.release_turn is not None and state.step >= asset.release_turn:
+                continue
             # A completed one-time harvest intentionally releases its tile.
             if not any(e.step < state.step for e in asset.harvest_schedule):
                 return f"kept {asset.asset_id} no longer exists"
