@@ -1,7 +1,7 @@
 """Lightweight observation-backed decisions for assets already on the farm."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
 from . import rules
@@ -275,6 +275,8 @@ def _animal_current_state(
     asset: AssetState,
     prior: CurrentAssetState | None,
     params: MidgameParameters,
+    *,
+    excluded_own_tiles: frozenset[Position] = frozenset(),
 ) -> CurrentAssetState:
     raw = dict(asset.official)
     identifier = _asset_id(asset)
@@ -284,7 +286,8 @@ def _animal_current_state(
     production_day = next_animal_production_day(raw, state.day)
     first_output_complete = state.day >= int(raw["placed_day"]) + rule.first_yield_day
     forecast_price = (rules.market_price(rule.product, forecast_inventory(
-        state, rule.product, _production_step(production_day), params=params))
+        state, rule.product, _production_step(production_day),
+        excluded_own_tiles=excluded_own_tiles, params=params))
         if production_day is not None else 0)
     daily = animal_daily_value(
         state, asset.asset_type, params, product_price=forecast_price)
@@ -664,12 +667,28 @@ def read_current_assets(
     # Prior state is used only to keep an in-progress EXIT sticky.  Every other
     # decision is derived from the same real observation path used at runtime.
     del prior_shops
+    prior_assets = tuple(prior_assets)
     prior = {asset.asset_id: asset for asset in prior_assets}
-    assets = [
-        _animal_current_state(
-            state, animal, prior.get(_asset_id(animal)), params)
-        for animal in state.own.animals
-    ]
+    ordered_animals = sorted(
+        state.own.animals,
+        key=lambda animal: (
+            rules.distance_to_shed(animal.position, state.board_size),
+            animal.position[1], animal.position[0], _asset_id(animal)))
+    excluded = {
+        asset.tile for asset in prior_assets
+        if asset.mode == EXIT and asset.asset_type in rules.ANIMALS
+    }
+    assets = []
+    exit_order = 0
+    for animal in ordered_animals:
+        current = _animal_current_state(
+            state, animal, prior.get(_asset_id(animal)), params,
+            excluded_own_tiles=frozenset(excluded))
+        if current.mode == EXIT:
+            current = replace(current, exit_order=exit_order)
+            exit_order += 1
+            excluded.add(animal.position)
+        assets.append(current)
     assets.extend(_crop_current_state(state, crop)
                   for crop in state.own.crops)
     return tuple(sorted(

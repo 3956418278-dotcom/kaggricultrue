@@ -215,6 +215,7 @@ def asset_output_to(state: State, asset: AssetState, target_step: int,
 
 def forecast_inventory(state: State, product: str, target_step: int, *,
                        planned_assets=(), commitments=(),
+                       excluded_own_tiles=frozenset(),
                        params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS) -> float:
     """Macro-only next-output supply estimate at the post-refresh state T.
 
@@ -226,7 +227,8 @@ def forecast_inventory(state: State, product: str, target_step: int, *,
                 if asset.asset_type in rules.ANIMALS else asset.asset_type) == product
 
     own = sum(asset_output_to(state, a, target_step, commitments)
-              for a in (*state.own.animals, *state.own.crops) if matches(a))
+              for a in (*state.own.animals, *state.own.crops)
+              if matches(a) and a.position not in excluded_own_tiles)
     opponent = sum(max(0, asset_output_to(state, a, target_step) - 1)
                    for a in (*state.opp.visible_animals, *state.opp.visible_crops)
                    if matches(a))
@@ -612,6 +614,68 @@ def _commitment_lines(commitments, step: int) -> int:
     return lines
 
 
+def _defer_sale_lines(
+    schedules: Mapping[str, Mapping[int, int]],
+    commitments,
+    forced: Mapping[str, Mapping[int, int]],
+) -> tuple[dict[str, dict[int, int]], str | None]:
+    """Move ordinary SELL lines one turn at a time until every turn is legal.
+
+    NOW/+4/+8 remains the economic decision grid. This is only the market
+    order compiler: when a chosen checkpoint has no free order line, the
+    complete product sale is executed on the next turn. A forced line cannot
+    move because it may fund a same-turn purchase or prevent shed overflow.
+    """
+    deferred = {
+        product: {step: quantity for step, quantity in schedule.items()
+                  if quantity > 0}
+        for product, schedule in schedules.items()
+    }
+    pending_steps = sorted({
+        step for schedule in deferred.values() for step in schedule
+    })
+    index = 0
+    while index < len(pending_steps):
+        step = pending_steps[index]
+        index += 1
+        sale_products = [
+            product for product in rules.PRODUCTS
+            if deferred[product].get(step, 0) > 0
+        ]
+        slots = rules.MAX_MARKET_ORDERS - _commitment_lines(
+            commitments, step)
+        hard_products = [
+            product for product in sale_products
+            if forced[product].get(step, 0) > 0
+        ]
+        if slots < len(hard_products):
+            return deferred, (
+                f"market order capacity cannot satisfy hard sales at {step}")
+        while len(sale_products) > slots:
+            movable = [
+                product for product in sale_products
+                if product not in hard_products
+            ]
+            if not movable:
+                return deferred, f"market order capacity exceeded at {step}"
+            product = min(
+                movable,
+                key=lambda item: (deferred[item][step], item),
+            )
+            quantity = deferred[product].pop(step)
+            next_step = step + 1
+            if next_step > rules.TERMINAL_ACTION_STEP:
+                return deferred, (
+                    f"market order capacity exceeded at terminal step {step}")
+            deferred[product][next_step] = (
+                deferred[product].get(next_step, 0) + quantity)
+            sale_products.remove(product)
+            if next_step not in pending_steps[index:]:
+                pending_steps.append(next_step)
+                pending_steps[index:] = sorted(pending_steps[index:])
+    return deferred, None
+
+
 def _apply_commitment(
     event, money: int, hires: int, land_count: int,
     inventory: dict[str, int],
@@ -860,45 +924,12 @@ def optimize_short_sales(
 
     for _ in range(rules.SHED_CAPACITY * 3 + 30):
         revenue, schedules = solve_all()
+        schedules, capacity_failure = _defer_sale_lines(
+            schedules, commit_list, forced)
+        if capacity_failure is not None:
+            return SalePlan(0, {}, {}, False, capacity_failure)
         result = simulate(schedules)
         if result[0] == "OK":
-            # Market-line capacity: commitments are fixed; ordinary sale lines
-            # move to the next legal checkpoint instead of being truncated.
-            changed = False
-            for step in sorted({
-                    *checkpoints,
-                    *(s for schedule in schedules.values()
-                      for s, q in schedule.items() if q)}):
-                sale_products = [
-                    product for product in rules.PRODUCTS
-                    if schedules[product].get(step, 0)]
-                slots = rules.MAX_MARKET_ORDERS - _commitment_lines(
-                    commit_list, step)
-                hard_products = [
-                    product for product in sale_products
-                    if forced[product].get(step, 0)]
-                if slots < len(hard_products):
-                    return SalePlan(
-                        0, {}, {}, False,
-                        f"market order capacity cannot satisfy hard sales at {step}")
-                while len(sale_products) > slots:
-                    movable = [
-                        product for product in sale_products
-                        if not forced[product].get(step, 0)
-                        and step != checkpoints[-1]]
-                    if not movable:
-                        return SalePlan(
-                            0, {}, {}, False,
-                            f"market order capacity exceeded at {step}")
-                    product = min(
-                        movable,
-                        key=lambda item: (
-                            schedules[item].get(step, 0), item))
-                    blocked[product].add(step)
-                    sale_products.remove(product)
-                    changed = True
-            if changed:
-                continue
             break
         kind, step, amount, stock, inventory, _ = result
         if kind in {"OVERFLOW", "ORDER_OVERFLOW"}:
@@ -951,13 +982,15 @@ def optimize_short_sales(
     inventories = {
         product: int(state.market.inventory[product])
         for product in rules.PRODUCTS}
+    actual_revenue = 0
     for step in event_steps:
         for product in rules.PRODUCTS:
             quantity = schedules[product].get(step, 0)
             if quantity:
                 planned[step][product] = quantity
-            _, inventories[product] = _sale_inventory_after(
+            earned, inventories[product] = _sale_inventory_after(
                 product, quantity, inventories[product])
+            actual_revenue += earned
             inventories[product] -= valuation_demand[product].get(step, 0)
             trajectory[step][product] = inventories[product]
-    return SalePlan(revenue, dict(planned), dict(trajectory))
+    return SalePlan(actual_revenue, dict(planned), dict(trajectory))

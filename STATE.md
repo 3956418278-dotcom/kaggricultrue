@@ -29,7 +29,7 @@ short states rather than terminal programmes.
   prices, with terminal-truncated new output and discounted realizable F;
 - observation-backed animal PRODUCE/MAINTAIN/EXIT, minimum survival FEED,
   pre-first-output protection, one-cycle CARE, held-capacity harvest gates,
-  and a two-night EXIT tail;
+  a two-night EXIT tail, and nearest-first sequential EXIT revaluation;
 - event-local decisions for existing Wheat/Carrot/Melon/Tomato/Strawberry,
   including actual HARVEST/DIG cleanup and same-day ongoing-crop replacement;
 - feed sourcing from real stock or route-proven mature Wheat, followed only by
@@ -41,6 +41,8 @@ short states rather than terminal programmes.
   purchases; only future shed F pickups reserve F, and free shed F sells NOW;
 - restored runnable daily intraday assignment with exact PICKUP/DROP routes and
   minimum feasible same-day staffing;
+- explicit `must_return` production: D1-D10 shed-distance <=3 plus a
+  farthest-first EOD-capacity split, with forced DROP no later than turn 22;
 - a runtime trade machine that re-reads real inventory every four turns and
   evaluates only NOW/+4/+8, enforcing overflow, cash, terminal, and ten-order
   constraints before discretionary timing;
@@ -53,7 +55,7 @@ an evaluation-local schema and do not enter the submitted strategy.
 
 ## Validation
 
-- The repository suite passes 107 tests, including the pinned environment,
+- The repository suite passes 122 tests, including the pinned environment,
   controller, seed ledger, asset modes, crop inputs, EXIT liquidation,
   short-horizon trade, order-limit, and runnable intraday regressions.
 - Two full pinned episodes (seeds 119-120) completed through D30 against PASS
@@ -65,7 +67,14 @@ an evaluation-local schema and do not enter the submitted strategy.
 ## Limiting issue
 
 The production runtime is executable, but its intraday implementation is the
-restored pre-zonal daily executor; the hand-authored zonal template library is
-still independent and is intentionally not connected by this change. D5-D10
-also remain the previously declared PASS interval. No competitive strength or
+restored pre-zonal daily executor. The replacement two-/three-/four-land
+fixed-road catalogue and its exact crop/connect/24-turn selector are still
+independent and intentionally not connected by this change. The current
+catalogue has 41 two-land and 55 three-land layouts through 12 workers,
+including cross-quadrant spines and directional hotspot roads. Its 42
+four-land entries are provisional and outside current integration/coverage
+acceptance. Each normal layout has three fixed EOD/narrow/wide return versions;
+selected high-load layouts add one authored overflow version. There is no
+return-mask enumeration, pair repair, or dynamic partitioning. D5-D10 also
+remain the previously declared PASS interval. No competitive strength or
 accepted-baseline claim has been established.

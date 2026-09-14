@@ -67,6 +67,7 @@ class CurrentAssetState:
     next_events: tuple[ProgrammeEvent, ...] = ()
     liquidation_step: int | None = None
     physical_release_step: int | None = None
+    exit_order: int | None = None
 
     @property
     def animal_mode(self) -> str | None:
@@ -121,6 +122,10 @@ class Programme:
     outer: frozenset[Position] = frozenset()
     placement_load: Mapping[Position, int] = field(default_factory=dict)
     return_mode: Mapping[str, str] = field(default_factory=dict)
+    must_return: Mapping[int, frozenset[Position]] = field(default_factory=dict)
+    return_reason: Mapping[int, Mapping[Position, str]] = field(default_factory=dict)
+    partition_template_id: str | None = None
+    zone_assignment: Mapping[Position, str] = field(default_factory=dict)
     routes: tuple[WorkerRoute, ...] = ()
     terminal_cash: int = 0
     feasible: bool = False

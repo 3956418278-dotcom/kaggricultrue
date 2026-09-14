@@ -33,6 +33,11 @@ from src.kaggriculture_agent.programme import (
     Programme,
     ProgrammeEvent,
 )
+from src.kaggriculture_agent.return_requirements import (
+    annotate_programme_returns,
+    mark_tile_workloads,
+    return_requirements,
+)
 from src.kaggriculture_agent.realization import TurnDecision
 from src.kaggriculture_agent.state import (
     AssetState,
@@ -215,6 +220,127 @@ class MidgameAssetTests(unittest.TestCase):
         self.assertEqual(produce.mode, PRODUCE)
         self.assertEqual(maintain.mode, MAINTAIN)
         self.assertEqual(exit_asset.mode, EXIT)
+
+    def test_exit_order_is_nearest_first_and_revalues_remaining_animals(self):
+        from src.kaggriculture_agent.midgame_config import MidgameParameters
+
+        near = self.cow(placed_day=3, position=(4, 4))
+        far = self.cow(placed_day=3, position=(0, 0))
+        state = self.state(
+            day=20, animals=(far, near),
+            inventories={
+                "MILK": 9_886,
+                "FERTILIZER": 30_000,
+                "WHEAT": 0,
+            })
+        current = read_current_assets(
+            state,
+            params=MidgameParameters(expected_shop_demand_per_reveal={}))
+        by_tile = {asset.tile: asset for asset in current}
+        self.assertEqual(by_tile[(4, 4)].mode, EXIT)
+        self.assertEqual(by_tile[(4, 4)].exit_order, 0)
+        self.assertIn(by_tile[(0, 0)].mode, (PRODUCE, MAINTAIN))
+        self.assertIsNone(by_tile[(0, 0)].exit_order)
+        self.assertGreater(by_tile[(0, 0)].daily_value, 0)
+
+    def test_multiple_exits_receive_nearest_first_order(self):
+        animals = (
+            self.cow(placed_day=3, position=(0, 0)),
+            self.cow(placed_day=3, position=(3, 4)),
+            self.cow(placed_day=3, position=(4, 4)),
+        )
+        state = self.state(
+            day=20, animals=animals,
+            inventories={
+                "MILK": 30_000,
+                "FERTILIZER": 30_000,
+                "WHEAT": 0,
+            })
+        current = read_current_assets(state)
+        orders = {asset.tile: asset.exit_order for asset in current}
+        self.assertEqual(orders, {(4, 4): 0, (3, 4): 1, (0, 0): 2})
+
+    def test_early_near_harvest_is_labeled_must_return(self):
+        state = self.state(day=9)
+        near = (1, 4)  # shed distance 3
+        far = (0, 0)
+        programme = Programme(
+            state.step, state.day, (), events=(
+                ProgrammeEvent(
+                    state.step, 0, "near", "HARVEST", near, "near",
+                    "MELON", 6, ("HARVEST",)),
+                ProgrammeEvent(
+                    state.step, 0, "far", "HARVEST", far, "far",
+                    "MELON", 6, ("HARVEST",)),
+            ))
+        labels = return_requirements(
+            state, programme, eod_capacity=100)
+        self.assertEqual(labels.must_return, frozenset((near,)))
+        self.assertEqual(labels.eod, frozenset((far,)))
+        self.assertEqual(labels.reason[near], "EARLY_NEAR_SHED")
+
+    def test_capacity_labels_farthest_output_eod_and_nearer_output_return(self):
+        from src.kaggriculture_agent import zonal_templates as zonal
+
+        state = self.state(day=11)
+        tiles = sorted(
+            zonal._owned_tiles(zonal.THREE_LAND),
+            key=lambda tile: (
+                -rules.distance_to_shed(tile), tile[1], tile[0]))[:18]
+        programme = Programme(
+            state.step, state.day, (), events=tuple(
+                ProgrammeEvent(
+                    state.step, 0, f"melon:{x}:{y}", "HARVEST",
+                    (x, y), f"melon:{x}:{y}", "MELON", 6,
+                    ("HARVEST",))
+                for x, y in tiles))
+        labels = return_requirements(
+            state, programme, eod_capacity=rules.SHED_CAPACITY)
+        self.assertEqual(labels.eod, frozenset(tiles[:16]))
+        self.assertEqual(labels.must_return, frozenset(tiles[16:]))
+        self.assertEqual(labels.eod_units, 96)
+
+        workloads = mark_tile_workloads(
+            {tile: zonal.TileWorkload(1, 6) for tile in tiles}, labels)
+        solution = zonal.select_minimum_workforce(
+            zonal.THREE_LAND, workloads)
+        self.assertIsNotNone(solution)
+        self.assertLessEqual(108 - solution.returned_units, 100)
+
+    def test_opening_shed_inventory_reduces_eod_capacity(self):
+        state = self.state(day=11, shed={"MELON": 94})
+        tiles = ((0, 0), (1, 0), (2, 0))
+        programme = Programme(
+            state.step, state.day, (), events=tuple(
+                ProgrammeEvent(
+                    state.step, 0, f"harvest:{x}", "HARVEST", tile,
+                    f"crop:{x}", "MELON", 6, ("HARVEST",))
+                for x, tile in enumerate(tiles)))
+        labels = return_requirements(state, programme)
+        self.assertEqual(labels.eod_capacity, 6)
+        self.assertEqual(labels.eod, frozenset(((0, 0),)))
+        self.assertEqual(labels.must_return, frozenset(((1, 0), (2, 0))))
+
+    def test_must_return_annotation_reaches_shed_by_turn_22(self):
+        from src.kaggriculture_agent.intraday import solve_intraday
+
+        state = self.state(day=9)
+        tile = (1, 4)
+        programme = Programme(
+            state.step, state.day, (), events=(ProgrammeEvent(
+                state.step, 0, "harvest", "HARVEST", tile, "crop",
+                "MELON", 6, ("HARVEST",), deadline=state.step + 22),))
+        annotated = annotate_programme_returns(state, programme)
+        self.assertEqual(
+            annotated.must_return[state.day], frozenset((tile,)))
+        solved = solve_intraday(state, annotated)
+        drops = [
+            step - state.day * rules.TURNS_PER_DAY
+            for route in solved.routes
+            for step, action in route.actions.items()
+            if action and action[0] == "DROP"]
+        self.assertTrue(drops)
+        self.assertLessEqual(min(drops), 22)
 
     def test_only_produce_cares_and_maintain_feeds_minimally(self):
         produce = self.current(self.state(
@@ -566,6 +692,42 @@ class TradeAndExecutionTests(unittest.TestCase):
         self.assertTrue(sale.feasible, sale.failure)
         self.assertGreaterEqual(
             sum(sale.planned_sale.get(state.step, {}).values()), 1)
+
+    def test_ordinary_sell_moves_one_turn_when_market_lines_are_full(self):
+        state = self.state(shed={"MILK": 2})
+        commitments = tuple(
+            ProgrammeEvent(
+                state.step, -1, f"seed-{index}", "BUY_SEED",
+                item="WHEAT", quantity=1)
+            for index in range(rules.MAX_MARKET_ORDERS)
+        )
+        sale = optimize_short_sales(
+            state, {}, commitments=commitments)
+        self.assertTrue(sale.feasible, sale.failure)
+        self.assertEqual(
+            sale.planned_sale.get(state.step, {}).get("MILK", 0), 0)
+        self.assertEqual(
+            sale.planned_sale[state.step + 1]["MILK"], 2)
+
+    def test_deferred_sell_keeps_every_turn_within_market_line_limit(self):
+        state = self.state(shed={"MILK": 2, "WOOL": 2})
+        commitments = tuple(
+            ProgrammeEvent(
+                state.step, -1, f"seed-{index}", "BUY_SEED",
+                item="WHEAT", quantity=1)
+            for index in range(rules.MAX_MARKET_ORDERS - 1)
+        )
+        sale = optimize_short_sales(
+            state, {}, commitments=commitments)
+        self.assertTrue(sale.feasible, sale.failure)
+        programme = Programme(
+            state.step, state.day, (), events=commitments,
+            planned_sale=sale.planned_sale, feasible=True)
+        for step in (state.step, state.step + 1):
+            actual = replace(state, step=step, turn=step % 24)
+            self.assertLessEqual(
+                len(_decision(actual, programme).market_orders),
+                rules.MAX_MARKET_ORDERS)
 
     def test_confirmed_product_buy_arrives_before_reserved_pickup(self):
         state = self.state(money=100)

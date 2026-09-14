@@ -13,13 +13,17 @@ is only the initial locality-calibration point, not an initialization requiremen
 | `locality_zero_day` | 24 | Day from which locality preference is zero. |
 | `locality_distance_span` | 8 | Shed-distance at which locality preference reaches zero. |
 | `fixed_cash_reserve` | 200 | Strict cash gate after funding the existing-land plan, next land price and new-quadrant Wheat seed fallback. Only quadrants 2 and 3 may be purchased. |
+| `early_return_last_day` | 9 | Last zero-based game day covered by the D1-D10 near-shed return rule. |
+| `early_return_distance` | 3 | D1-D10 harvested bundles at shed distance at most this value receive `must_return`. |
 | `expected_shop_demand_per_reveal` | W .625; C .375; T .25; ST .5; M 0; Egg .25; Milk .375; Wool .25 | Macro inventory subtraction per future reveal, initially one average basket tick across the eight official shops. These uncalibrated weights do not select or simulate a future shop. |
 
 Animal modes have no injected score maps or action shadow prices. EXIT is the
 mechanical zero boundary of current daily value; among positive assets, a
 positive next-cycle CARE increment selects PRODUCE and otherwise selects
 MAINTAIN. Before the first production has completed, an animal always remains
-MAINTAIN with minimum survival feeding; afterwards EXIT remains sticky.
+MAINTAIN with minimum survival feeding; afterwards EXIT remains sticky. Animal
+evaluation is ordered by shed distance, then y/x/id. Once an EXIT is accepted,
+that animal's future output is removed before the next animal is valued.
 Product prices for new long assets use the first output's supply estimate;
 existing animals use their individual next output. Wheat/F input prices remain
 current. CARE is still a separate next-cycle marginal decision.
@@ -42,6 +46,12 @@ Input purchasing starts from public shed stock. One reconciliation against real
 worker routes removes redundant W/F purchases justified by private carry or
 DROP-before-PICKUP, with at most one recompilation. Trading reserves only future
 route-proven shed F pickups and immediately sells the remaining shed F.
+
+Daily return labeling first reserves D1-D10 harvests at shed distance at most 3
+for a DROP by turn 22. From the remaining output bundles, the farthest tiles are
+kept for EOD in deterministic distance/y/x order until the available shed
+capacity is filled; the remaining nearer bundles receive `must_return`. A tile
+bundle is indivisible. Opening non-seed shed inventory reduces EOD capacity.
 
 Animal placement first rejects every candidate whose daily value is not
 positive. Remaining animal candidates use

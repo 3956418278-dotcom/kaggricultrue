@@ -13,7 +13,10 @@ observation -> canonical State -> macro Programme -> intraday routes -> action
 - `programme.py` is the frozen macro/executor contract; `CurrentAssetState`
   carries existing assets without daily terminal expansion.
 - `current_assets.py` owns short PRODUCE/MAINTAIN/EXIT and crop checkpoint
-  decisions, including the separate one-cycle CARE/WATER/FERTILIZE checks.
+  decisions, including nearest-first sequential EXIT revaluation and the
+  separate one-cycle CARE/WATER/FERTILIZE checks.
+- `return_requirements.py` owns the farthest-first EOD-capacity split and the
+  D1-D10 near-shed `must_return` labels consumed by intraday routing.
 - `planner.py` owns current-asset compilation, mandatory inputs, seed ledger,
   current-value long candidates, and scale-based land purchase.
 - `intraday.py` may assign workers and construct routes, but cannot alter macro

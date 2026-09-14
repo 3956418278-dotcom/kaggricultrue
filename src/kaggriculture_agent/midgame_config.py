@@ -18,6 +18,11 @@ class MidgameParameters:
 
     # New land purchase: cash reserve kept after land + fallback seed.
     fixed_cash_reserve: int = 200
+
+    # D1-D10 force harvested bundles this close to the shed to return.  Later
+    # days use only the real EOD-capacity split.
+    early_return_last_day: int = 9
+    early_return_distance: int = 3
     # Units per future reveal, initially one average basket tick across the
     # eight official shop types. This is a tunable weight, not a shop forecast.
     expected_shop_demand_per_reveal: Mapping[str, float] = field(

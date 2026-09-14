@@ -28,6 +28,7 @@ from .programme import (
     Programme,
     ProgrammeEvent,
 )
+from .return_requirements import annotate_programme_returns
 from .simulation import drop_arrivals
 from .state import Position, State
 
@@ -946,7 +947,9 @@ def _actual_cleanup_releases(state: State, solved: Programme) -> Programme:
 def _solve_daily(
     state: State,
     programme: Programme,
+    params: MidgameParameters,
 ) -> Programme:
+    programme = annotate_programme_returns(state, programme, params=params)
     try:
         solved = solve_intraday(state, programme)
         solved = _reconcile_carried_inputs(state, solved)
@@ -1020,7 +1023,7 @@ def make_plan(
     # a nonexistent balance.
     without_land = None
     while True:
-        solved = _solve_daily(state, programme)
+        solved = _solve_daily(state, programme, params)
         if solved.feasible:
             if without_land is None:
                 # Existing land is completely funded, including real hires,
