@@ -318,7 +318,7 @@ def _product_dp(product: str, opening_stock: int, opening_inventory: int,
             else:
                 future, schedule = value(index + 1, stock - quantity, next_inventory)
                 candidate = (revenue + future, -quantity, quantity, schedule)
-            if best is None or candidate[:2] > best[:2]:
+            if best is None or candidate[:2] >= best[:2]:
                 best = candidate
         assert best is not None
         return best[0], ((step, best[2]), *best[3])
@@ -587,7 +587,7 @@ def _short_product_plan(
                 candidate = (
                     immediate + future, -quantity, quantity, after_sale,
                     schedule)
-            if best is None or candidate[:2] > best[:2]:
+            if best is None or candidate[:2] >= best[:2]:
                 best = candidate
         assert best is not None
         return (

@@ -86,6 +86,28 @@ class DailyPlanningSession:
         if state.step % 4 == 0:
             programme = _refresh_sales(state, programme)
             self._plans[state.player] = programme
+        else:
+            # ── Per-turn inventory deviation detection ──
+            # Compare actual market inventory against the trajectory
+            # predicted at the last 4-turn refresh.  If any non-excluded
+            # product diverges, trigger an immediate sale refresh for the
+            # whole programme (the optimizer handles per-product decisions).
+            _DEVIATION_EXCLUDED = frozenset({"WHEAT", "CARROT"})
+            predicted = programme.market_inventory
+            if predicted:
+                # Find the latest trajectory step <= current step.
+                past_steps = [s for s in predicted if s <= state.step]
+                if past_steps:
+                    ref_step = max(past_steps)
+                    ref_inv = predicted[ref_step]
+                    deviated = any(
+                        state.market.inventory.get(product, 0) != ref_inv.get(product, 0)
+                        for product in rules.PRODUCTS
+                        if product not in _DEVIATION_EXCLUDED
+                    )
+                    if deviated:
+                        programme = _refresh_sales(state, programme)
+                        self._plans[state.player] = programme
         return _decision(state, programme)
 
     @property
