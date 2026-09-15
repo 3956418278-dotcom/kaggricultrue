@@ -95,6 +95,7 @@ def animal_daily_value(
     animal: str,
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
     *, product_price: int | None = None,
+    include_purchase_cost: bool = True,
 ) -> float:
     """Current snapshot value of one maximum effective animal cycle."""
     rule = rules.ANIMALS[animal]
@@ -109,7 +110,7 @@ def animal_daily_value(
     numerator = (
         rule.max_held * (_price(state, rule.product) if product_price is None else product_price)
         + realizable_f * conservative_f_price(state, params)
-        - rule.cost
+        - (rule.cost if include_purchase_cost else 0)
         - wheat_cost
     )
     return numerator / max(1, days)
@@ -222,6 +223,23 @@ def _next_crop_production_day(raw: Mapping[str, object], day: int) -> int | None
     return candidate
 
 
+def _fertilizer_covered_productions(
+    raw: Mapping[str, object], rule, day: int
+) -> int:
+    """Legal productions inside one new fertilizer's [day, day+2] window."""
+    covered = 0
+    remaining = rule.max_yield - completed_production_count(raw, day)
+    probe = day
+    while remaining > 0:
+        production_day = _next_crop_production_day(raw, probe)
+        if production_day is None or production_day > day + 2:
+            break
+        covered += 1
+        remaining -= 1
+        probe = production_day + 1
+    return covered
+
+
 def _care_gain(state: State, asset: AssetState) -> tuple[int, bool]:
     raw = asset.official
     rule = rules.ANIMALS[asset.asset_type]
@@ -290,7 +308,8 @@ def _animal_current_state(
         excluded_own_tiles=excluded_own_tiles, params=params))
         if production_day is not None else 0)
     daily = animal_daily_value(
-        state, asset.asset_type, params, product_price=forecast_price)
+        state, asset.asset_type, params, product_price=forecast_price,
+        include_purchase_cost=False)
 
     # EXIT is sticky until the official escape transition releases the tile.
     if not first_output_complete:
@@ -350,8 +369,11 @@ def _animal_current_state(
             tile=asset.position, asset_id=identifier, item=rule.product,
             quantity=held, action=("HARVEST",), deadline=end,
             source="EXIT_LIQUIDATION"))
-    elif held > 0 and (overflow or state.day >= 29):
-        source = "HELD_OVERFLOW" if overflow else "TERMINAL_LIQUIDATION"
+    elif held > 0 and (held >= rule.max_held or overflow or state.day >= 29):
+        source = (
+            "HELD_OVERFLOW" if overflow else
+            "TERMINAL_LIQUIDATION" if state.day >= 29 else
+            "HELD_CAP")
         today.append(_event(
             state.step, 30, identifier + ":harvest", "HARVEST",
             tile=asset.position, asset_id=identifier, item=rule.product,
@@ -439,12 +461,15 @@ def _one_time_plan(
     if state.day >= first_day and state.day > last_day and held > 0:
         return state.day, False, False, held * price
     best: tuple[int, int, int, bool, bool] | None = None
+    watered_today = bool(raw.get("watered_today", False))
     for harvest_day in candidates:
         for use_f in (False, True):
             quantity = held
             applications = 0
             covered = int(raw.get("fertilized_until_day", -1))
             for day in range(state.day, harvest_day + 1):
+                if day == state.day and watered_today:
+                    continue
                 day_age = day - planted
                 window_start = (rule.max_yield_day + 1) // 2
                 if not window_start <= day_age <= rule.max_yield_day:
@@ -468,7 +493,10 @@ def _one_time_plan(
             if best is None or candidate[:3] > best[:3]:
                 best = candidate
     if best is None:
-        return None, False, False, 0
+        survival = (
+            not watered_today
+            and int(raw.get("consecutive_unwatered", 0)) >= 1)
+        return None, survival, False, 0
     _, neg_day, _, use_f, harvest_now = best
     harvest_day = -neg_day
     productive_water = rules.one_time_water_gain(
@@ -479,11 +507,10 @@ def _one_time_plan(
         fertilized_until_day=(
             state.day + 2 if use_f else
             int(raw.get("fertilized_until_day", -1))),
-        watered_today=bool(raw.get("watered_today", False)),
+        watered_today=watered_today,
     ) > 0
     water = (
-        not harvest_now
-        and not bool(raw.get("watered_today", False))
+        not watered_today
         and (
             productive_water
             or int(raw.get("consecutive_unwatered", 0)) >= 1
@@ -540,8 +567,10 @@ def _crop_current_state(
                 input_gain = _price(state, crop)
                 bonus_water = input_gain > 0
             else:
+                covered = _fertilizer_covered_productions(
+                    raw, rule, state.day)
                 input_gain = (
-                    _price(state, crop)
+                    covered * _price(state, crop)
                     - _fertilizer_use_cost(state, 1))
                 fertilize = input_gain > 0
                 bonus_water = fertilize
@@ -569,11 +598,14 @@ def _crop_current_state(
         overflow = held > 0 and incoming > 0 and held + incoming > rule.max_yield
         lifespan = int(raw.get("max_lifespan_step", -1))
         expiring = 0 <= lifespan <= end
-        if held > 0 and (overflow or expiring or state.day >= 29 or lifecycle_done):
+        cap_full = held >= rule.max_yield
+        if held > 0 and (overflow or expiring or state.day >= 29
+                         or lifecycle_done or cap_full):
             source = (
                 "HELD_OVERFLOW" if overflow else
                 "TERMINAL_LIQUIDATION" if state.day >= 29 else
-                "LIFECYCLE_DONE" if lifecycle_done else "EXPIRY")
+                "LIFECYCLE_DONE" if lifecycle_done else
+                "HELD_CAP" if cap_full else "EXPIRY")
             today.append(_event(
                 state.step, 30, identifier + ":harvest", "HARVEST",
                 tile=asset.position, asset_id=identifier, item=crop,
@@ -618,13 +650,23 @@ def _crop_current_state(
                     raw.get("consecutive_unwatered", 0)) >= 1
                     else "MAX_DAILY_VALUE")))
         if harvest_day == state.day and held > 0:
+            quantity = held + rules.one_time_water_gain(
+                crop,
+                planted_day=int(raw["planted_day"]),
+                day=state.day,
+                yield_units=held,
+                fertilized_until_day=(
+                    state.day + 2 if fertilize
+                    else int(raw.get("fertilized_until_day", -1))),
+                watered_today=bool(raw.get("watered_today", False)),
+            )
             source = (
                 "TERMINAL_LIQUIDATION" if state.day >= 29
                 else "CURRENT_HARVEST_VALUE")
             today.append(_event(
                 state.step, 30, identifier + ":harvest", "HARVEST",
                 tile=asset.position, asset_id=identifier, item=crop,
-                quantity=held, action=("HARVEST",), deadline=end,
+                quantity=quantity, action=("HARVEST",), deadline=end,
                 source=source))
             mode = HARVEST
         elif harvest_day is not None:

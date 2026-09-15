@@ -222,6 +222,14 @@ class MidgameAssetTests(unittest.TestCase):
         self.assertEqual(exit_asset.mode, EXIT)
 
     def test_exit_order_is_nearest_first_and_revalues_remaining_animals(self):
+        from unittest.mock import patch
+
+        from src.kaggriculture_agent import current_assets
+        from src.kaggriculture_agent.current_assets import (
+            exit_current_asset,
+            next_animal_production_day,
+        )
+        from src.kaggriculture_agent.market import forecast_inventory
         from src.kaggriculture_agent.midgame_config import MidgameParameters
 
         near = self.cow(placed_day=3, position=(4, 4))
@@ -233,9 +241,47 @@ class MidgameAssetTests(unittest.TestCase):
                 "FERTILIZER": 30_000,
                 "WHEAT": 0,
             })
+        params = MidgameParameters(expected_shop_demand_per_reveal={})
+        real_value = current_assets.animal_daily_value
+
+        def record(*args, **kwargs):
+            kwargs.pop("self", None)
+            calls.append(kwargs.get("include_purchase_cost", True))
+            return real_value(*args, **kwargs)
+
+        calls = []
+        with patch.object(
+                current_assets, "animal_daily_value",
+                side_effect=lambda *a, **k: record(*a, **k)):
+            current = read_current_assets(state, params=params)
+        # Existing animals are valued without re-paying their purchase cost.
+        self.assertTrue(calls)
+        self.assertTrue(all(value is False for value in calls))
+        by_tile = {asset.tile: asset for asset in current}
+        # Positive continuation value keeps the animal instead of exiting on
+        # a repeated sunk cost.
+        self.assertIn(by_tile[(4, 4)].mode, (PRODUCE, MAINTAIN))
+        self.assertIsNone(by_tile[(4, 4)].exit_order)
+        self.assertGreater(by_tile[(4, 4)].daily_value, 0)
+        self.assertIn(by_tile[(0, 0)].mode, (PRODUCE, MAINTAIN))
+        self.assertIsNone(by_tile[(0, 0)].exit_order)
+        self.assertGreater(by_tile[(0, 0)].daily_value, 0)
+        # Excluding an exiting tile lowers the forecast supply the remaining
+        # animal is priced against.
+        step = (
+            next_animal_production_day(far.official, state.day) + 1) * 24
+        kept = forecast_inventory(
+            state, "MILK", step, excluded_own_tiles=frozenset({(4, 4)}),
+            params=params)
+        both = forecast_inventory(
+            state, "MILK", step, excluded_own_tiles=frozenset(),
+            params=params)
+        self.assertLess(kept, both)
+        # An explicit EXIT stays sticky and keeps the nearest-first order.
+        prior = exit_current_asset(state, near, params)
+        self.assertEqual(prior.mode, EXIT)
         current = read_current_assets(
-            state,
-            params=MidgameParameters(expected_shop_demand_per_reveal={}))
+            state, prior_assets=(prior,), params=params)
         by_tile = {asset.tile: asset for asset in current}
         self.assertEqual(by_tile[(4, 4)].mode, EXIT)
         self.assertEqual(by_tile[(4, 4)].exit_order, 0)
@@ -694,10 +740,11 @@ class TradeAndExecutionTests(unittest.TestCase):
             sum(sale.planned_sale.get(state.step, {}).values()), 1)
 
     def test_ordinary_sell_moves_one_turn_when_market_lines_are_full(self):
-        state = self.state(shed={"MILK": 2})
+        state = self.state(money=10_000, shed={"MILK": 2})
+        sell_step = state.step + 8
         commitments = tuple(
             ProgrammeEvent(
-                state.step, -1, f"seed-{index}", "BUY_SEED",
+                sell_step, -1, f"seed-{index}", "BUY_SEED",
                 item="WHEAT", quantity=1)
             for index in range(rules.MAX_MARKET_ORDERS)
         )
@@ -705,15 +752,17 @@ class TradeAndExecutionTests(unittest.TestCase):
             state, {}, commitments=commitments)
         self.assertTrue(sale.feasible, sale.failure)
         self.assertEqual(
-            sale.planned_sale.get(state.step, {}).get("MILK", 0), 0)
+            sale.planned_sale.get(sell_step, {}).get("MILK", 0), 0)
         self.assertEqual(
-            sale.planned_sale[state.step + 1]["MILK"], 2)
+            sale.planned_sale[sell_step + 1]["MILK"], 2)
 
     def test_deferred_sell_keeps_every_turn_within_market_line_limit(self):
-        state = self.state(shed={"MILK": 2, "WOOL": 2})
+        state = self.state(
+            money=10_000, shed={"MILK": 2, "WOOL": 2})
+        sell_step = state.step + 8
         commitments = tuple(
             ProgrammeEvent(
-                state.step, -1, f"seed-{index}", "BUY_SEED",
+                sell_step, -1, f"seed-{index}", "BUY_SEED",
                 item="WHEAT", quantity=1)
             for index in range(rules.MAX_MARKET_ORDERS - 1)
         )
@@ -723,7 +772,7 @@ class TradeAndExecutionTests(unittest.TestCase):
         programme = Programme(
             state.step, state.day, (), events=commitments,
             planned_sale=sale.planned_sale, feasible=True)
-        for step in (state.step, state.step + 1):
+        for step in (sell_step, sell_step + 1):
             actual = replace(state, step=step, turn=step % 24)
             self.assertLessEqual(
                 len(_decision(actual, programme).market_orders),
