@@ -5,7 +5,12 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
 from . import rules
-from .scenario_forecast import forecast_product_distribution
+from .scenario_forecast import (
+    AnimalMarketContext,
+    animal_incremental_market_path,
+    forecast_product_distribution,
+    scenario_revenue_value,
+)
 import numpy as np
 from .market import buy_cost, forecast_inventory, next_reveal, sell_revenue
 from .midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
@@ -188,6 +193,22 @@ def next_animal_production_day(
     return candidate if candidate <= last_refresh_day else None
 
 
+def existing_animal_future_production_days(
+    raw: Mapping[str, object], day: int
+) -> list[int]:
+    """All achievable future production days for an existing animal from day onwards."""
+    rule = rules.ANIMALS[str(raw["animal"])]
+    days: list[int] = []
+    probe = day
+    while len(days) < rule.max_held:
+        p_day = next_animal_production_day(raw, probe, strictly_after=(len(days) > 0))
+        if p_day is None:
+            break
+        days.append(p_day)
+        probe = p_day
+    return days
+
+
 def _production_step(day: int | None) -> int | None:
     return None if day is None else (day + 1) * rules.TURNS_PER_DAY
 
@@ -297,6 +318,7 @@ def _animal_current_state(
     params: MidgameParameters,
     *,
     excluded_own_tiles: frozenset[Position] = frozenset(),
+    market_context: AnimalMarketContext | None = None,
 ) -> CurrentAssetState:
     raw = dict(asset.official)
     identifier = _asset_id(asset)
@@ -305,25 +327,67 @@ def _animal_current_state(
     care_gain, care_possible = _care_gain(state, asset)
     production_day = next_animal_production_day(raw, state.day)
     first_output_complete = state.day >= int(raw["placed_day"]) + rule.first_yield_day
-    if rule.product in ("WOOL", "MILK", "EGG") and production_day is not None:
-        target_step = _production_step(production_day)
-        h = (target_step - state.step) if target_step is not None else -1
-        dist = forecast_product_distribution(state, rule.product)
-        if 0 <= h < dist.horizon_steps:
-            inv_at_h = dist.inventory_paths[:, h]
-            prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in inv_at_h])
-            forecast_price = float(dist.weights @ prices_s)
+
+    valid_shops = len(state.shops) <= 4 and len(set(state.shops)) == len(state.shops)
+    use_empirical = (
+        (rule.product in ("MILK", "EGG") or (rule.product == "WOOL" and state.step >= 239))
+        and valid_shops
+    )
+    if use_empirical and production_day is not None:
+        dist = forecast_product_distribution(state, rule.product, context=market_context)
+        ref_paths = dist.inventory_paths
+        H = dist.horizon_steps
+
+        # 1. Deduct future production of excluded animals from reference paths
+        excluded_events: list[tuple[int, int]] = []
+        if excluded_own_tiles:
+            for ex_tile in excluded_own_tiles:
+                for ex_a in state.own.animals:
+                    if ex_a.position == ex_tile and ex_a.asset_type == asset.asset_type:
+                        for d in existing_animal_future_production_days(ex_a.official, state.day):
+                            h = (d + 1) * 24 - state.step
+                            if 0 <= h < H:
+                                excluded_events.append((h, 1))
+        ex_impact = animal_incremental_market_path(excluded_events, H)
+        active_baseline_inv = ref_paths - ex_impact
+
+        # 2. Achievable future production timeline for this animal
+        my_days = existing_animal_future_production_days(raw, state.day)
+        my_events: list[tuple[int, int]] = []
+        for d in my_days:
+            h = (d + 1) * 24 - state.step
+            if 0 <= h < H:
+                bonus = int(raw.get("pending_care_bonus", 0)) if (d == state.day and bool(raw.get("fed_today", False))) else 0
+                my_events.append((h, 1 + bonus))
+
+        # 3. Evaluate remaining achievable production timeline across scenarios
+        if my_events:
+            step_indices = [h for h, _ in my_events]
+            quantities = [q for _, q in my_events]
+            rev_dict = scenario_revenue_value(
+                rule.product, active_baseline_inv, quantities, step_indices, weights=dist.weights
+            )
+            expected_product_revenue = rev_dict["expected"]
         else:
-            forecast_price = float(_price(state, rule.product))
+            expected_product_revenue = 0.0
+
+        daily = animal_daily_value(
+            state, asset.asset_type, params,
+            product_price=expected_product_revenue / rule.max_held,
+            include_purchase_cost=False,
+        )
     elif production_day is not None:
         forecast_price = float(rules.market_price(rule.product, forecast_inventory(
             state, rule.product, _production_step(production_day),
             excluded_own_tiles=excluded_own_tiles, params=params)))
+        daily = animal_daily_value(
+            state, asset.asset_type, params, product_price=forecast_price,
+            include_purchase_cost=False)
     else:
         forecast_price = 0.0
-    daily = animal_daily_value(
-        state, asset.asset_type, params, product_price=forecast_price,
-        include_purchase_cost=False)
+        daily = animal_daily_value(
+            state, asset.asset_type, params, product_price=forecast_price,
+            include_purchase_cost=False)
 
     # EXIT is sticky until the official escape transition releases the tile.
     if not first_output_complete:
@@ -719,6 +783,7 @@ def read_current_assets(
     prior_assets: Iterable[CurrentAssetState] = (),
     prior_shops: Iterable[str] = (),
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+    market_context: AnimalMarketContext | None = None,
 ) -> tuple[CurrentAssetState, ...]:
     # Prior state is used only to keep an in-progress EXIT sticky.  Every other
     # decision is derived from the same real observation path used at runtime.
@@ -739,7 +804,8 @@ def read_current_assets(
     for animal in ordered_animals:
         current = _animal_current_state(
             state, animal, prior.get(_asset_id(animal)), params,
-            excluded_own_tiles=frozenset(excluded))
+            excluded_own_tiles=frozenset(excluded),
+            market_context=market_context)
         if current.mode == EXIT:
             current = replace(current, exit_order=exit_order)
             exit_order += 1
@@ -756,11 +822,14 @@ def exit_current_asset(
     state: State,
     asset: AssetState,
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
+    market_context: AnimalMarketContext | None = None,
 ) -> CurrentAssetState:
     prior = CurrentAssetState(
         _asset_id(asset), asset.asset_type, asset.position,
         dict(asset.official), mode=EXIT)
-    return _animal_current_state(state, asset, prior, params)
+    return _animal_current_state(
+        state, asset, prior, params, market_context=market_context
+    )
 
 
 def current_asset_programmes(

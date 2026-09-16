@@ -9,6 +9,7 @@ from .market import optimize_short_sales
 from .planner import _arrivals, _shed_consumptions, make_plan
 from .programme import Programme
 from .realization import TurnDecision
+from .scenario_forecast import AnimalMarketContext
 from .state import State
 
 
@@ -68,16 +69,21 @@ def _refresh_sales(state: State, programme: Programme) -> Programme:
 class DailyPlanningSession:
     _plans: dict[int, Programme] = field(default_factory=dict, init=False)
     _last_steps: dict[int, int] = field(default_factory=dict, init=False)
+    _market_contexts: dict[int, AnimalMarketContext] = field(default_factory=dict, init=False)
 
     def reset(self):
-        self._plans.clear(); self._last_steps.clear()
+        self._plans.clear()
+        self._last_steps.clear()
+        self._market_contexts.clear()
 
     def plan_for(self, state: State) -> Programme:
+        ctx = self._market_contexts.setdefault(state.player, AnimalMarketContext())
+        ctx.observe_turn(state)
         prior = self._plans.get(state.player)
         last = self._last_steps.get(state.player, -1)
         reason = None if prior is None else programme_invalidation(state, prior)
         if prior is None or state.step < last or prior.day != state.day or reason is not None:
-            prior = make_plan(state, prior_programme=prior)
+            prior = make_plan(state, prior_programme=prior, market_context=ctx)
         self._plans[state.player] = prior
         self._last_steps[state.player] = state.step
         return prior

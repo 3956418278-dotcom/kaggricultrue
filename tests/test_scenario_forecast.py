@@ -1,16 +1,27 @@
-"""Unit and regression tests for conditional scenario forecasting of animal products."""
+"""Unit, regression, and golden reference tests for conditional scenario forecasting of animal products."""
+import sys
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 
 from kaggle_environments import make
 
 from src.kaggriculture_agent import rules, planner
-from src.kaggriculture_agent.current_assets import read_current_assets, _animal_current_state
+from src.kaggriculture_agent.current_assets import (
+    read_current_assets,
+    _animal_current_state,
+    existing_animal_future_production_days,
+)
+from src.kaggriculture_agent.market import sell_revenue
 from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
+from src.kaggriculture_agent.programme import AssetProgramme, Programme
 from src.kaggriculture_agent.scenario_forecast import (
+    AnimalMarketContext,
     ScenarioDistribution,
+    _MilkEggForecaster,
+    animal_incremental_market_path,
     candidate_inventory,
     forecast_product_distribution,
     scenario_revenue_value,
@@ -81,102 +92,234 @@ class ScenarioForecastUnitTests(unittest.TestCase):
                     self.assertTrue(np.all(dist.inventory_q[q] <= dist.inventory_q[q + 1] + 1e-6))
                     self.assertTrue(np.all(dist.price_q[q] <= dist.price_q[q + 1] + 1e-6))
 
-    def test_counterfactual_delta_zero_identity(self):
-        """Candidate inventory with Delta=0 is strictly identical to reference paths."""
-        st = self.state(day=11)
+    def test_exact_price_path_identity(self):
+        """Test Point 4: price paths must strictly equal rules.market_price(product, round(inventory))."""
         for prod in ("WOOL", "MILK", "EGG"):
+            st = self.state(day=11, inventory_overrides={prod: 9500})
             dist = forecast_product_distribution(st, prod)
-            cf_identical = candidate_inventory(dist.inventory_paths, candidate_impact=0, baseline_impact=0)
-            np.testing.assert_array_equal(cf_identical, dist.inventory_paths)
+            S, H = dist.inventory_paths.shape
+            # Spot check sample of paths
+            sample_s = min(S, 20)
+            sample_h = min(H, 30)
+            for s in range(sample_s):
+                for h in range(sample_h):
+                    inv_round = int(round(dist.inventory_paths[s, h]))
+                    expected_p = rules.market_price(prod, inv_round)
+                    self.assertEqual(dist.price_paths[s, h], expected_p)
 
-            # Symmetrical impact
-            cf_offset = candidate_inventory(dist.inventory_paths, candidate_impact=5, baseline_impact=5)
-            np.testing.assert_array_equal(cf_offset, dist.inventory_paths)
-
-            # Incremental impact Delta != 0
-            cf_added = candidate_inventory(dist.inventory_paths, candidate_impact=3, baseline_impact=1)
-            np.testing.assert_array_equal(cf_added, dist.inventory_paths + 2)
-
-    def test_shop_reveal_response(self):
-        """Revealing relevant shops triggers scenario reconditioning."""
-        # MILK: PIZZA_SHOP, SMOOTHIE_SHOP, ICE_CREAM_SHOP
-        st_no_shops = self.state(day=10, shops=())
-        dist_no_shops = forecast_product_distribution(st_no_shops, "MILK")
-
-        st_smoothie = self.state(day=10, shops=("SMOOTHIE_SHOP",))
-        dist_smoothie = forecast_product_distribution(st_smoothie, "MILK")
-        self.assertIn(dist_smoothie.conditioning_level, ("relevant", "exact", "state_fallback"))
-
-        # WOOL: Yarn store revelation
-        st_no_yarn = self.state(day=10, shops=("BAKERY", "PIZZA_SHOP"))
-        dist_no_yarn = forecast_product_distribution(st_no_yarn, "WOOL")
-
-        st_yarn = self.state(day=10, shops=("YARN_STORE", "PIZZA_SHOP"))
-        dist_yarn = forecast_product_distribution(st_yarn, "WOOL")
-        self.assertNotEqual(dist_no_yarn.state, dist_yarn.state)
-
-    def test_animal_count_and_state_change_response(self):
-        """Animal count and features properly govern gate and branch transitions."""
-        # MILK gating transitions
-        # cow_age35 <= 2 and mean <= 6.207 -> G0
-        cows_g0 = [self.animal("COW", placed_day=6, position=(i, 0)) for i in range(2)]
-        st_g0 = self.state(day=10, animals=cows_g0)
-        dist_g0 = forecast_product_distribution(st_g0, "MILK")
-        self.assertEqual(dist_g0.state, "G0")
-
-        # cow_age35 > 2 and cow_total <= 17 -> G2
-        # age at day 10: 10 - 6 = 4 in [3, 5]
-        cows_g2 = [self.animal("COW", placed_day=6, position=(i % 10, i // 10)) for i in range(5)]
-        st_g2 = self.state(day=10, animals=cows_g2)
-        dist_g2 = forecast_product_distribution(st_g2, "MILK")
-        self.assertEqual(dist_g2.state, "G2")
-
-        # WOOL sheep_age9p gating: <= 3 -> G0, >= 4 -> G1
-        sheep_g0 = [self.animal("SHEEP", placed_day=0, position=(i, 0)) for i in range(2)]
-        st_w_g0 = self.state(day=10, animals=sheep_g0)
-        dist_w_g0 = forecast_product_distribution(st_w_g0, "WOOL")
-        self.assertEqual(dist_w_g0.state, "G0")
-
-        sheep_g1 = [self.animal("SHEEP", placed_day=0, position=(i, 0)) for i in range(5)]
-        st_w_g1 = self.state(day=10, animals=sheep_g1)
-        dist_w_g1 = forecast_product_distribution(st_w_g1, "WOOL")
-        self.assertEqual(dist_w_g1.state, "G1")
-
-    def test_planner_call_site_and_heuristics_isolation(self):
-        """Planner uses forecast_product_distribution for animals and forecast_inventory for crops."""
-        state = self.state(day=10)
+    def test_counterfactual_planner_candidate_impact(self):
+        """Test Point 5 & 10: planner candidate valuation reflects accepted animal impact."""
+        st = self.state(day=11)
         params = DEFAULT_MIDGAME_PARAMETERS
 
-        # Animals must call forecast_product_distribution
-        with patch("src.kaggriculture_agent.planner.forecast_product_distribution", wraps=forecast_product_distribution) as mock_animal:
-            val_cow = planner._forecast_animal_daily_value(state, "COW", params)
-            self.assertEqual(mock_animal.call_args.args[1], "MILK")
-            self.assertGreater(val_cow, -1000.0)
+        # Baseline: evaluate first cow with empty programme
+        val_cow1 = planner._forecast_animal_daily_value(st, "COW", params, programme=None)
 
-        with patch("src.kaggriculture_agent.planner.forecast_product_distribution", wraps=forecast_product_distribution) as mock_animal:
-            val_sheep = planner._forecast_animal_daily_value(state, "SHEEP", params)
-            self.assertEqual(mock_animal.call_args.args[1], "WOOL")
+        # Now create programme with one already accepted cow
+        rule = rules.ANIMALS["COW"]
+        accepted_cow = AssetProgramme(
+            asset_id="new:COW:0:0:265",
+            asset_type="COW",
+            tile=(0, 0),
+            decision="NEW",
+            existing=False,
+        )
+        prog_with_cow = Programme(
+            formed_step=st.step,
+            day=st.day,
+            shops=st.shops,
+            assets=(accepted_cow,),
+        )
 
-        with patch("src.kaggriculture_agent.planner.forecast_product_distribution", wraps=forecast_product_distribution) as mock_animal:
-            val_goose = planner._forecast_animal_daily_value(state, "GOOSE", params)
-            self.assertEqual(mock_animal.call_args.args[1], "EGG")
+        # Evaluate second cow: its candidate scenarios see candidate 1's impact
+        val_cow2 = planner._forecast_animal_daily_value(st, "COW", params, programme=prog_with_cow)
 
-        # Crops must NOT call forecast_product_distribution; they use forecast_inventory
-        with patch("src.kaggriculture_agent.planner.forecast_inventory", wraps=planner.forecast_inventory) as mock_crop:
-            planner._forecast_crop_daily_value(state, "TOMATO", params)
-            mock_crop.assert_called()
-            self.assertEqual(mock_crop.call_args.args[1], "TOMATO")
+        # Additional supply depresses future price, so second cow value must be strictly lower
+        self.assertLess(val_cow2, val_cow1)
 
-    def test_scenario_revenue_value_sequential(self):
-        """Scenario revenue respects official sequential price impact."""
-        paths = np.array([[10000, 10000], [9000, 9000]], dtype=float)
-        res = scenario_revenue_value("MILK", paths, quantities=[1, 1], step_indices=[0, 1])
-        # Quantities sell sequentially
-        self.assertIn("expected", res)
-        self.assertIn("q10", res)
-        self.assertIn("q50", res)
-        self.assertIn("q90", res)
-        self.assertGreater(res["expected"], 0)
+    def test_shop_reveal_response(self):
+        """Test Point 10: Shop reveal changes selected scenario set or count, with fallback when support is insufficient."""
+        # Relevant shop selection at D12 anchor (step 311)
+        st_no_shops = self.state(step=311, shops=())
+        dist_no_shops = forecast_product_distribution(st_no_shops, "MILK")
+
+        st_ice = self.state(step=311, shops=("ICE_CREAM_SHOP",))
+        dist_ice = forecast_product_distribution(st_ice, "MILK")
+
+        self.assertIn(dist_ice.conditioning_level, ("relevant", "exact"))
+        # Relevant filter selects a specific subset of empirical scenarios
+        self.assertLess(dist_ice.scenario_count, dist_no_shops.scenario_count)
+
+        # Insufficient support fallback (e.g. at D10 where only 2 episodes have ICE_CREAM_SHOP as shop 0, threshold 10)
+        st_fallback = self.state(day=10, shops=("ICE_CREAM_SHOP",))
+        dist_fallback = forecast_product_distribution(st_fallback, "MILK")
+        self.assertEqual(dist_fallback.conditioning_level, "state_fallback")
+        self.assertTrue(dist_fallback.ood["reveal_ood"])
+
+    def test_inventory_residual_rho_propagation(self):
+        """Test Point 10: Inventory residual post-D12 propagates via rho, not constant shift."""
+        st_a = self.state(day=13, step=335, inventory_overrides={"MILK": 260.0})
+        st_b = self.state(day=13, step=335, inventory_overrides={"MILK": 280.0})
+
+        # Persisted D12 anchor at step 311
+        ctx = AnimalMarketContext()
+        ctx.d12_anchors["MILK"] = (0, 250.0)
+
+        dist_a = forecast_product_distribution(st_a, "MILK", context=ctx)
+        dist_b = forecast_product_distribution(st_b, "MILK", context=ctx)
+
+        # At h=0, strictly equal to current inventory
+        self.assertEqual(dist_a.inventory_paths[0, 0], 260.0)
+        self.assertEqual(dist_b.inventory_paths[0, 0], 280.0)
+
+        diff = dist_b.inventory_paths - dist_a.inventory_paths
+        # Difference at h=0 is 20.0
+        np.testing.assert_allclose(diff[:, 0], 20.0)
+        # Future difference is NOT constant 20 across all horizons; rho decays
+        self.assertFalse(np.allclose(diff[:, 10], 20.0))
+        self.assertFalse(np.allclose(diff[:, -1], 20.0))
+
+    def test_sequential_revenue_hand_calculation(self):
+        """Test Point 10: Hand-calculated case comparing against rules.market_price / sell_revenue."""
+        candidate_inv = np.array([
+            [100.0, 105.0],
+            [200.0, 205.0],
+        ])
+        quantities = [2, 3]
+        step_indices = [0, 1]
+
+        # Scenario 0 manual calculation
+        rev_s0_0 = sell_revenue("MILK", 2, 100)
+        rev_s0_1 = sell_revenue("MILK", 3, 105)
+        tot_s0 = rev_s0_0 + rev_s0_1
+
+        # Scenario 1 manual calculation
+        rev_s1_0 = sell_revenue("MILK", 2, 200)
+        rev_s1_1 = sell_revenue("MILK", 3, 205)
+        tot_s1 = rev_s1_0 + rev_s1_1
+
+        expected_val = 0.5 * (tot_s0 + tot_s1)
+
+        res = scenario_revenue_value("MILK", candidate_inv, quantities, step_indices)
+        self.assertAlmostEqual(res["expected"], expected_val)
+
+    def test_excluded_own_tiles_revalues_remaining_animals(self):
+        """Test Point 8: When one animal exits, remaining animal valuation uses lowered supply."""
+        params = DEFAULT_MIDGAME_PARAMETERS
+        for kind, prod in (("COW", "MILK"), ("SHEEP", "WOOL"), ("GOOSE", "EGG")):
+            a1 = self.animal(kind, placed_day=3, position=(0, 0))
+            a2 = self.animal(kind, placed_day=3, position=(1, 0))
+            st = self.state(day=12, animals=(a1, a2))
+
+            # Both kept
+            val_both = _animal_current_state(st, a2, prior=None, params=params, excluded_own_tiles=frozenset())
+
+            # First animal exits
+            val_excluded = _animal_current_state(
+                st, a2, prior=None, params=params, excluded_own_tiles=frozenset([a1.position])
+            )
+
+            # When a1 exits, its future supply is removed, so market inventory drops and a2 daily value increases
+            self.assertGreater(val_excluded.daily_value, val_both.daily_value)
+
+    def test_late_attach_fallback(self):
+        """Test Point 1: Agent attaching after D12 without anchor enters late_fallback."""
+        st = self.state(day=14, step=336)
+        dist = forecast_product_distribution(st, "MILK")
+        self.assertEqual(dist.state, "late_fallback")
+        self.assertEqual(dist.conditioning_level, "late_fallback")
+        self.assertTrue(dist.ood.get("late_fallback", False))
+        self.assertEqual(dist.confidence, 0.3)
+        self.assertEqual(dist.inventory_paths[0, 0], float(st.market.inventory["MILK"]))
+
+    def test_egg_insufficient_information_fallback(self):
+        """Test Point 11: Missing opponent money triggers insufficient_info fallback, not branch 2."""
+        st = self.state(day=13, step=311, shops=("BRUNCH_SPOT",), opp_money=None)
+        # Ensure state.opp.money is None
+        st = replace(st, opp=replace(st.opp, money=None))
+        dist = forecast_product_distribution(st, "EGG")
+        self.assertEqual(dist.state, "insufficient_info")
+        self.assertTrue(dist.ood.get("insufficient_info", False))
+
+    def test_reference_cache_single_computation(self):
+        """Test Point 12: Reference distribution is cached and computed only once per (step, product)."""
+        ctx = AnimalMarketContext()
+        st = self.state(day=11)
+        dist1 = forecast_product_distribution(st, "MILK", context=ctx)
+        dist2 = forecast_product_distribution(st, "MILK", context=ctx)
+        self.assertIs(dist1, dist2)
+
+
+class GoldenReferenceTests(unittest.TestCase):
+    """Test Point 3: Strict golden comparison against supplied reference runtimes."""
+
+    def test_milk_golden_comparison_across_stages(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        milk_dir = repo_root / "animal_calculation_value_model" / "milk"
+        sys.path.insert(0, str(milk_dir))
+        from milk_runtime_v3 import ConditionalMarketForecaster
+        ref = ConditionalMarketForecaster(str(milk_dir), "milk")
+        our = _MilkEggForecaster("MILK")
+
+        # D9, D10, D11, D12 anchor, D12+1d, D12+3d, D12+5d
+        steps = [240, 264, 288, 311, 335, 383, 431]
+        for step in steps:
+            s = {
+                "step": step,
+                "inventory": 250.0,
+                "shops": ["ICE_CREAM_SHOP"],
+                "cow_total": 5,
+                "cow_age35": 2,
+                "cow_age_mean": 5.0,
+                "cow_bonus": 20.0,
+            }
+            if step >= 311:
+                s["d12_branch"] = 0
+                s["d12_inventory"] = 250.0
+
+            r_ref = ref.forecast(s)
+            r_our = our.forecast(s)
+
+            self.assertEqual(r_ref["state"], r_our.state)
+            self.assertEqual(r_ref["conditioning_level"], r_our.conditioning_level)
+            self.assertEqual(r_ref["scenario_count"], r_our.scenario_count)
+            np.testing.assert_allclose(r_ref["inventory_paths"], r_our.inventory_paths)
+            np.testing.assert_allclose(r_ref["inventory_q"], r_our.inventory_q)
+            self.assertEqual(r_ref["ood"]["reveal_ood"], r_our.ood["reveal_ood"])
+            self.assertEqual(r_ref["ood"]["residual_ood"], r_our.ood["residual_ood"])
+
+    def test_egg_golden_comparison_across_stages(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        egg_dir = repo_root / "animal_calculation_value_model" / "egg"
+        sys.path.insert(0, str(egg_dir))
+        from egg_runtime_v3 import ConditionalMarketForecaster
+        ref = ConditionalMarketForecaster(str(egg_dir), "egg")
+        our = _MilkEggForecaster("EGG")
+
+        # D9, D10, D11, D12 anchor, D12+1d, D12+3d, D12+5d
+        steps = [240, 264, 288, 311, 335, 383, 431]
+        for step in steps:
+            s = {
+                "step": step,
+                "inventory": 300.0,
+                "shops": ["BAKERY"],
+                "goose_total": 5,
+                "opponent_money": 8000,
+            }
+            if step >= 311:
+                s["d12_branch"] = 0
+                s["d12_inventory"] = 300.0
+
+            r_ref = ref.forecast(s)
+            r_our = our.forecast(s)
+
+            self.assertEqual(r_ref["state"], r_our.state)
+            self.assertEqual(r_ref["conditioning_level"], r_our.conditioning_level)
+            self.assertEqual(r_ref["scenario_count"], r_our.scenario_count)
+            np.testing.assert_allclose(r_ref["inventory_paths"], r_our.inventory_paths)
+            np.testing.assert_allclose(r_ref["inventory_q"], r_our.inventory_q)
+            self.assertEqual(r_ref["ood"]["reveal_ood"], r_our.ood["reveal_ood"])
+            self.assertEqual(r_ref["ood"]["residual_ood"], r_our.ood["residual_ood"])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,12 @@ from dataclasses import replace
 from typing import Iterable
 
 from . import rules
-from .scenario_forecast import forecast_product_distribution
+from .scenario_forecast import (
+    AnimalMarketContext,
+    animal_incremental_market_path,
+    forecast_product_distribution,
+    scenario_revenue_value,
+)
 import numpy as np
 from .current_assets import (
     _minimum_survival_feed_units,
@@ -423,15 +428,25 @@ def _resolve_inputs(
 
 
 def _asset_daily_value(
-    state: State, kind: str, params: MidgameParameters, programme=None
+    state: State,
+    kind: str,
+    params: MidgameParameters,
+    programme=None,
+    market_context: AnimalMarketContext | None = None,
 ) -> float:
     if kind in rules.ANIMALS:
-        return _forecast_animal_daily_value(state, kind, params, programme)
+        return _forecast_animal_daily_value(
+            state, kind, params, programme, market_context=market_context
+        )
     return _forecast_crop_daily_value(state, kind, params, programme)
 
 
 def _forecast_animal_daily_value(
-    state: State, animal: str, params: MidgameParameters, programme=None
+    state: State,
+    animal: str,
+    params: MidgameParameters,
+    programme=None,
+    market_context: AnimalMarketContext | None = None,
 ) -> float:
     """Forecast-aware animal daily value for new placement decisions."""
     rule = rules.ANIMALS[animal]
@@ -455,19 +470,66 @@ def _forecast_animal_daily_value(
         int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
     realizable_f = max(1, wheat_units)
 
-    if rule.product in ("WOOL", "MILK", "EGG"):
-        dist = forecast_product_distribution(state, rule.product)
-        expected_product_revenue = 0.0
+    valid_shops = len(state.shops) <= 4 and len(set(state.shops)) == len(state.shops)
+    use_empirical = (
+        (rule.product in ("MILK", "EGG") or (rule.product == "WOOL" and state.step >= 239))
+        and valid_shops
+    )
+    if use_empirical:
+        dist = forecast_product_distribution(state, rule.product, context=market_context)
+        ref_paths = dist.inventory_paths
+        H = dist.horizon_steps
+
+        # 1. Baseline impact from already accepted animal additions in programme
+        accepted_events: list[tuple[int, int]] = []
+        if programme is not None:
+            additions = getattr(programme, "additions", None)
+            if additions is None:
+                additions = [a for a in programme.assets if not a.existing and a.decision == "NEW"]
+            for accepted in additions:
+                if accepted.asset_type in rules.ANIMALS and rules.ANIMALS[accepted.asset_type].product == rule.product:
+                    acc_rule = rules.ANIMALS[accepted.asset_type]
+                    acc_first_day = state.day + acc_rule.first_yield_day - 1
+                    for k in range(acc_rule.max_held):
+                        p_day = acc_first_day + k * acc_rule.interval
+                        if p_day > 28:
+                            break
+                        h = (p_day + 1) * 24 - state.step
+                        if 0 <= h < H:
+                            accepted_events.append((h, 1))
+
+        base_impact = animal_incremental_market_path(accepted_events, H)
+        planning_baseline = ref_paths + base_impact
+
+        # 2. Candidate animal incremental impact
+        cand_events: list[tuple[int, int]] = []
+        out_of_horizon_days = 0
         for prod_day in prod_days:
-            target_step = (prod_day + 1) * 24
-            h = target_step - state.step
-            if 0 <= h < dist.horizon_steps:
-                inv_at_h = dist.inventory_paths[:, h]
-                prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in inv_at_h])
-                expected_product_revenue += float(dist.weights @ prices_s)
+            h = (prod_day + 1) * 24 - state.step
+            if 0 <= h < H:
+                cand_events.append((h, 1))
             else:
-                expected_product_revenue += float(rules.market_price(
-                    rule.product, int(state.market.inventory.get(rule.product, rules.MARKET_I0))))
+                out_of_horizon_days += 1
+
+        cand_impact = animal_incremental_market_path(cand_events, H)
+        candidate_scenarios = planning_baseline + cand_impact
+
+        # 3. Revenue via scenario_revenue_value
+        if cand_events:
+            step_indices = [h for h, _ in cand_events]
+            quantities = [q for _, q in cand_events]
+            rev_dict = scenario_revenue_value(
+                rule.product, candidate_scenarios, quantities, step_indices, weights=dist.weights
+            )
+            expected_product_revenue = rev_dict["expected"]
+        else:
+            expected_product_revenue = 0.0
+
+        if out_of_horizon_days > 0:
+            expected_product_revenue += out_of_horizon_days * float(rules.market_price(
+                rule.product, int(state.market.inventory.get(rule.product, rules.MARKET_I0))
+            ))
+
         numerator = (
             expected_product_revenue
             + realizable_f * conservative_f_price(state, params)
@@ -670,12 +732,18 @@ def _ranked_kind(
     state: State,
     programme: Programme,
     params: MidgameParameters,
+    market_context: AnimalMarketContext | None = None,
 ) -> tuple[str, Position, float] | None:
     if state.turn > rules.TURNS_PER_DAY - 4:
         return None
     candidates = []
     for kind in LONG_ASSETS:
-        daily = _asset_daily_value(state, kind, params, programme)
+        if market_context is not None:
+            daily = _asset_daily_value(
+                state, kind, params, programme, market_context=market_context
+            )
+        else:
+            daily = _asset_daily_value(state, kind, params, programme)
         if daily <= 0 or _remaining_effective_days(state, kind) <= 0:
             continue
         if not _wait_reveal_allows_start(state, kind, daily):
@@ -744,10 +812,13 @@ def _long_candidate_loop(
     state: State,
     programme: Programme,
     params: MidgameParameters,
+    market_context: AnimalMarketContext | None = None,
 ) -> Programme:
     """Greedily deploy positive current-value assets on exact chosen tiles."""
     while True:
-        ranked = _ranked_kind(state, programme, params)
+        ranked = _ranked_kind(
+            state, programme, params, market_context=market_context
+        )
         if ranked is None:
             return programme
         kind, tile, _ = ranked
@@ -1017,6 +1088,7 @@ def make_plan(
     config=None,
     *,
     prior_programme: Programme | None = None,
+    market_context: AnimalMarketContext | None = None,
 ) -> Programme:
     """Build one observation-backed daily plan; no terminal economic rollout."""
     params = coerce_midgame_parameters(config)
@@ -1030,13 +1102,16 @@ def make_plan(
         prior_shops=(
             prior_programme.shops if prior_programme is not None else ()),
         params=params,
+        market_context=market_context,
     )
     assets = current_asset_programmes(current)
     programme = _programme_from_assets(
         state, assets, current_assets=current)
     programme = _resolve_inputs(state, programme)
 
-    programme = _long_candidate_loop(state, programme, params)
+    programme = _long_candidate_loop(
+        state, programme, params, market_context=market_context
+    )
     programme = _resolve_inputs(state, programme)
     programme = _buffer_loop(state, programme)
     programme = _resolve_inputs(state, programme)
@@ -1055,7 +1130,9 @@ def make_plan(
                 without_land = solved
                 expanded = _land_expansion(state, solved, params)
                 if expanded.land != solved.land:
-                    programme = _long_candidate_loop(state, expanded, params)
+                    programme = _long_candidate_loop(
+                        state, expanded, params, market_context=market_context
+                    )
                     programme = _buffer_loop(state, programme)
                     programme = _resolve_inputs(state, programme)
                     continue

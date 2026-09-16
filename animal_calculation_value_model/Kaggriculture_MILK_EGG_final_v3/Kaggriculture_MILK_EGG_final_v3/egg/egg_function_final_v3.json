@@ -1,6 +1,0 @@
-{
-  "model_version": "egg_function_final_v3",
-  "runtime_bundle": "egg_final_runtime_bundle_v3.json",
-  "scenario_library": "egg_final_scenario_library_v3.npz",
-  "reference_runtime": "egg_runtime_v3.py"
-}

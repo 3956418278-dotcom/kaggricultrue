@@ -1022,7 +1022,11 @@ class SubmitRegressionTests(unittest.TestCase):
         from src.kaggriculture_agent.current_assets import conservative_f_price, _minimum_survival_feed_units
         from src.kaggriculture_agent.market import buy_cost, forecast_inventory
         from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS as params
-        from src.kaggriculture_agent.scenario_forecast import forecast_product_distribution
+        from src.kaggriculture_agent.scenario_forecast import (
+            forecast_product_distribution,
+            animal_incremental_market_path,
+            scenario_revenue_value,
+        )
         import numpy as np
         for kind in planner.LONG_ASSETS:
             state = self.state(day=10)
@@ -1060,11 +1064,12 @@ class SubmitRegressionTests(unittest.TestCase):
                     wheat = _minimum_survival_feed_units(days)
                     dist = forecast_product_distribution(two, rule.product)
                     p_days = [two.day + rule.first_yield_day - 1, two.day + rule.first_yield_day - 1 + rule.interval]
-                    expected_rev = 0.0
-                    for pd in p_days:
-                        h = (pd + 1) * 24 - two.step
-                        prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in dist.inventory_paths[:, h]])
-                        expected_rev += float(dist.weights @ prices_s)
+                    h_steps = [(pd + 1) * 24 - two.step for pd in p_days]
+                    cand_impact = animal_incremental_market_path([(h, 1) for h in h_steps], dist.horizon_steps)
+                    cand_inv = dist.inventory_paths + cand_impact
+                    expected_rev = scenario_revenue_value(
+                        rule.product, cand_inv, [1, 1], h_steps, weights=dist.weights
+                    )["expected"]
                     expected = (expected_rev + max(1, wheat) * conservative_f_price(two)
                                 - rule.cost - buy_cost("WHEAT", wheat, two.market.inventory["WHEAT"])) / days
                 else:
@@ -1114,7 +1119,7 @@ class SubmitRegressionTests(unittest.TestCase):
         # Large known demand separates the two next-output prices enough to
         # cross the existing zero base-value boundary.
         state = self.state(day=13, animals=cows, money=1000,
-                           inventories={"MILK": 10103, "FERTILIZER": 30000})
+                           inventories={"MILK": 10106, "FERTILIZER": 30000})
         state = replace(state, shops=("SMOOTHIE_SHOP",) * 8)
         targets = [(next_animal_production_day(a.official, state.day) + 1) * 24 for a in cows]
         self.assertEqual(targets, [14 * 24, 15 * 24])

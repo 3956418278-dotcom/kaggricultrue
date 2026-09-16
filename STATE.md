@@ -49,29 +49,34 @@ Empirical scenario forecast models (`src/kaggriculture_agent/scenario_forecast.p
 replace legacy single-point heuristics (`forecast_inventory` and `expected_shop_demand_per_reveal`)
 for animal products (WOOL, MILK, EGG):
 
-- **Sources**: WOOL from `Kaggriculture_WOOL_final_v2`, MILK and EGG from `Kaggriculture_MILK_EGG_final_v3`.
-- **Interface**: `forecast_product_distribution(state, product)` returns `ScenarioDistribution` containing
-  scenario paths, price paths, normalized weights, ordered quantiles (Q10/Q25/Q50/Q75/Q90), OOD diagnostics,
-  and confidence metrics.
-- **Dynamic re-anchoring**: Path origin ($h=0$) strictly aligns with observed `state.market.inventory[product]`;
-  future trajectory updates dynamically via correlation $\rho$ without persistent cross-replan state caching.
+- **Sources**: Cleaned model assets under `animal_calculation_value_model/{wool,milk,egg}/`.
+- **Interface**: `forecast_product_distribution(state, product, context=...)` returns `ScenarioDistribution` containing
+  scenario paths, exact sequential price paths via `rules.market_price`, normalized weights, ordered quantiles (Q10/Q25/Q50/Q75/Q90),
+  OOD diagnostics, and confidence metrics.
+- **Dynamic re-anchoring & context**:
+  - `DailyPlanningSession` maintains a per-player `AnimalMarketContext` that captures observed D12 branches and real inventories at step 311.
+  - Post-D12 residual update applies $\rho$ correction with the real anchor.
+  - Late-attach fallback performs empirical scenario re-anchoring without $\rho$ correction when no anchor was recorded.
+  - Missing public opponent money triggers an explicit insufficient-information fallback rather than defaulting to branch 2.
+  - Single-pass turn reference caching eliminates repeated full-scenario generation across farm animals.
 - **Planner & asset valuation**:
-  - `planner._forecast_animal_daily_value` evaluates expected revenue along actual achievable production day offsets
-    across all scenarios under official sequential pricing `rules.market_price`.
-  - `current_assets._animal_current_state` evaluates individual next-output prices via `forecast_product_distribution`.
-  - Counterfactual invariant $I_{candidate} = I_{ref} + \Delta_{cand} - \Delta_{base}$ holds; $\Delta = 0$ preserves reference paths.
-  - Crops retain legacy `forecast_inventory` behavior.
+  - `animal_incremental_market_path` computes cumulative prior market impact avoiding intra-transaction double counting.
+  - `planner._forecast_animal_daily_value` evaluates new candidate incremental impact on top of already accepted programme additions.
+  - `current_assets._animal_current_state` deducts future supply of exiting animals (`excluded_own_tiles`) and evaluates the full remaining achievable production timeline via `scenario_revenue_value`.
+  - WOOL at D8 and earlier routes to legacy `forecast_inventory`; empirical gating begins from step 239 onwards. Crops retain legacy `forecast_inventory` behavior.
 
 ## Validation
 
-- Full suite run under runner: 113 passed tests (all midgame asset, scenario forecast, D11 controller,
+- Full suite run under runner: 119 passed tests (all midgame asset, scenario forecast, D11 controller,
   opening base, player day, reference pipeline, replay viewer, scripted opening, and zonal template tests).
 - Dedicated scenario forecast tests in `tests/test_scenario_forecast.py`:
-  - Shop reveal response (Yarn store and relevant shop signature reconditioning);
-  - Animal feature gating and branching response;
-  - Inventory shift strict re-anchoring and monotone quantile ordering;
-  - Counterfactual $\Delta = 0$ identity;
-  - Planner and current assets call site verification and heuristic isolation.
+  - Golden comparison against supplied reference runtimes (`milk_runtime_v3.py`, `egg_runtime_v3.py`) across D9, D10, D11, D12, D12+1d, D12+3d, D12+5d;
+  - Exact price path identity: `dist.price_paths[s, h] == rules.market_price(product, round(dist.inventory_paths[s, h]))`;
+  - Counterfactual candidate valuation incorporating accepted additions;
+  - Re-valuation of remaining animals when exiting animals are excluded;
+  - Sequential revenue exact comparison against manual hand calculation;
+  - Inventory residual $\rho$ decay vs constant shift;
+  - Late-attach and insufficient-information fallbacks.
 
 ## Limiting issue
 

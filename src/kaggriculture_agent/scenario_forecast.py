@@ -6,7 +6,7 @@ calculations with empirical scenario distributions reanchored to observed state.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -75,6 +75,38 @@ class ScenarioDistribution:
         return self.price_q[q_idx]
 
 
+def _inventory_to_price_paths(product: str, inv_paths: np.ndarray) -> np.ndarray:
+    """Exact mapping of inventory paths to price paths via rules.market_price."""
+    S, H = inv_paths.shape
+    if S == 0 or H == 0:
+        return np.zeros((S, H), dtype=float)
+    rounded = np.rint(inv_paths).astype(int)
+    unq, inv_idx = np.unique(rounded, return_inverse=True)
+    unq_prices = np.array([rules.market_price(product, int(v)) for v in unq], dtype=float)
+    return unq_prices[inv_idx].reshape(S, H)
+
+
+def animal_incremental_market_path(
+    events: Sequence[tuple[int, int]],
+    horizon: int,
+) -> np.ndarray:
+    """Cumulative market inventory impact path of shape (horizon,).
+
+    For a sale at step h_k with quantity q_k:
+    - At h <= h_k: this sale has not yet completed and entered the market,
+      so it contributes 0 before/during the transaction.
+    - At h > h_k: this sale has completed and entered the market inventory,
+      so it contributes +q_k to all subsequent steps.
+    """
+    impact = np.zeros(horizon, dtype=float)
+    for step_h, qty in events:
+        if 0 <= step_h + 1 < horizon:
+            impact[step_h + 1:] += qty
+        elif step_h < 0:
+            impact[:] += qty
+    return impact
+
+
 def candidate_inventory(
     reference_paths: np.ndarray,
     candidate_impact: np.ndarray | float | int = 0,
@@ -113,22 +145,10 @@ def scenario_revenue_value(
 
 def _model_dir(product: str) -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "animal_calculation_value_model"
-    prod_upper = product.upper()
-    if prod_upper == "WOOL":
-        candidate = base / "Kaggriculture_WOOL_final_v2"
-        if candidate.exists():
-            return candidate
-    elif prod_upper in ("MILK", "EGG"):
-        sub = "milk" if prod_upper == "MILK" else "egg"
-        candidates = [
-            base / "Kaggriculture_MILK_EGG_final_v3" / "Kaggriculture_MILK_EGG_final_v3" / sub,
-            base / "Kaggriculture_MILK_EGG_final_v3" / sub,
-        ]
-        for c in candidates:
-            if c.exists():
-                return c
-    raise FileNotFoundError(f"Model directory for {product} not found under {base}")
+    candidate = repo_root / "animal_calculation_value_model" / product.lower()
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(f"Model directory for {product} not found at {candidate}")
 
 
 class _MilkEggForecaster:
@@ -138,7 +158,6 @@ class _MilkEggForecaster:
         self.cfg = json.load(open(self.d / f"{self.product}_final_runtime_bundle_v3.json"))
         z = np.load(self.d / f"{self.product}_final_scenario_library_v3.npz", allow_pickle=True)
         self.z = {k: z[k] for k in z.files}
-        self.price = pd.read_csv(self.d / f"{self.product}_price_map_0906_v1.csv").sort_values("inventory")
         self.cal = pd.read_csv(self.d / f"{self.product}_final_calibration_all_oof_0906.csv")
         self.rs = pd.read_csv(self.d / f"{self.product}_final_residual_support_0906.csv")
 
@@ -160,7 +179,12 @@ class _MilkEggForecaster:
         shops = s["shops"]
         fp = lambda x: min([i + 1 for i, y in enumerate(shops) if y == x], default=0)
         br, ba = fp("BRUNCH_SPOT"), fp("BAKERY")
-        return (0 if ba <= 1 else 1) if br == 0 else (2 if s["opponent_money"] <= 10134 else 3)
+        if br == 0:
+            return 0 if ba <= 1 else 1
+        opp_money = s.get("opponent_money")
+        if opp_money is None:
+            return -1
+        return 2 if opp_money <= 10134 else 3
 
     def _scenario_shops(self, idx: np.ndarray, k: int) -> list[list[str]]:
         return [[SHOP_NAMES[c] for c in row[:k] if c >= 0] for row in self.z["shop_codes"][idx]]
@@ -204,13 +228,6 @@ class _MilkEggForecaster:
         i = (q.obs_days - od).abs().argmin()
         return q.iloc[i]
 
-    def _price(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        xx = self.price.inventory.to_numpy(float)
-        yy = self.price.price.to_numpy(float)
-        a = np.asarray(x, float)
-        v = np.interp(a, xx, yy, left=yy[0], right=yy[-1])
-        return v, (a < xx[0]) | (a > xx[-1])
-
     def forecast(self, s: Mapping[str, Any]) -> ScenarioDistribution:
         step = int(s["step"])
         cur = float(s["inventory"])
@@ -240,19 +257,32 @@ class _MilkEggForecaster:
             cand, level = self._filter(pool, shops, "pre")
             paths = self.z["inventory_full"][cand, step:].astype(float) - self.z["inventory_full"][cand, step, None] + cur
             state_desc = f"G{g}"
-        else:
-            b = int(s.get("d12_branch", self._branch(s)))
-            pool = np.where(self.z["d12_branch"] == b)[0]
-            cand, level = self._filter(pool, shops, "post")
-            e = min(step - 311, self.z["d12_delta"].shape[1] - 1)
-            cen = self.z[f"center_b{b}"].astype(float)
-            base = self.z["d12_delta"][cand].astype(float)
-            if e == 0:
-                delta = base[:, e:]
-                d12 = cur
+        elif step == 311:
+            b = self._branch(s)
+            if b < 0:
+                # Insufficient information fallback for EGG when opponent money is unavailable
+                cand, level = self._filter(np.arange(N), shops, "pre")
+                paths = self.z["inventory_full"][cand, step:].astype(float) - self.z["inventory_full"][cand, step, None] + cur
+                state_desc = "insufficient_info"
             else:
-                cen_d12 = float(np.mean(self.z["inventory_full"][cand, 311]))
-                d12 = float(s.get("d12_inventory", cen_d12))
+                d12 = cur
+                pool = np.where(self.z["d12_branch"] == b)[0]
+                cand, level = self._filter(pool, shops, "post")
+                delta = self.z["d12_delta"][cand].astype(float)
+                paths = d12 + delta
+                state_desc = f"B{b}"
+        else:
+            # step > 311 (post-D12)
+            has_b = "d12_branch" in s and s["d12_branch"] is not None and int(s["d12_branch"]) >= 0
+            has_inv = "d12_inventory" in s and s["d12_inventory"] is not None and np.isfinite(float(s["d12_inventory"]))
+            if has_b and has_inv:
+                b = int(s["d12_branch"])
+                d12 = float(s["d12_inventory"])
+                pool = np.where(self.z["d12_branch"] == b)[0]
+                cand, level = self._filter(pool, shops, "post")
+                e = min(step - 311, self.z["d12_delta"].shape[1] - 1)
+                cen = self.z[f"center_b{b}"].astype(float)
+                base = self.z["d12_delta"][cand].astype(float)
                 rho = self.z[f"rho_b{b}"][e, e:].astype(float)
                 robs = (cur - d12) - cen[e]
                 R = base - cen
@@ -261,32 +291,50 @@ class _MilkEggForecaster:
                 r = near[near.branch == b]
                 if len(r):
                     residual_ood = bool(robs < r.q01.iloc[0] or robs > r.q99.iloc[0])
-            paths = d12 + delta
-            state_desc = f"B{b}"
+                paths = d12 + delta
+                state_desc = f"B{b}"
+            else:
+                # Late-attach fallback: re-anchor empirical scenarios without rho correction
+                pool = np.arange(N)
+                cand, level = self._filter(pool, shops, "pre")
+                paths = self.z["inventory_full"][cand, step:].astype(float) - self.z["inventory_full"][cand, step, None] + cur
+                state_desc = "late_fallback"
+                level = "late_fallback"
 
         # Re-anchor strictly to current inventory at h = 0
         paths[:, 0] = cur
 
         qs = np.quantile(paths, [.1, .25, .5, .75, .9], axis=0)
-        c = self._cal(step)
-        med = qs[2].copy()
-        qs[0] = med - c["cal_mult80"] * (med - qs[0])
-        qs[4] = med + c["cal_mult80"] * (qs[4] - med)
-        qs[1] = med - c["cal_mult50"] * (med - qs[1])
-        qs[3] = med + c["cal_mult50"] * (qs[3] - med)
-        qs = np.sort(qs, axis=0)
+        if state_desc != "late_fallback" and state_desc != "insufficient_info":
+            c = self._cal(step)
+            med = qs[2].copy()
+            qs[0] = med - c["cal_mult80"] * (med - qs[0])
+            qs[4] = med + c["cal_mult80"] * (qs[4] - med)
+            qs[1] = med - c["cal_mult50"] * (med - qs[1])
+            qs[3] = med + c["cal_mult50"] * (qs[3] - med)
 
-        pp, pood = self._price(paths)
-        pq = np.stack([self._price(qs[4])[0], self._price(qs[3])[0], self._price(qs[2])[0], self._price(qs[1])[0], self._price(qs[0])[0]])
+        # Price paths mapped from integer rounded inventory using rules.market_price
+        pp = _inventory_to_price_paths(self.product.upper(), paths)
+        pq = np.stack([
+            np.array([rules.market_price(self.product.upper(), int(round(x))) for x in qs[4 - i]])
+            for i in range(5)
+        ])
         pq = np.sort(pq, axis=0)
 
         reveal_ood = "fallback" in level
         flags = {
             "reveal_ood": bool(reveal_ood),
             "residual_ood": bool(residual_ood),
-            "price_ood": bool(np.any(pood)),
+            "price_ood": False,
         }
-        conf = max(0.2, 1.0 - 0.2 * sum(flags.values()))
+        if state_desc == "late_fallback":
+            flags["late_fallback"] = True
+            conf = 0.3
+        elif state_desc == "insufficient_info":
+            flags["insufficient_info"] = True
+            conf = 0.3
+        else:
+            conf = max(0.2, 1.0 - 0.2 * sum(flags.values()))
 
         return ScenarioDistribution(
             product=self.product.upper(),
@@ -334,13 +382,6 @@ class _WoolForecaster:
         pull = sum((13 - REVEAL_DAYS[i]) * 12 for i in yarn_indices if i < len(REVEAL_DAYS) and REVEAL_DAYS[i] <= 12)
         return 3 if pull > 126 else 2
 
-    def _price(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        xx = self.z["price_inventory_keys"].astype(float)
-        yy = self.z["price_values"].astype(float)
-        a = np.asarray(x, float)
-        v = np.interp(a, xx, yy, left=yy[0], right=yy[-1])
-        return v, (a < xx[0]) | (a > xx[-1])
-
     def forecast(self, s: Mapping[str, Any]) -> ScenarioDistribution:
         step = int(s["step"])
         cur = float(s["inventory"])
@@ -358,55 +399,47 @@ class _WoolForecaster:
             )
 
         if step < 239:
+            raise ValueError(
+                f"WOOL empirical scenario library only available from step 239 (Day 10); step {step} must use legacy forecast_inventory."
+            )
+
+        d12_full_delta = np.hstack([
+            np.zeros((len(self.z["d12_branch"]), 1)),
+            self.z["d12_delta_inventory"].astype(float),
+        ])
+
+        if step < 311:
             g = self._gate(s)
             cand = np.where(self.z["d9_state"] == g)[0]
             if len(cand) == 0:
                 cand = np.arange(len(self.z["d9_state"]))
-
-            # Deterministic simulation from step to 239
-            inv_hist = [cur]
-            yarn_revealed = any(shop == "YARN_STORE" for shop in shops)
-            for t in range(step, 239):
-                delta_t = 0
-                if yarn_revealed and (t + 1) % 4 == 0:
-                    delta_t -= 2
-                if (t + 1) % 24 == 0:
-                    delta_t -= 1
-                inv_hist.append(inv_hist[-1] + delta_t)
-
-            anchor_239 = inv_hist[-1]
-            pre_paths = np.tile(np.array(inv_hist), (len(cand), 1))
-            delta_240 = self.z["d9_delta_inventory"][cand].astype(float)
-            post_paths = anchor_239 + delta_240
-            paths = np.hstack([pre_paths, post_paths])
-            state_desc = f"G{g}"
-            level = "state"
-
-        elif step < 311:
-            g = self._gate(s)
-            cand = np.where(self.z["d9_state"] == g)[0]
-            if len(cand) == 0:
-                cand = np.arange(len(self.z["d9_state"]))
-            e = step - 240
+            e = max(0, step - 240)
             delta = self.z["d9_delta_inventory"][cand, e:].astype(float) - self.z["d9_delta_inventory"][cand, e, None].astype(float)
             paths = cur + delta
             state_desc = f"G{g}"
             level = "state"
-
-        else:
+        elif step == 311:
             b = int(s.get("d12_branch", self._branch(s)))
             cand = np.where(self.z["d12_branch"] == b)[0]
             if len(cand) == 0:
                 cand = np.arange(len(self.z["d12_branch"]))
-            d12_full_delta = np.hstack([np.zeros((len(self.z["d12_branch"]), 1)), self.z["d12_delta_inventory"].astype(float)])
-            base = d12_full_delta[cand]
-            cen = np.mean(base, axis=0)
-            e = min(step - 311, base.shape[1] - 1)
-            if e == 0:
-                delta = base[:, e:]
-                d12 = cur
-            else:
-                d12 = float(s.get("d12_inventory", cur - cen[e]))
+            delta = d12_full_delta[cand, 0:]
+            paths = cur + delta
+            state_desc = f"B{b}"
+            level = "branch"
+        else:
+            # step > 311 (post-D12)
+            has_b = "d12_branch" in s and s["d12_branch"] is not None and int(s["d12_branch"]) >= 0
+            has_inv = "d12_inventory" in s and s["d12_inventory"] is not None and np.isfinite(float(s["d12_inventory"]))
+            e = min(step - 311, d12_full_delta.shape[1] - 1)
+            if has_b and has_inv:
+                b = int(s["d12_branch"])
+                d12 = float(s["d12_inventory"])
+                cand = np.where(self.z["d12_branch"] == b)[0]
+                if len(cand) == 0:
+                    cand = np.arange(len(self.z["d12_branch"]))
+                base = d12_full_delta[cand]
+                cen = np.mean(base, axis=0)
                 robs = (cur - d12) - cen[e]
                 obs_days = e / 24
                 obs_idx = int(np.argmin(np.abs(np.array([int(x) for x in self.z["residual_obs_days"]]) - obs_days)))
@@ -420,25 +453,38 @@ class _WoolForecaster:
                 r = near[near.branch == b]
                 if len(r):
                     residual_ood = bool(robs < r.residual_q01.iloc[0] or robs > r.residual_q99.iloc[0])
-            paths = d12 + delta
-            state_desc = f"B{b}"
-            level = "branch"
+                paths = d12 + delta
+                state_desc = f"B{b}"
+                level = "branch"
+            else:
+                # Late-attach fallback without fake anchor or rho correction
+                cand = np.arange(len(self.z["d12_branch"]))
+                delta = d12_full_delta[cand, e:] - d12_full_delta[cand, e, None]
+                paths = cur + delta
+                state_desc = "late_fallback"
+                level = "late_fallback"
 
         # Re-anchor strictly to current inventory at h = 0
         paths[:, 0] = cur
 
         qs = np.quantile(paths, [.1, .25, .5, .75, .9], axis=0)
-        qs = np.sort(qs, axis=0)
-        pp, pood = self._price(paths)
-        pq = np.stack([self._price(qs[4])[0], self._price(qs[3])[0], self._price(qs[2])[0], self._price(qs[1])[0], self._price(qs[0])[0]])
+        pp = _inventory_to_price_paths("WOOL", paths)
+        pq = np.stack([
+            np.array([rules.market_price("WOOL", int(round(x))) for x in qs[4 - i]])
+            for i in range(5)
+        ])
         pq = np.sort(pq, axis=0)
 
         flags = {
             "reveal_ood": False,
             "residual_ood": bool(residual_ood),
-            "price_ood": bool(np.any(pood)),
+            "price_ood": False,
         }
-        conf = max(0.2, 1.0 - 0.2 * sum(flags.values()))
+        if state_desc == "late_fallback":
+            flags["late_fallback"] = True
+            conf = 0.3
+        else:
+            conf = max(0.2, 1.0 - 0.2 * sum(flags.values()))
 
         return ScenarioDistribution(
             product="WOOL",
@@ -465,6 +511,31 @@ def _get_forecaster(product: str) -> _WoolForecaster | _MilkEggForecaster:
     if prod_upper in ("MILK", "EGG"):
         return _MilkEggForecaster(prod_upper)
     raise ValueError(f"Scenario forecaster is only available for WOOL, MILK, EGG; got {product}")
+
+
+@dataclass
+class AnimalMarketContext:
+    """Per-player session context maintaining anchor observations and turn forecast caches."""
+    d12_anchors: dict[str, tuple[int, float]] = field(default_factory=dict)
+    reference_cache: dict[tuple[int, str, float], ScenarioDistribution] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        self.d12_anchors.clear()
+        self.reference_cache.clear()
+
+    def observe_turn(self, state: State) -> None:
+        self.reference_cache = {k: v for k, v in self.reference_cache.items() if k[0] == state.step}
+        if state.step != 311:
+            return
+        for prod in ("WOOL", "MILK", "EGG"):
+            if prod in self.d12_anchors:
+                continue
+            forecaster = _get_forecaster(prod)
+            feats = _extract_state_features(state, prod)
+            branch = forecaster._branch(feats)
+            cur_inv = float(state.market.inventory.get(prod, rules.MARKET_I0))
+            if branch >= 0:
+                self.d12_anchors[prod] = (branch, cur_inv)
 
 
 def _extract_state_features(state: State, product: str, **kwargs) -> dict[str, Any]:
@@ -497,13 +568,34 @@ def _extract_state_features(state: State, product: str, **kwargs) -> dict[str, A
     elif prod_upper == "EGG":
         geese = [a for a in (*state.own.animals, *state.opp.visible_animals) if a.asset_type == "GOOSE"]
         features["goose_total"] = len(geese)
-        features["opponent_money"] = getattr(state.opp, "money", 0)
+        features["opponent_money"] = kwargs.get("opponent_money", getattr(state.opp, "money", None))
 
     return features
 
 
-def forecast_product_distribution(state: State, product: str, **kwargs) -> ScenarioDistribution:
+def forecast_product_distribution(
+    state: State,
+    product: str,
+    context: AnimalMarketContext | None = None,
+    **kwargs,
+) -> ScenarioDistribution:
     """Public entry point: forecast full scenario distribution for WOOL, MILK, or EGG."""
+    prod_upper = product.upper()
+    cur_inv = float(kwargs.get("inventory", state.market.inventory.get(prod_upper, rules.MARKET_I0)))
+    step = int(kwargs.get("step", state.step))
+    key = (step, prod_upper, cur_inv)
+    if context is not None and not kwargs and key in context.reference_cache:
+        return context.reference_cache[key]
+
     forecaster = _get_forecaster(product)
     s = _extract_state_features(state, product, **kwargs)
-    return forecaster.forecast(s)
+    if context is not None and prod_upper in context.d12_anchors:
+        if "d12_branch" not in s:
+            s["d12_branch"] = context.d12_anchors[prod_upper][0]
+        if "d12_inventory" not in s:
+            s["d12_inventory"] = context.d12_anchors[prod_upper][1]
+
+    dist = forecaster.forecast(s)
+    if context is not None and not kwargs:
+        context.reference_cache[key] = dist
+    return dist
