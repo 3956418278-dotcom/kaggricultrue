@@ -1024,7 +1024,9 @@ class SubmitRegressionTests(unittest.TestCase):
         from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS as params
         from src.kaggriculture_agent.scenario_forecast import (
             forecast_product_distribution,
+            animal_batch_sale_events,
             animal_incremental_market_path,
+            scenario_batch_sale_value,
             scenario_revenue_value,
         )
         import numpy as np
@@ -1063,12 +1065,9 @@ class SubmitRegressionTests(unittest.TestCase):
                 if kind in rules.ANIMALS:
                     wheat = _minimum_survival_feed_units(days)
                     dist = forecast_product_distribution(two, rule.product)
-                    p_days = [two.day + rule.first_yield_day - 1, two.day + rule.first_yield_day - 1 + rule.interval]
-                    h_steps = [(pd + 1) * 24 - two.step for pd in p_days]
-                    cand_impact = animal_incremental_market_path([(h, 1) for h in h_steps], dist.horizon_steps)
-                    cand_inv = dist.inventory_paths + cand_impact
-                    expected_rev = scenario_revenue_value(
-                        rule.product, cand_inv, [1, 1], h_steps, weights=dist.weights
+                    events = animal_batch_sale_events(two, kind, is_new=True)
+                    expected_rev = scenario_batch_sale_value(
+                        rule.product, dist.inventory_paths, events, weights=dist.weights
                     )["expected"]
                     expected = (expected_rev + max(1, wheat) * conservative_f_price(two)
                                 - rule.cost - buy_cost("WHEAT", wheat, two.market.inventory["WHEAT"])) / days

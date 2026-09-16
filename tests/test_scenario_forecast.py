@@ -21,9 +21,11 @@ from src.kaggriculture_agent.scenario_forecast import (
     AnimalMarketContext,
     ScenarioDistribution,
     _MilkEggForecaster,
+    animal_batch_sale_events,
     animal_incremental_market_path,
     candidate_inventory,
     forecast_product_distribution,
+    scenario_batch_sale_value,
     scenario_revenue_value,
 )
 from src.kaggriculture_agent.state import AssetState, TileState, reconstruct
@@ -207,8 +209,12 @@ class ScenarioForecastUnitTests(unittest.TestCase):
         """Test Point 8: When one animal exits, remaining animal valuation uses lowered supply."""
         params = DEFAULT_MIDGAME_PARAMETERS
         for kind, prod in (("COW", "MILK"), ("SHEEP", "WOOL"), ("GOOSE", "EGG")):
+            held = 3 if kind == "SHEEP" else 0
             a1 = self.animal(kind, placed_day=3, position=(0, 0))
             a2 = self.animal(kind, placed_day=3, position=(1, 0))
+            if held:
+                a1.official["yield_units"] = held
+                a2.official["yield_units"] = held
             st = self.state(day=12, animals=(a1, a2))
 
             # Both kept
@@ -248,6 +254,116 @@ class ScenarioForecastUnitTests(unittest.TestCase):
         dist1 = forecast_product_distribution(st, "MILK", context=ctx)
         dist2 = forecast_product_distribution(st, "MILK", context=ctx)
         self.assertIs(dist1, dist2)
+
+    def test_batch_schedule_new_cow_multi_batch(self):
+        """12.1: New COW with 15 productions returns [(h1,6), (h2,6), (h3,3)], not 15 individual (h,1)."""
+        st = self.state(day=0, step=0)
+        # 15 productions for COW (first_yield=8, interval=2): end_day = 7 + 14 * 2 = 35
+        events = animal_batch_sale_events(st, "COW", is_new=True, end_day=35)
+        self.assertEqual(len(events), 3)
+        self.assertEqual([q for _, q in events], [6, 6, 3])
+        # Verify h1, h2, h3 are the steps when 6th, 12th, and 15th milk completed
+        h1 = (7 + 5 * 2 + 1) * 24
+        h2 = (7 + 11 * 2 + 1) * 24
+        h3 = (7 + 14 * 2 + 1) * 24
+        self.assertEqual([h for h, _ in events], [h1, h2, h3])
+
+    def test_batch_schedule_existing_cow_held(self):
+        """12.2: Existing COW with held=3 and 10 future productions yields [(h1,6), (h2,6), (h3,1)]."""
+        st = self.state(day=0, step=0)
+        # 10 productions: end_day = 7 + 9 * 2 = 25
+        events = animal_batch_sale_events(
+            st, "COW", raw={"placed_day": 0, "yield_units": 3}, end_day=25
+        )
+        self.assertEqual([q for _, q in events], [6, 6, 1])
+        h1 = (7 + 2 * 2 + 1) * 24  # 3rd production completes 6th held
+        h2 = (7 + 8 * 2 + 1) * 24  # 9th production completes 12th held
+        h3 = (7 + 9 * 2 + 1) * 24  # 10th production completes terminal 1 held
+        self.assertEqual([h for h, _ in events], [h1, h2, h3])
+
+    def test_batch_schedule_goose(self):
+        """12.3: GOOSE with 10 productions yields [(h1,4), (h2,4), (h3,2)]."""
+        st = self.state(day=0, step=0)
+        # GOOSE (first_yield=4, interval=1): 10 productions: end_day = 3 + 9 = 12
+        events = animal_batch_sale_events(st, "GOOSE", is_new=True, end_day=12)
+        self.assertEqual([q for _, q in events], [4, 4, 2])
+        h1 = (3 + 3 + 1) * 24  # 4th egg
+        h2 = (3 + 7 + 1) * 24  # 8th egg
+        h3 = (3 + 9 + 1) * 24  # 10th egg
+        self.assertEqual([h for h, _ in events], [h1, h2, h3])
+
+    def test_production_does_not_affect_market_before_sale(self):
+        """12.4: Production events do not alter market inventory before batch sale."""
+        events = [(30, 3)]
+        H = 100
+        impact = animal_incremental_market_path(events, H)
+        # For all h <= 30, impact must be 0
+        self.assertTrue(np.all(impact[:31] == 0))
+        # For all h > 30, impact must be 3
+        self.assertTrue(np.all(impact[31:] == 3))
+
+    def test_batch_sale_sequential_ordering(self):
+        """12.5: Batch sale sequence: rev1 uses pre-sale1 inv; rev2 uses post-sale1 inv."""
+        ref_paths = np.full((1, 100), 20.0)
+        events = [(30, 6), (60, 4)]
+        rev_dict = scenario_batch_sale_value("MILK", ref_paths, events)
+
+        # Revenue 1 uses inventory 20.0
+        exp_rev1 = sell_revenue("MILK", 6, 20)
+        # Revenue 2 uses inventory 20 + 6 = 26 (containing batch 1 impact)
+        exp_rev2 = sell_revenue("MILK", 4, 26)
+        total_exp = exp_rev1 + exp_rev2
+
+        self.assertAlmostEqual(rev_dict["expected"], float(total_exp))
+
+    def test_exit_batch_subtraction(self):
+        """12.6: Existing COW EXIT removes its batch schedule [(h1,6), (h2,3)] from reference scenario."""
+        events = [(30, 6), (60, 3)]
+        H = 100
+        impact = animal_incremental_market_path(events, H)
+        ref_paths = np.full((1, H), 30.0)
+        active_inv = ref_paths - impact
+
+        # At h <= 30: unchanged
+        self.assertTrue(np.all(active_inv[0, :31] == 30.0))
+        # At 30 < h <= 60: subtracted 6 (inv = 24.0)
+        self.assertTrue(np.all(active_inv[0, 31:61] == 24.0))
+        # At h > 60: subtracted 6 + 3 = 9 (inv = 21.0)
+        self.assertTrue(np.all(active_inv[0, 61:] == 21.0))
+
+    def test_shops_5_6_8_empirical_models_continue_working(self):
+        """12.7: 5, 6, 8 shops allow empirical forecast for SHEEP, COW, and GOOSE."""
+        from src.kaggriculture_agent.planner import _forecast_animal_daily_value
+        from src.kaggriculture_agent.current_assets import _animal_current_state
+        shops_5 = ("BAKERY", "PIZZA_SHOP", "BRUNCH_SPOT", "YARN_STORE", "ICE_CREAM_SHOP")
+        shops_6 = shops_5 + ("PET_CAFE",)
+        shops_8 = shops_6 + ("SMOOTHIE_SHOP", "FARMERS_MARKET")
+
+        for sh in (shops_5, shops_6, shops_8):
+            st = self.state(day=12, step=288, shops=sh)
+            for kind in ("COW", "SHEEP", "GOOSE"):
+                val = _forecast_animal_daily_value(st, kind, DEFAULT_MIDGAME_PARAMETERS)
+                self.assertIsInstance(val, float)
+                a = self.animal(kind, placed_day=3, position=(0, 0))
+                cur = _animal_current_state(st, a, prior=None, params=DEFAULT_MIDGAME_PARAMETERS)
+                self.assertIsInstance(cur.daily_value, float)
+
+    def test_new_episode_context_reset(self):
+        """12.8: Old D12 anchor and reference cache do not leak into new episode."""
+        from src.kaggriculture_agent.operating import DailyPlanningSession
+        session = DailyPlanningSession()
+        # Episode 1 reaches D12 (step 311)
+        st_ep1_d12 = self.state(day=12, step=311, shops=("BAKERY",), opp_money=5000)
+        session.plan_for(st_ep1_d12)
+        ctx1 = session._market_contexts[0]
+        self.assertTrue(len(ctx1.d12_anchors) > 0 or len(ctx1.reference_cache) > 0)
+
+        # Episode 2 starts at step 0 (state.step < last_step)
+        st_ep2_start = self.state(day=0, step=0, shops=(), opp_money=100)
+        session.plan_for(st_ep2_start)
+        ctx2 = session._market_contexts[0]
+        # Must be a fresh context with no old D12 anchors
+        self.assertEqual(len(ctx2.d12_anchors), 0)
 
 
 class GoldenReferenceTests(unittest.TestCase):

@@ -7,8 +7,11 @@ from typing import Iterable, Mapping
 from . import rules
 from .scenario_forecast import (
     AnimalMarketContext,
+    animal_batch_sale_events,
     animal_incremental_market_path,
     forecast_product_distribution,
+    is_valid_shops,
+    scenario_batch_sale_value,
     scenario_revenue_value,
 )
 import numpy as np
@@ -328,7 +331,7 @@ def _animal_current_state(
     production_day = next_animal_production_day(raw, state.day)
     first_output_complete = state.day >= int(raw["placed_day"]) + rule.first_yield_day
 
-    valid_shops = len(state.shops) <= 4 and len(set(state.shops)) == len(state.shops)
+    valid_shops = is_valid_shops(state.shops)
     use_empirical = (
         (rule.product in ("MILK", "EGG") or (rule.product == "WOOL" and state.step >= 239))
         and valid_shops
@@ -338,34 +341,27 @@ def _animal_current_state(
         ref_paths = dist.inventory_paths
         H = dist.horizon_steps
 
-        # 1. Deduct future production of excluded animals from reference paths
+        # 1. Deduct future batch sales of excluded animals from reference paths
         excluded_events: list[tuple[int, int]] = []
         if excluded_own_tiles:
             for ex_tile in excluded_own_tiles:
                 for ex_a in state.own.animals:
                     if ex_a.position == ex_tile and ex_a.asset_type == asset.asset_type:
-                        for d in existing_animal_future_production_days(ex_a.official, state.day):
-                            h = (d + 1) * 24 - state.step
+                        ex_batches = animal_batch_sale_events(state, ex_a.asset_type, raw=ex_a.official)
+                        for h, q in ex_batches:
                             if 0 <= h < H:
-                                excluded_events.append((h, 1))
-        ex_impact = animal_incremental_market_path(excluded_events, H)
-        active_baseline_inv = ref_paths - ex_impact
+                                excluded_events.append((h, q))
+        ex_impact = animal_incremental_market_path(excluded_events, H, inclusive=True)
+        active_baseline_inv = np.maximum(0, ref_paths - ex_impact)
 
-        # 2. Achievable future production timeline for this animal
-        my_days = existing_animal_future_production_days(raw, state.day)
-        my_events: list[tuple[int, int]] = []
-        for d in my_days:
-            h = (d + 1) * 24 - state.step
-            if 0 <= h < H:
-                bonus = int(raw.get("pending_care_bonus", 0)) if (d == state.day and bool(raw.get("fed_today", False))) else 0
-                my_events.append((h, 1 + bonus))
+        # 2. Batch sale schedule for this animal
+        my_sale_events = animal_batch_sale_events(state, asset.asset_type, raw=raw)
+        valid_sale_events = [(h, q) for h, q in my_sale_events if 0 <= h < H]
 
-        # 3. Evaluate remaining achievable production timeline across scenarios
-        if my_events:
-            step_indices = [h for h, _ in my_events]
-            quantities = [q for _, q in my_events]
-            rev_dict = scenario_revenue_value(
-                rule.product, active_baseline_inv, quantities, step_indices, weights=dist.weights
+        # 3. Evaluate multi-batch sales across scenarios
+        if valid_sale_events:
+            rev_dict = scenario_batch_sale_value(
+                rule.product, active_baseline_inv, valid_sale_events, weights=dist.weights
             )
             expected_product_revenue = rev_dict["expected"]
         else:

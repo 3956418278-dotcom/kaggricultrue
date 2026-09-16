@@ -89,20 +89,25 @@ def _inventory_to_price_paths(product: str, inv_paths: np.ndarray) -> np.ndarray
 def animal_incremental_market_path(
     events: Sequence[tuple[int, int]],
     horizon: int,
+    *,
+    inclusive: bool = False,
 ) -> np.ndarray:
     """Cumulative market inventory impact path of shape (horizon,).
 
     For a sale at step h_k with quantity q_k:
-    - At h <= h_k: this sale has not yet completed and entered the market,
+    - If inclusive is False (default for a candidate's own future sales):
+      At h <= h_k, the transaction has not yet completed and entered the market,
       so it contributes 0 before/during the transaction.
-    - At h > h_k: this sale has completed and entered the market inventory,
-      so it contributes +q_k to all subsequent steps.
+      At h > h_k, the transaction has completed, so it contributes +q_k.
+    - If inclusive is True (for prior accepted sales or counterfactual exits at the same step):
+      The sale impact is present at h >= h_k.
     """
     impact = np.zeros(horizon, dtype=float)
     for step_h, qty in events:
-        if 0 <= step_h + 1 < horizon:
-            impact[step_h + 1:] += qty
-        elif step_h < 0:
+        start = step_h if inclusive else step_h + 1
+        if 0 <= start <= horizon:
+            impact[start:] += qty
+        elif start < 0:
             impact[:] += qty
     return impact
 
@@ -114,6 +119,147 @@ def candidate_inventory(
 ) -> np.ndarray:
     """Counterfactual inventory I_candidate = I_ref + Delta_cand - Delta_base."""
     return reference_paths + np.asarray(candidate_impact) - np.asarray(baseline_impact)
+
+
+def is_valid_shops(shops: Sequence[str]) -> bool:
+    """1-8 unique legal shops allow empirical forecast; duplicate or invalid shops do not."""
+    return len(set(shops)) == len(shops) and all(shop in rules.SHOPS for shop in shops)
+
+
+def animal_batch_sale_events(
+    state: State,
+    animal_type: str,
+    *,
+    raw: Mapping[str, object] | None = None,
+    is_new: bool = False,
+    end_day: int | None = None,
+) -> list[tuple[int, int]]:
+    """Generate macro batch sale events [(relative_sale_step, quantity), ...] to terminal.
+
+    An animal accumulates held product; when reaching max_held, it is harvested and
+    sold as a batch. Any remaining partial batch at terminal is sold at the last
+    production step (or current step if no further productions occur).
+
+    For existing animals (raw provided, is_new=False):
+    - Starts accumulation from current held quantity (raw['yield_units']).
+    - Existing legal pending CARE bonus is realized on the next production refresh.
+    - Future uncommitted care is NOT assumed.
+
+    For new animals (is_new=True or raw=None):
+    - Placed at state.day with initial held = 0 and no bonus.
+    """
+    rule = rules.ANIMALS[animal_type]
+    max_held = rule.max_held
+    last_refresh_day = end_day if end_day is not None else (rules.TERMINAL_ACTION_STEP // rules.TURNS_PER_DAY - 1)
+
+    if is_new or raw is None:
+        placed_day = state.day
+        accum = 0
+        pending_bonus = 0
+        raw_dict: dict[str, object] = {}
+    else:
+        raw_dict = dict(raw)
+        placed_day = int(raw_dict.get("placed_day", state.day))
+        accum = int(raw_dict.get("yield_units", 0))
+        pending_bonus = int(raw_dict.get("pending_care_bonus", 0))
+
+    events: list[tuple[int, int]] = []
+    last_h = 0
+
+    # If current held already exceeds or meets max_held, harvest immediate batch at h = 0
+    while accum >= max_held:
+        events.append((0, max_held))
+        accum -= max_held
+
+    for d in range(state.day, last_refresh_day + 1):
+        since = d + 1 - placed_day - rule.first_yield_day
+        if since < 0 or since % rule.interval != 0:
+            continue
+
+        if is_new or raw is None:
+            qty = 1
+        else:
+            prod_raw = dict(raw_dict)
+            prod_raw["animal"] = animal_type
+            prod_raw["placed_day"] = placed_day
+            if d == state.day:
+                if pending_bonus > 0:
+                    prod_raw["fed_today"] = True
+                    prod_raw["pending_care_bonus"] = pending_bonus
+                    qty = rules.animal_production_on_refresh(prod_raw, d)
+                    pending_bonus = 0
+                else:
+                    qty = rules.animal_production_on_refresh(prod_raw, d)
+                    if qty <= 0:
+                        qty = 1
+            else:
+                if pending_bonus > 0:
+                    prod_raw["fed_today"] = True
+                    prod_raw["pending_care_bonus"] = pending_bonus
+                    qty = rules.animal_production_on_refresh(prod_raw, d)
+                    pending_bonus = 0
+                else:
+                    prod_raw["fed_today"] = True
+                    prod_raw["pending_care_bonus"] = 0
+                    qty = rules.animal_production_on_refresh(prod_raw, d)
+                    if qty <= 0:
+                        qty = 1
+
+        h = (d + 1) * rules.TURNS_PER_DAY - state.step
+        last_h = h
+        accum += qty
+        while accum >= max_held:
+            events.append((h, max_held))
+            accum -= max_held
+
+    if accum > 0:
+        events.append((last_h, accum))
+
+    return events
+
+
+def scenario_batch_sale_value(
+    product: str,
+    reference_paths: np.ndarray,
+    batch_sale_events: Sequence[tuple[int, int]],
+    weights: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Sequential transaction price-impact revenue across scenarios for multi-batch sales.
+
+    Evaluates batch sales strictly in chronological order:
+    1. At sale step h_k, batch k sells into the current counterfactual inventory,
+       which includes impacts of previous batches (h_j < h_k or earlier in sequence)
+       but NOT this batch k or future batches.
+    2. After sale step h_k (i.e. at h > h_k), market inventory increases by q_k.
+    """
+    S, H = reference_paths.shape
+    if S == 0 or H == 0 or not batch_sale_events:
+        return {"expected": 0.0, "q10": 0.0, "q50": 0.0, "q90": 0.0}
+
+    w = np.ones(S) / S if weights is None else np.asarray(weights) / np.sum(weights)
+    current_inv = reference_paths.copy()
+    scenario_revenue = np.zeros(S, dtype=float)
+
+    sorted_events = sorted(batch_sale_events, key=lambda x: x[0])
+    for step_h, qty in sorted_events:
+        if qty <= 0:
+            continue
+        if 0 <= step_h < H:
+            for s in range(S):
+                scenario_revenue[s] += sell_revenue(
+                    product, qty, int(round(current_inv[s, step_h]))
+                )
+            if step_h + 1 < H:
+                current_inv[:, step_h + 1:] += qty
+        elif step_h < 0:
+            current_inv += qty
+
+    return {
+        "expected": float(w @ scenario_revenue),
+        "q10": float(np.quantile(scenario_revenue, 0.10)),
+        "q50": float(np.quantile(scenario_revenue, 0.50)),
+        "q90": float(np.quantile(scenario_revenue, 0.90)),
+    }
 
 
 def scenario_revenue_value(

@@ -60,18 +60,26 @@ for animal products (WOOL, MILK, EGG):
   - Missing public opponent money triggers an explicit insufficient-information fallback rather than defaulting to branch 2.
   - Single-pass turn reference caching eliminates repeated full-scenario generation across farm animals.
 - **Planner & asset valuation**:
-  - `animal_incremental_market_path` computes cumulative prior market impact avoiding intra-transaction double counting.
-  - `planner._forecast_animal_daily_value` evaluates new candidate incremental impact on top of already accepted programme additions.
-  - `current_assets._animal_current_state` deducts future supply of exiting animals (`excluded_own_tiles`) and evaluates the full remaining achievable production timeline via `scenario_revenue_value`.
+  - `is_valid_shops` validates 1-8 unique legal shops, allowing empirical forecasting across all reveal stages up to full 8-shop reveal.
+  - `animal_batch_sale_events` separates production from market sales: held inventory accumulates to `max_held` before batch sale, terminal partial batches liquidate at the final production step, and existing animals accumulate from observed held quantity with pending CARE bonuses.
+  - `scenario_batch_sale_value` evaluates multi-batch sales in strict chronological order, ensuring earlier sales impact later batches while avoiding intra-batch double counting.
+  - Exiting animals (`excluded_own_tiles`) remove their full batch-sale counterfactual impact from market inventory.
+  - `DailyPlanningSession.plan_for` resets per-player `AnimalMarketContext` when `step < last_step`, eliminating cross-episode anchor and cache leakage.
   - WOOL at D8 and earlier routes to legacy `forecast_inventory`; empirical gating begins from step 239 onwards. Crops retain legacy `forecast_inventory` behavior.
 
 ## Validation
 
-- Full suite run under runner: 119 passed tests (all midgame asset, scenario forecast, D11 controller,
+- Full suite run under runner: 127 passed tests (all midgame asset, scenario forecast, D11 controller,
   opening base, player day, reference pipeline, replay viewer, scripted opening, and zonal template tests).
 - Dedicated scenario forecast tests in `tests/test_scenario_forecast.py`:
   - Golden comparison against supplied reference runtimes (`milk_runtime_v3.py`, `egg_runtime_v3.py`) across D9, D10, D11, D12, D12+1d, D12+3d, D12+5d;
   - Exact price path identity: `dist.price_paths[s, h] == rules.market_price(product, round(dist.inventory_paths[s, h]))`;
+  - Exact batch schedule verification for new COW (15 productions -> [6, 6, 3]), existing COW (held=3, 10 productions -> [6, 6, 1]), and GOOSE (10 productions -> [4, 4, 2]);
+  - Market isolation of intermediate production before batch sales;
+  - Strict chronological batch ordering and sequential price impact;
+  - Full batch-path counterfactual subtraction for EXIT animals;
+  - Multi-shop (5, 6, 8 shops) empirical execution;
+  - Cross-episode context reset verification;
   - Counterfactual candidate valuation incorporating accepted additions;
   - Re-valuation of remaining animals when exiting animals are excluded;
   - Sequential revenue exact comparison against manual hand calculation;

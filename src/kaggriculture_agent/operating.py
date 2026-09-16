@@ -77,10 +77,18 @@ class DailyPlanningSession:
         self._market_contexts.clear()
 
     def plan_for(self, state: State) -> Programme:
-        ctx = self._market_contexts.setdefault(state.player, AnimalMarketContext())
-        ctx.observe_turn(state)
-        prior = self._plans.get(state.player)
         last = self._last_steps.get(state.player, -1)
+        if state.step < last:
+            self._plans.pop(state.player, None)
+            self._market_contexts[state.player] = AnimalMarketContext()
+
+        ctx = self._market_contexts.setdefault(
+            state.player,
+            AnimalMarketContext(),
+        )
+        ctx.observe_turn(state)
+
+        prior = self._plans.get(state.player)
         reason = None if prior is None else programme_invalidation(state, prior)
         if prior is None or state.step < last or prior.day != state.day or reason is not None:
             prior = make_plan(state, prior_programme=prior, market_context=ctx)

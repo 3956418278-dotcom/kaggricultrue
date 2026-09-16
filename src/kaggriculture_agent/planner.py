@@ -8,8 +8,11 @@ from typing import Iterable
 from . import rules
 from .scenario_forecast import (
     AnimalMarketContext,
+    animal_batch_sale_events,
     animal_incremental_market_path,
     forecast_product_distribution,
+    is_valid_shops,
+    scenario_batch_sale_value,
     scenario_revenue_value,
 )
 import numpy as np
@@ -454,12 +457,12 @@ def _forecast_animal_daily_value(
     first_prod_day = state.day + rule.first_yield_day - 1
     if first_prod_day > 28:
         return 0.0
-    prod_days = []
-    for k in range(rule.max_held):
-        prod_day = first_prod_day + k * rule.interval
-        if prod_day > 28:
-            break
-        prod_days.append(prod_day)
+    last_refresh_day = rules.TERMINAL_ACTION_STEP // rules.TURNS_PER_DAY - 1
+    prod_days = [
+        d for d in range(state.day, last_refresh_day + 1)
+        if (d + 1 - state.day - rule.first_yield_day) >= 0
+        and (d + 1 - state.day - rule.first_yield_day) % rule.interval == 0
+    ]
     productions = len(prod_days)
     if productions == 0:
         return 0.0
@@ -470,7 +473,7 @@ def _forecast_animal_daily_value(
         int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
     realizable_f = max(1, wheat_units)
 
-    valid_shops = len(state.shops) <= 4 and len(set(state.shops)) == len(state.shops)
+    valid_shops = is_valid_shops(state.shops)
     use_empirical = (
         (rule.product in ("MILK", "EGG") or (rule.product == "WOOL" and state.step >= 239))
         and valid_shops
@@ -488,47 +491,26 @@ def _forecast_animal_daily_value(
                 additions = [a for a in programme.assets if not a.existing and a.decision == "NEW"]
             for accepted in additions:
                 if accepted.asset_type in rules.ANIMALS and rules.ANIMALS[accepted.asset_type].product == rule.product:
-                    acc_rule = rules.ANIMALS[accepted.asset_type]
-                    acc_first_day = state.day + acc_rule.first_yield_day - 1
-                    for k in range(acc_rule.max_held):
-                        p_day = acc_first_day + k * acc_rule.interval
-                        if p_day > 28:
-                            break
-                        h = (p_day + 1) * 24 - state.step
+                    acc_events = animal_batch_sale_events(state, accepted.asset_type, is_new=True)
+                    for h, q in acc_events:
                         if 0 <= h < H:
-                            accepted_events.append((h, 1))
+                            accepted_events.append((h, q))
 
-        base_impact = animal_incremental_market_path(accepted_events, H)
+        base_impact = animal_incremental_market_path(accepted_events, H, inclusive=True)
         planning_baseline = ref_paths + base_impact
 
-        # 2. Candidate animal incremental impact
-        cand_events: list[tuple[int, int]] = []
-        out_of_horizon_days = 0
-        for prod_day in prod_days:
-            h = (prod_day + 1) * 24 - state.step
-            if 0 <= h < H:
-                cand_events.append((h, 1))
-            else:
-                out_of_horizon_days += 1
+        # 2. Candidate animal batch sale events
+        cand_events = animal_batch_sale_events(state, animal, is_new=True)
+        valid_cand_events = [(h, q) for h, q in cand_events if 0 <= h < H]
 
-        cand_impact = animal_incremental_market_path(cand_events, H)
-        candidate_scenarios = planning_baseline + cand_impact
-
-        # 3. Revenue via scenario_revenue_value
-        if cand_events:
-            step_indices = [h for h, _ in cand_events]
-            quantities = [q for _, q in cand_events]
-            rev_dict = scenario_revenue_value(
-                rule.product, candidate_scenarios, quantities, step_indices, weights=dist.weights
+        # 3. Revenue via scenario_batch_sale_value
+        if valid_cand_events:
+            rev_dict = scenario_batch_sale_value(
+                rule.product, planning_baseline, valid_cand_events, weights=dist.weights
             )
             expected_product_revenue = rev_dict["expected"]
         else:
             expected_product_revenue = 0.0
-
-        if out_of_horizon_days > 0:
-            expected_product_revenue += out_of_horizon_days * float(rules.market_price(
-                rule.product, int(state.market.inventory.get(rule.product, rules.MARKET_I0))
-            ))
 
         numerator = (
             expected_product_revenue
@@ -536,7 +518,15 @@ def _forecast_animal_daily_value(
             - rule.cost
             - wheat_cost
         )
+        return numerator / max(1, days)
     else:
+        legacy_prods = min(productions, rule.max_held)
+        legacy_days = rule.first_yield_day + (legacy_prods - 1) * rule.interval
+        legacy_wheat_units = _minimum_survival_feed_units(legacy_days)
+        legacy_wheat_cost = buy_cost(
+            "WHEAT", legacy_wheat_units,
+            int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
+        legacy_realizable_f = max(1, legacy_wheat_units)
         forecast_inv = forecast_inventory(
             state, rule.product, (first_prod_day + 1) * 24,
             planned_assets=programme.additions if programme else (),
@@ -544,12 +534,12 @@ def _forecast_animal_daily_value(
         )
         forecast_price = rules.market_price(rule.product, forecast_inv)
         numerator = (
-            productions * forecast_price
-            + realizable_f * conservative_f_price(state, params)
+            legacy_prods * forecast_price
+            + legacy_realizable_f * conservative_f_price(state, params)
             - rule.cost
-            - wheat_cost
+            - legacy_wheat_cost
         )
-    return numerator / max(1, days)
+        return numerator / max(1, legacy_days)
 
 
 def _forecast_crop_daily_value(state: State, crop: str, params=None, programme=None) -> float:
