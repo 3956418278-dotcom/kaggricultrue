@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
 from . import rules
+from .scenario_forecast import forecast_product_distribution
+import numpy as np
 from .market import buy_cost, forecast_inventory, next_reveal, sell_revenue
 from .midgame_config import DEFAULT_MIDGAME_PARAMETERS, MidgameParameters
 from .programme import AssetProgramme, CurrentAssetState, ProgrammeEvent
@@ -94,7 +96,7 @@ def animal_daily_value(
     state: State,
     animal: str,
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
-    *, product_price: int | None = None,
+    *, product_price: float | int | None = None,
     include_purchase_cost: bool = True,
 ) -> float:
     """Current snapshot value of one maximum effective animal cycle."""
@@ -303,10 +305,22 @@ def _animal_current_state(
     care_gain, care_possible = _care_gain(state, asset)
     production_day = next_animal_production_day(raw, state.day)
     first_output_complete = state.day >= int(raw["placed_day"]) + rule.first_yield_day
-    forecast_price = (rules.market_price(rule.product, forecast_inventory(
-        state, rule.product, _production_step(production_day),
-        excluded_own_tiles=excluded_own_tiles, params=params))
-        if production_day is not None else 0)
+    if rule.product in ("WOOL", "MILK", "EGG") and production_day is not None:
+        target_step = _production_step(production_day)
+        h = (target_step - state.step) if target_step is not None else -1
+        dist = forecast_product_distribution(state, rule.product)
+        if 0 <= h < dist.horizon_steps:
+            inv_at_h = dist.inventory_paths[:, h]
+            prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in inv_at_h])
+            forecast_price = float(dist.weights @ prices_s)
+        else:
+            forecast_price = float(_price(state, rule.product))
+    elif production_day is not None:
+        forecast_price = float(rules.market_price(rule.product, forecast_inventory(
+            state, rule.product, _production_step(production_day),
+            excluded_own_tiles=excluded_own_tiles, params=params)))
+    else:
+        forecast_price = 0.0
     daily = animal_daily_value(
         state, asset.asset_type, params, product_price=forecast_price,
         include_purchase_cost=False)

@@ -6,6 +6,8 @@ from dataclasses import replace
 from typing import Iterable
 
 from . import rules
+from .scenario_forecast import forecast_product_distribution
+import numpy as np
 from .current_assets import (
     _minimum_survival_feed_units,
     animal_daily_value,
@@ -437,32 +439,54 @@ def _forecast_animal_daily_value(
     first_prod_day = state.day + rule.first_yield_day - 1
     if first_prod_day > 28:
         return 0.0
-    productions = 0
+    prod_days = []
     for k in range(rule.max_held):
         prod_day = first_prod_day + k * rule.interval
         if prod_day > 28:
             break
-        productions += 1
+        prod_days.append(prod_day)
+    productions = len(prod_days)
     if productions == 0:
         return 0.0
-    forecast_inv = forecast_inventory(
-        state, rule.product, (first_prod_day + 1) * 24,
-        planned_assets=programme.additions if programme else (),
-        commitments=programme.events if programme else (), params=params,
-    )
-    forecast_price = rules.market_price(rule.product, forecast_inv)
     days = rule.first_yield_day + (productions - 1) * rule.interval
     wheat_units = _minimum_survival_feed_units(days)
     wheat_cost = buy_cost(
         "WHEAT", wheat_units,
         int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
     realizable_f = max(1, wheat_units)
-    numerator = (
-        productions * forecast_price
-        + realizable_f * conservative_f_price(state, params)
-        - rule.cost
-        - wheat_cost
-    )
+
+    if rule.product in ("WOOL", "MILK", "EGG"):
+        dist = forecast_product_distribution(state, rule.product)
+        expected_product_revenue = 0.0
+        for prod_day in prod_days:
+            target_step = (prod_day + 1) * 24
+            h = target_step - state.step
+            if 0 <= h < dist.horizon_steps:
+                inv_at_h = dist.inventory_paths[:, h]
+                prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in inv_at_h])
+                expected_product_revenue += float(dist.weights @ prices_s)
+            else:
+                expected_product_revenue += float(rules.market_price(
+                    rule.product, int(state.market.inventory.get(rule.product, rules.MARKET_I0))))
+        numerator = (
+            expected_product_revenue
+            + realizable_f * conservative_f_price(state, params)
+            - rule.cost
+            - wheat_cost
+        )
+    else:
+        forecast_inv = forecast_inventory(
+            state, rule.product, (first_prod_day + 1) * 24,
+            planned_assets=programme.additions if programme else (),
+            commitments=programme.events if programme else (), params=params,
+        )
+        forecast_price = rules.market_price(rule.product, forecast_inv)
+        numerator = (
+            productions * forecast_price
+            + realizable_f * conservative_f_price(state, params)
+            - rule.cost
+            - wheat_cost
+        )
     return numerator / max(1, days)
 
 

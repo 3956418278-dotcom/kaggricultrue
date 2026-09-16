@@ -1,0 +1,17 @@
+d9_state,d9_state_name,d12_branch,d12_branch_name,train_count,train_state_n,train_probability,frozen_count,frozen_state_n,frozen_probability
+0,D9 no Yarn; sheep_age9p <= 3,0,B0 no Yarn at D12; sheep_age9p <= 3,141,157,0.8980891719745223,27,30,0.9
+0,D9 no Yarn; sheep_age9p <= 3,1,B1 no Yarn at D12; sheep_age9p >= 4,0,157,0.0,0,30,0.0
+0,D9 no Yarn; sheep_age9p <= 3,2,B2 Yarn at D12; cumulative_yarn_pull <= 126,16,157,0.10191082802547771,3,30,0.1
+0,D9 no Yarn; sheep_age9p <= 3,3,B3 Yarn at D12; cumulative_yarn_pull > 126,0,157,0.0,0,30,0.0
+1,D9 no Yarn; sheep_age9p >= 4,0,B0 no Yarn at D12; sheep_age9p <= 3,0,295,0.0,0,397,0.0
+1,D9 no Yarn; sheep_age9p >= 4,1,B1 no Yarn at D12; sheep_age9p >= 4,256,295,0.8677966101694915,341,397,0.8589420654911839
+1,D9 no Yarn; sheep_age9p >= 4,2,B2 Yarn at D12; cumulative_yarn_pull <= 126,39,295,0.13220338983050847,56,397,0.14105793450881612
+1,D9 no Yarn; sheep_age9p >= 4,3,B3 Yarn at D12; cumulative_yarn_pull > 126,0,295,0.0,0,397,0.0
+2,D9 Yarn already in shop1/2,0,B0 no Yarn at D12; sheep_age9p <= 3,0,132,0.0,0,145,0.0
+2,D9 Yarn already in shop1/2,1,B1 no Yarn at D12; sheep_age9p >= 4,0,132,0.0,0,145,0.0
+2,D9 Yarn already in shop1/2,2,B2 Yarn at D12; cumulative_yarn_pull <= 126,119,132,0.9015151515151515,130,145,0.896551724137931
+2,D9 Yarn already in shop1/2,3,B3 Yarn at D12; cumulative_yarn_pull > 126,13,132,0.09848484848484848,15,145,0.10344827586206896
+3,D9 Yarn first appears as shop3,0,B0 no Yarn at D12; sheep_age9p <= 3,0,78,0.0,0,82,0.0
+3,D9 Yarn first appears as shop3,1,B1 no Yarn at D12; sheep_age9p >= 4,0,78,0.0,0,82,0.0
+3,D9 Yarn first appears as shop3,2,B2 Yarn at D12; cumulative_yarn_pull <= 126,59,78,0.7564102564102564,61,82,0.7439024390243902
+3,D9 Yarn first appears as shop3,3,B3 Yarn at D12; cumulative_yarn_pull > 126,19,78,0.24358974358974358,21,82,0.25609756097560976

@@ -1,0 +1,50 @@
+{
+  "model_version": "wool_function_final_v2",
+  "data": {
+    "train": "official Daily Top Episodes 2026-09-06, 662 episodes, module_version 1.32.7",
+    "frozen_validation": "official Daily Top Episodes 2026-09-14, 654 episodes, module_version 1.32.7",
+    "turn_precision": true
+  },
+  "core_model": "conditional empirical long-horizon scenario model; no trajectory clustering",
+  "price_model": "deterministic monotone inventory->price lookup learned from 9/06; no conflicts observed in the 337 inventory values seen across 9/06+9/14",
+  "d9_states": {
+    "0": "D9 no Yarn; sheep_age9p <= 3",
+    "1": "D9 no Yarn; sheep_age9p >= 4",
+    "2": "D9 Yarn already in shop1/2",
+    "3": "D9 Yarn first appears as shop3"
+  },
+  "d12_branches": {
+    "0": "B0 no Yarn at D12; sheep_age9p <= 3",
+    "1": "B1 no Yarn at D12; sheep_age9p >= 4",
+    "2": "B2 Yarn at D12; cumulative_yarn_pull <= 126",
+    "3": "B3 Yarn at D12; cumulative_yarn_pull > 126"
+  },
+  "update_policy": {
+    "D8": "broad early scenario distribution; do not force a final long-horizon branch",
+    "D9_D11": "use current known shop chain + sheep_age9p structural state. Re-anchor empirical delta-inventory scenarios to current inventory. D9 is the earliest strong long-horizon value split.",
+    "D12": "full shop chain is known; branch becomes directly observed by D12 rules; switch to D12 branch scenario library.",
+    "after_D12": "condition branch scenarios on accumulated inventory residual. For current residual r at elapsed e, future residual is rho_b,e(h)*r + eta_j,b,e(h), eta_j=R_j(h)-rho_b,e(h)*R_j(e).",
+    "residual_modes_selected_on_0906": {
+      "1d": "branch",
+      "2d": "branch",
+      "3d": "branch",
+      "5d": "branch",
+      "8d": "pooled",
+      "10d": "pooled"
+    },
+    "residual_OOD": "flag when current residual lies outside branch/day 1%-99% train support. Keep residual-corrected center but lower confidence/use downside scenarios."
+  },
+  "counterfactual_value_rule": "Historical scenarios already include normal future supply from both players. Apply only candidate-vs-baseline incremental market impact: I_candidate = I_reference + impact(candidate) - impact(baseline).",
+  "value_formula": "V(a|s)=sum_s w_s * sum_h discount(h) * [official_transaction_revenue(q_a(h), I_s(h)+impact_delta_a(h)) - incremental_cost_a(h)].",
+  "files": [
+    "wool_final_scenario_library_v2.npz",
+    "wool_final_d9_to_d12_transition.csv",
+    "wool_final_d9_long_horizon_metrics.json",
+    "wool_final_residual_method_cv_0906.csv",
+    "wool_final_residual_update_frozen_0914.csv",
+    "wool_final_conditional_scenario_calibration_0914.csv",
+    "wool_final_residual_ood_0914.csv",
+    "wool_final_residual_support_0906.csv",
+    "wool_final_residual_rho_summary.csv"
+  ]
+}

@@ -43,45 +43,35 @@ side-swapped games between the two bases; `scripts/verify_baseline.py` is a
 full-episode health check. Both are explicitly exploratory and are not
 acceptance-quality evidence.
 
-## Current-assets maintenance fixes (this revision)
+## Empirical animal scenario forecasting (this revision)
 
-`current_assets.py` was corrected without redesign; the observation-driven
-daily re-read design is retained:
+Empirical scenario forecast models (`src/kaggriculture_agent/scenario_forecast.py`)
+replace legacy single-point heuristics (`forecast_inventory` and `expected_shop_demand_per_reveal`)
+for animal products (WOOL, MILK, EGG):
 
-- assets at their tile held cap (`animal max_held`, ongoing-crop `max_yield`)
-  now harvest immediately, including off-production days (`HELD_CAP`), while
-  the earlier next-production-overflow harvest is retained;
-- one-time crop task generation now implements the `_one_time_plan()` choice:
-  a same-day harvest may still WATER (or FERTILIZE -> WATER when the bonus
-  needs fresh fertilizer), the candidate simulation no longer counts a gain on
-  an already-watered day, and the HARVEST event quantity equals the plan's
-  post-water yield instead of the pre-action held count;
-- survival WATER no longer depends on the harvest-candidate search: a one-time
-  crop with no candidate still waters when `consecutive_unwatered >= 1`;
-- existing ongoing crops price one new fertilizer by its full
-  `[day, day+2]` coverage of remaining legal productions
-  (`_fertilizer_covered_productions`), not by tonight's single product;
-- existing animals are valued for KEEP/EXIT with
-  `animal_daily_value(..., include_purchase_cost=False)`; new-asset valuation
-  calls keep the previous behavior.
+- **Sources**: WOOL from `Kaggriculture_WOOL_final_v2`, MILK and EGG from `Kaggriculture_MILK_EGG_final_v3`.
+- **Interface**: `forecast_product_distribution(state, product)` returns `ScenarioDistribution` containing
+  scenario paths, price paths, normalized weights, ordered quantiles (Q10/Q25/Q50/Q75/Q90), OOD diagnostics,
+  and confidence metrics.
+- **Dynamic re-anchoring**: Path origin ($h=0$) strictly aligns with observed `state.market.inventory[product]`;
+  future trajectory updates dynamically via correlation $\rho$ without persistent cross-replan state caching.
+- **Planner & asset valuation**:
+  - `planner._forecast_animal_daily_value` evaluates expected revenue along actual achievable production day offsets
+    across all scenarios under official sequential pricing `rules.market_price`.
+  - `current_assets._animal_current_state` evaluates individual next-output prices via `forecast_product_distribution`.
+  - Counterfactual invariant $I_{candidate} = I_{ref} + \Delta_{cand} - \Delta_{base}$ holds; $\Delta = 0$ preserves reference paths.
+  - Crops retain legacy `forecast_inventory` behavior.
 
 ## Validation
 
-- Full suite run under the WSL conda `base` runner: 126 tests plus 6 subtests,
-  123 passed, 3 failed in 28s. Failures: two `test_environment_contract.py`
-  identity checks, because `base` is Python 3.13.12 with a different
-  distribution set than the pinned runtime identity (Python 3.12.3 plus
-  `requirements.lock`); and `test_midgame_assets.py::
-  test_existing_animals_use_individual_next_output`, which still asserts the
-  pre-fix sunk-cost EXIT behavior and is obsolete pending removal.
-- The two full pinned episodes (seeds 119-120) with the full D1-D30 controller
-  coverage passed in the same run, as did the zonal-template, opening-base,
-  scripted-opening, and replay-viewer suites.
-- Runner identity note: tests execute in WSL conda `base`, which has
-  `kaggle-environments==1.32.7` and pytest; the conda `kaggle` environment is
-  the Kaggle CLI tooling environment without the engine. Results from `base`
-  do not satisfy the pinned-environment identity required for competitive
-  evidence under `EVALUATION.md`.
+- Full suite run under runner: 113 passed tests (all midgame asset, scenario forecast, D11 controller,
+  opening base, player day, reference pipeline, replay viewer, scripted opening, and zonal template tests).
+- Dedicated scenario forecast tests in `tests/test_scenario_forecast.py`:
+  - Shop reveal response (Yarn store and relevant shop signature reconditioning);
+  - Animal feature gating and branching response;
+  - Inventory shift strict re-anchoring and monotone quantile ordering;
+  - Counterfactual $\Delta = 0$ identity;
+  - Planner and current assets call site verification and heuristic isolation.
 
 ## Limiting issue
 

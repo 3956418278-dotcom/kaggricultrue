@@ -1,0 +1,63 @@
+{
+  "model_version": "milk_function_final_v3",
+  "purpose": "current public state -> full-turn D29 conditional inventory/price distribution",
+  "fit_dataset": "official 2026-09-06 662 only",
+  "frozen_validation": "official 2026-09-14 654 once, no tuning",
+  "d9_gate": {
+    "0": "cow age3-5<=2 and mean age<=6.207",
+    "1": "cow age3-5<=2 and mean age>6.207",
+    "2": "cow age3-5>2 and total cows<=17",
+    "3": "cow age3-5>2 and total cows>=18"
+  },
+  "d12_branch": {
+    "0": "bonus<=31.5; mean age<=9.207",
+    "1": "bonus<=31.5; mean age>9.207",
+    "2": "31.5<bonus<=46.5",
+    "3": "bonus>46.5"
+  },
+  "reveal_filter_0906_selected": {
+    "pre": {
+      "policy": "relevant",
+      "threshold": 10,
+      "mae": 19.703824996948242,
+      "best_mae": 19.623477935791016
+    },
+    "post": {
+      "policy": "relevant",
+      "threshold": 5,
+      "mae": 18.128780364990234,
+      "best_mae": 18.128780364990234
+    }
+  },
+  "residual_modes_0906_selected": {
+    "1": "pooled",
+    "2": "pooled",
+    "3": "pooled",
+    "5": "branch",
+    "8": "branch",
+    "10": "branch"
+  },
+  "scenario_update": {
+    "D9_D11": "state gate + revealed-prefix conditioning + scenario reanchor to current inventory",
+    "D12": "public-state branch collapse + revealed-prefix conditioning",
+    "post_D12": "new reveals recondition scenarios immediately; current residual updates every future turn with stored rho_b,e(h)"
+  },
+  "residual_formula": "R_cond_j(h)=rho_b,e(h)*r_obs + R_j(h)-rho_b,e(h)*R_j(e)",
+  "calibration": "milk_final_calibration_all_oof_0906.csv",
+  "residual_support": "milk_final_residual_support_0906.csv",
+  "structural_support": "milk_final_structural_support_0906.csv",
+  "scenario_library": "milk_final_scenario_library_v3.npz",
+  "price_map": "milk_price_map_0906_v1.csv",
+  "price_method": "linear",
+  "outputs": [
+    "weighted inventory paths",
+    "weighted price paths",
+    "inventory and price Q10/Q25/Q50/Q75/Q90",
+    "state/branch",
+    "reveal conditioning level",
+    "residual/reveal/price OOD",
+    "confidence"
+  ],
+  "counterfactual": "I_candidate=I_reference+impact(candidate)-impact(baseline)",
+  "value": "official sequential transaction price-impact callback per scenario; never q*spot_price"
+}

@@ -1,0 +1,6 @@
+{
+  "model_version": "milk_function_final_v3",
+  "runtime_bundle": "milk_final_runtime_bundle_v3.json",
+  "scenario_library": "milk_final_scenario_library_v3.npz",
+  "reference_runtime": "milk_runtime_v3.py"
+}

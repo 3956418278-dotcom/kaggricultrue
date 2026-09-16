@@ -1,0 +1,556 @@
+{
+  "milk": {
+    "reveal_choice": {
+      "pre": {
+        "policy": "relevant",
+        "threshold": 10,
+        "mae": 19.703824996948242,
+        "best_mae": 19.623477935791016
+      },
+      "post": {
+        "policy": "relevant",
+        "threshold": 5,
+        "mae": 18.128780364990234,
+        "best_mae": 18.128780364990234
+      }
+    },
+    "price": {
+      "method_selected_on_0906": "linear",
+      "0906_leaveout_mae": {
+        "nearest": 1.15,
+        "linear": 0.39698412698412633,
+        "linear_round": 0.45
+      },
+      "frozen0914_price_reconstruction_mae": 2.1059859553743506e-05,
+      "frozen_outside_train_map_rate": 0.0
+    },
+    "oof_calibration": [
+      {
+        "stage": "D9",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 19.877233671040315,
+        "raw_cov80": 0.761742989306891,
+        "cal_mult80": 1.1068702340126038,
+        "cal_cov80": 0.8000401148286972,
+        "raw_cov50": 0.4852389966278472,
+        "cal_mult50": 1.071428582072258,
+        "cal_cov50": 0.5006706697922804
+      },
+      {
+        "stage": "D10",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 19.712554621959843,
+        "raw_cov80": 0.7544228815683585,
+        "cal_mult80": 1.1200000047683716,
+        "cal_cov80": 0.8001622712700696,
+        "raw_cov50": 0.4842214277233209,
+        "cal_mult50": 1.0697674453258514,
+        "cal_cov50": 0.5000197891792768
+      },
+      {
+        "stage": "D11",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 20.020739867292757,
+        "raw_cov80": 0.745805894719256,
+        "cal_mult80": 1.125,
+        "cal_cov80": 0.8008130647249642,
+        "raw_cov50": 0.475023319921478,
+        "cal_mult50": 1.0833333432674408,
+        "cal_cov50": 0.5000556893647236
+      },
+      {
+        "stage": "D12+0d",
+        "obs_days": 0,
+        "mode": "none",
+        "oof_inv_mae": 18.946363542351477,
+        "raw_cov80": 0.8002284282661558,
+        "cal_mult80": 1.0,
+        "cal_cov80": 0.8002284282661558,
+        "raw_cov50": 0.5105224375506595,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5105224375506595
+      },
+      {
+        "stage": "D12+1d",
+        "obs_days": 1,
+        "mode": "pooled",
+        "oof_inv_mae": 18.933495602906675,
+        "raw_cov80": 0.7890283800072007,
+        "cal_mult80": 1.025308579206467,
+        "cal_cov80": 0.8000015653616768,
+        "raw_cov50": 0.4974328068500227,
+        "cal_mult50": 1.00524839758873,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+2d",
+        "obs_days": 2,
+        "mode": "pooled",
+        "oof_inv_mae": 18.817532331172924,
+        "raw_cov80": 0.7916910083290214,
+        "cal_mult80": 1.0205603539943695,
+        "cal_cov80": 0.8000033382851229,
+        "raw_cov50": 0.4956018093505366,
+        "cal_mult50": 1.0096020251512527,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+3d",
+        "obs_days": 3,
+        "mode": "pooled",
+        "oof_inv_mae": 18.68414036111264,
+        "raw_cov80": 0.7900033965569638,
+        "cal_mult80": 1.0243941247463226,
+        "cal_cov80": 0.8000053629846797,
+        "raw_cov50": 0.4930549348397361,
+        "cal_mult50": 1.0136039108037949,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+5d",
+        "obs_days": 5,
+        "mode": "branch",
+        "oof_inv_mae": 17.887684394052236,
+        "raw_cov80": 0.7882591936660068,
+        "cal_mult80": 1.0275544226169586,
+        "cal_cov80": 0.8,
+        "raw_cov50": 0.4911032399208251,
+        "cal_mult50": 1.0230548977851868,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+8d",
+        "obs_days": 8,
+        "mode": "branch",
+        "oof_inv_mae": 13.650849978268344,
+        "raw_cov80": 0.7872030821253361,
+        "cal_mult80": 1.0335013568401337,
+        "cal_cov80": 0.8000083150863383,
+        "raw_cov50": 0.4865572770863937,
+        "cal_mult50": 1.0332309305667875,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+10d",
+        "obs_days": 10,
+        "mode": "branch",
+        "oof_inv_mae": 10.68613672772692,
+        "raw_cov80": 0.7883774657899414,
+        "cal_mult80": 1.0289884060621262,
+        "cal_cov80": 0.8,
+        "raw_cov50": 0.4952905633552514,
+        "cal_mult50": 1.0113874822854996,
+        "cal_cov50": 0.5
+      }
+    ],
+    "frozen": [
+      {
+        "stage": "D9",
+        "inventory_mae": 20.348714451925463,
+        "price_mae": 38.33695410300915,
+        "global_inventory_mae": 23.577951431274414,
+        "global_price_mae": 44.91846910424892,
+        "relative_joint_loss": 0.8582593060824102,
+        "coverage80": 0.7115336931850693,
+        "coverage50": 0.43181890429596853,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D10",
+        "inventory_mae": 19.590098635563677,
+        "price_mae": 37.56347573257316,
+        "global_inventory_mae": 25.17613410949707,
+        "global_price_mae": 48.647864680572,
+        "relative_joint_loss": 0.7751361746310409,
+        "coverage80": 0.6764800353321423,
+        "coverage50": 0.4287635757733925,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D11",
+        "inventory_mae": 20.892318367692862,
+        "price_mae": 40.470006921343874,
+        "global_inventory_mae": 27.592376708984375,
+        "global_price_mae": 52.98105282115389,
+        "relative_joint_loss": 0.7605176523654256,
+        "coverage80": 0.6794358398485779,
+        "coverage50": 0.42569796102859647,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D12+0d",
+        "inventory_mae": 20.145762768892578,
+        "price_mae": 39.15022655391311,
+        "global_inventory_mae": 30.28884506225586,
+        "global_price_mae": 57.23099526704202,
+        "relative_joint_loss": 0.6745976804138671,
+        "coverage80": 0.6247317616622926,
+        "coverage50": 0.39515339120552095,
+        "residual_ood_rate": 0.0
+      },
+      {
+        "stage": "D12+1d",
+        "inventory_mae": 21.023241008042465,
+        "price_mae": 40.7203640412519,
+        "global_inventory_mae": 33.63723373413086,
+        "global_price_mae": 61.32499503554549,
+        "relative_joint_loss": 0.6445041786030696,
+        "coverage80": 0.6109813733666946,
+        "coverage50": 0.37127368044799236,
+        "residual_ood_rate": 0.02599388379204893
+      },
+      {
+        "stage": "D12+2d",
+        "inventory_mae": 19.74381009138938,
+        "price_mae": 38.10269088306244,
+        "global_inventory_mae": 28.517162322998047,
+        "global_price_mae": 53.32932645471718,
+        "relative_joint_loss": 0.7034137377461273,
+        "coverage80": 0.6418375731700086,
+        "coverage50": 0.36871330910569516,
+        "residual_ood_rate": 0.04434250764525994
+      },
+      {
+        "stage": "D12+3d",
+        "inventory_mae": 19.75946707184221,
+        "price_mae": 38.049901306678535,
+        "global_inventory_mae": 29.208541870117188,
+        "global_price_mae": 54.134676811949284,
+        "relative_joint_loss": 0.6896855020563977,
+        "coverage80": 0.6414441147378833,
+        "coverage50": 0.3869635840615614,
+        "residual_ood_rate": 0.04892966360856269
+      },
+      {
+        "stage": "D12+5d",
+        "inventory_mae": 17.71008006489758,
+        "price_mae": 33.779491198755906,
+        "global_inventory_mae": 21.129789352416992,
+        "global_price_mae": 40.55965419087225,
+        "relative_joint_loss": 0.8354958777787085,
+        "coverage80": 0.6980148778345662,
+        "coverage50": 0.4362771552225855,
+        "residual_ood_rate": 0.0856269113149847
+      },
+      {
+        "stage": "D12+8d",
+        "inventory_mae": 12.634098682188075,
+        "price_mae": 23.882218801774414,
+        "global_inventory_mae": 12.857622146606445,
+        "global_price_mae": 24.615140433207912,
+        "relative_joint_loss": 0.976420126536473,
+        "coverage80": 0.7612846855226257,
+        "coverage50": 0.47229385983455235,
+        "residual_ood_rate": 0.08409785932721713
+      },
+      {
+        "stage": "D12+10d",
+        "inventory_mae": 10.223641656524547,
+        "price_mae": 18.92046480716481,
+        "global_inventory_mae": 10.074606895446777,
+        "global_price_mae": 19.130123228923512,
+        "relative_joint_loss": 1.0019167566627096,
+        "coverage80": 0.7477788031775329,
+        "coverage50": 0.4438774586975011,
+        "residual_ood_rate": 0.04892966360856269
+      }
+    ],
+    "filter_levels_frozen": {
+      "D9_state": 315,
+      "D9_relevant": 339,
+      "D10_state": 285,
+      "D10_relevant": 369,
+      "D11_state": 267,
+      "D11_relevant": 387,
+      "D12+0_state": 409,
+      "D12+0_relevant": 245,
+      "D12+1_state": 409,
+      "D12+1_relevant": 245,
+      "D12+2_state": 409,
+      "D12+2_relevant": 245,
+      "D12+3_state": 409,
+      "D12+3_relevant": 245,
+      "D12+5_state": 409,
+      "D12+5_relevant": 245,
+      "D12+8_state": 409,
+      "D12+8_relevant": 245,
+      "D12+10_state": 409,
+      "D12+10_relevant": 245
+    }
+  },
+  "egg": {
+    "reveal_choice": {
+      "pre": {
+        "policy": "none",
+        "threshold": 20,
+        "mae": 37.43277359008789,
+        "best_mae": 37.3881950378418
+      },
+      "post": {
+        "policy": "none",
+        "threshold": 20,
+        "mae": 35.45378494262695,
+        "best_mae": 35.32211685180664
+      }
+    },
+    "price": {
+      "method_selected_on_0906": "linear",
+      "0906_leaveout_mae": {
+        "nearest": 0.1357142857142857,
+        "linear": 0.10119047619047603,
+        "linear_round": 0.11428571428571428
+      },
+      "frozen0914_price_reconstruction_mae": 0.0002998843098231474,
+      "frozen_outside_train_map_rate": 0.0010618416581719334
+    },
+    "oof_calibration": [
+      {
+        "stage": "D9",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 36.104121260465675,
+        "raw_cov80": 0.8194393952689574,
+        "cal_mult80": 1.0,
+        "cal_cov80": 0.8194393952689574,
+        "raw_cov50": 0.5506324353461785,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5506324353461785
+      },
+      {
+        "stage": "D10",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 37.65213496664838,
+        "raw_cov80": 0.8133154790960303,
+        "cal_mult80": 1.0,
+        "cal_cov80": 0.8133154790960303,
+        "raw_cov50": 0.5375532658742199,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5375532658742199
+      },
+      {
+        "stage": "D11",
+        "obs_days": 0,
+        "mode": "reanchor",
+        "oof_inv_mae": 39.02327958527243,
+        "raw_cov80": 0.8103568296044663,
+        "cal_mult80": 1.0,
+        "cal_cov80": 0.8103568296044663,
+        "raw_cov50": 0.5305038495273365,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5305038495273365
+      },
+      {
+        "stage": "D12+0d",
+        "obs_days": 0,
+        "mode": "none",
+        "oof_inv_mae": 35.367499759933224,
+        "raw_cov80": 0.7999926313462531,
+        "cal_mult80": 1.0000000149011612,
+        "cal_cov80": 0.8,
+        "raw_cov50": 0.5279861469309557,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5279861469309557
+      },
+      {
+        "stage": "D12+1d",
+        "obs_days": 1,
+        "mode": "pooled",
+        "oof_inv_mae": 30.323206106265253,
+        "raw_cov80": 0.7928009016483258,
+        "cal_mult80": 1.0133177489042282,
+        "cal_cov80": 0.8000015653616768,
+        "raw_cov50": 0.5142213108338681,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5142213108338681
+      },
+      {
+        "stage": "D12+2d",
+        "obs_days": 2,
+        "mode": "pooled",
+        "oof_inv_mae": 30.335958358637484,
+        "raw_cov80": 0.7916576254777921,
+        "cal_mult80": 1.0159456133842468,
+        "cal_cov80": 0.8000116839979302,
+        "raw_cov50": 0.5031046051643271,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5031046051643271
+      },
+      {
+        "stage": "D12+3d",
+        "obs_days": 3,
+        "mode": "branch",
+        "oof_inv_mae": 21.944591856962383,
+        "raw_cov80": 0.7889129230054166,
+        "cal_mult80": 1.024298682808876,
+        "cal_cov80": 0.8000053629846797,
+        "raw_cov50": 0.4996514059958168,
+        "cal_mult50": 1.0006895065307615,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+5d",
+        "obs_days": 5,
+        "mode": "branch",
+        "oof_inv_mae": 18.39971774730043,
+        "raw_cov80": 0.7893843108657151,
+        "cal_mult80": 1.0221153050661087,
+        "cal_cov80": 0.8,
+        "raw_cov50": 0.4957183039899989,
+        "cal_mult50": 1.0065552294254303,
+        "cal_cov50": 0.5
+      },
+      {
+        "stage": "D12+8d",
+        "obs_days": 8,
+        "mode": "branch",
+        "oof_inv_mae": 13.69266332814323,
+        "raw_cov80": 0.7895035893456027,
+        "cal_mult80": 1.0229588747024536,
+        "cal_cov80": 0.8000083150863383,
+        "raw_cov50": 0.5058898528229718,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.5058898528229718
+      },
+      {
+        "stage": "D12+10d",
+        "obs_days": 10,
+        "mode": "branch",
+        "oof_inv_mae": 10.428954316186823,
+        "raw_cov80": 0.790741069841834,
+        "cal_mult80": 1.0175734758377075,
+        "cal_cov80": 0.8,
+        "raw_cov50": 0.50934778745335,
+        "cal_mult50": 1.0,
+        "cal_cov50": 0.50934778745335
+      }
+    ],
+    "frozen": [
+      {
+        "stage": "D9",
+        "inventory_mae": 44.33641845797809,
+        "price_mae": 3.1106591771729386,
+        "global_inventory_mae": 49.586326599121094,
+        "global_price_mae": 3.434757799436699,
+        "relative_joint_loss": 0.8998836914208832,
+        "coverage80": 0.7418794941730722,
+        "coverage50": 0.4722195731370044,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D10",
+        "inventory_mae": 45.87665033893428,
+        "price_mae": 3.2203440868849498,
+        "global_inventory_mae": 49.76885223388672,
+        "global_price_mae": 3.467916675031284,
+        "relative_joint_loss": 0.9252024965496048,
+        "coverage80": 0.7325330067786856,
+        "coverage50": 0.45556046279752943,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D11",
+        "inventory_mae": 47.06858486768226,
+        "price_mae": 3.3085824663997006,
+        "global_inventory_mae": 49.981563568115234,
+        "global_price_mae": 3.4967617998319103,
+        "relative_joint_loss": 0.9439518111626928,
+        "coverage80": 0.7344887740039975,
+        "coverage50": 0.4581435260715724,
+        "residual_ood_rate": NaN
+      },
+      {
+        "stage": "D12+0d",
+        "inventory_mae": 46.00387309990055,
+        "price_mae": 3.218774066680125,
+        "global_inventory_mae": 48.73088455200195,
+        "global_price_mae": 3.414950689008023,
+        "relative_joint_loss": 0.943296480497738,
+        "coverage80": 0.7055771143162634,
+        "coverage50": 0.43629946987879736,
+        "residual_ood_rate": 0.0
+      },
+      {
+        "stage": "D12+1d",
+        "inventory_mae": 39.0017907278064,
+        "price_mae": 2.6639610226526407,
+        "global_inventory_mae": 47.718780517578125,
+        "global_price_mae": 3.3358890345128875,
+        "relative_joint_loss": 0.8079509179323193,
+        "coverage80": 0.6978950712895667,
+        "coverage50": 0.4097104730132253,
+        "residual_ood_rate": 0.11467889908256881
+      },
+      {
+        "stage": "D12+2d",
+        "inventory_mae": 35.2388539345545,
+        "price_mae": 2.377907866216711,
+        "global_inventory_mae": 46.75872039794922,
+        "global_price_mae": 3.2708560996891065,
+        "relative_joint_loss": 0.7403151592219477,
+        "coverage80": 0.7471515582776352,
+        "coverage50": 0.4611425957457623,
+        "residual_ood_rate": 0.0856269113149847
+      },
+      {
+        "stage": "D12+3d",
+        "inventory_mae": 26.801995219348417,
+        "price_mae": 1.7807357803890582,
+        "global_inventory_mae": 44.55873107910156,
+        "global_price_mae": 3.1102346663762828,
+        "relative_joint_loss": 0.5870194106572144,
+        "coverage80": 0.7162360819971143,
+        "coverage50": 0.4419141734498498,
+        "residual_ood_rate": 0.06574923547400612
+      },
+      {
+        "stage": "D12+5d",
+        "inventory_mae": 20.936730197182055,
+        "price_mae": 1.40443028476523,
+        "global_inventory_mae": 39.51053237915039,
+        "global_price_mae": 2.7250484111615507,
+        "relative_joint_loss": 0.5226403062035678,
+        "coverage80": 0.7583833317460821,
+        "coverage50": 0.46696930256182345,
+        "residual_ood_rate": 0.06880733944954129
+      },
+      {
+        "stage": "D12+8d",
+        "inventory_mae": 15.354463770711137,
+        "price_mae": 1.0390039258423596,
+        "global_inventory_mae": 31.59710121154785,
+        "global_price_mae": 2.1552576638823626,
+        "relative_joint_loss": 0.48401204115943675,
+        "coverage80": 0.734811651798926,
+        "coverage50": 0.44436928367085216,
+        "residual_ood_rate": 0.0672782874617737
+      },
+      {
+        "stage": "D12+10d",
+        "inventory_mae": 11.656751482093869,
+        "price_mae": 0.7862743856458982,
+        "global_inventory_mae": 25.36813735961914,
+        "global_price_mae": 1.7418144664086794,
+        "relative_joint_loss": 0.4554573708920475,
+        "coverage80": 0.746439751732624,
+        "coverage50": 0.4771546966324666,
+        "residual_ood_rate": 0.07033639143730887
+      }
+    ],
+    "filter_levels_frozen": {
+      "D9_state": 654,
+      "D10_state": 654,
+      "D11_state": 654,
+      "D12+0_state": 654,
+      "D12+1_state": 654,
+      "D12+2_state": 654,
+      "D12+3_state": 654,
+      "D12+5_state": 654,
+      "D12+8_state": 654,
+      "D12+10_state": 654
+    }
+  }
+}

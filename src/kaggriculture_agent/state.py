@@ -97,6 +97,7 @@ class OppState:
     owned_land: tuple[str, ...]
     usable_tiles: tuple[Position, ...]
     tiles: tuple[TileState, ...]
+    money: int = 0
 
 
 @dataclass(frozen=True)
@@ -225,5 +226,5 @@ def reconstruct(observation: Any) -> State:
         shops=tuple(str(s) for s in (get(get(observation, "town", {}) or {}, "unlocked_shops", ()) or ())),
         market=MarketState(_int_map(get(market, "inventory", {}), clamp=False), _int_map(get(market, "prices", {}))),
         own=OwnState(int(get(own_farm, "money", 0) or 0), _int_map(get(private, "shed", {})), _int_map(get(private, "seeds", {})), workers, tuple(w.position for w in workers), tuple(w.inventory for w in workers), own_animals, own_crops, own_land, usable(own_tiles), own_tiles, int(get(own_farm, "hires_today", 0) or 0)),
-        opp=OppState(opp_positions, opp_animals, opp_crops, opp_land, usable(opp_tiles), opp_tiles),
+        opp=OppState(opp_positions, opp_animals, opp_crops, opp_land, usable(opp_tiles), opp_tiles, int(get(opp_farm, "money", 0) or 0)),
     )

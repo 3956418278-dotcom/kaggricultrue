@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "checks": [
+    "MILK D9/D12/D17 forecast executes",
+    "EGG D9/D12/D17 forecast executes",
+    "scenario first point anchored to observed current inventory",
+    "inventory quantiles ordered",
+    "post-D12 runtime accepts persisted D12 branch/inventory",
+    "price paths reconstructed from inventory"
+  ]
+}

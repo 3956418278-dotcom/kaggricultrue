@@ -1,0 +1,63 @@
+{
+  "model_version": "egg_function_final_v3",
+  "purpose": "current public state -> full-turn D29 conditional inventory/price distribution",
+  "fit_dataset": "official 2026-09-06 662 only",
+  "frozen_validation": "official 2026-09-14 654 once, no tuning",
+  "d9_gate": {
+    "0": "no Brunch and no Bakery",
+    "1": "no Brunch; Bakery revealed",
+    "2": "Brunch revealed; Bakery absent/first",
+    "3": "Brunch revealed; Bakery later"
+  },
+  "d12_branch": {
+    "0": "no Brunch D12; Bakery absent/first",
+    "1": "no Brunch D12; Bakery later",
+    "2": "Brunch present; opponent money<=10134",
+    "3": "Brunch present; opponent money>10134"
+  },
+  "reveal_filter_0906_selected": {
+    "pre": {
+      "policy": "none",
+      "threshold": 20,
+      "mae": 37.43277359008789,
+      "best_mae": 37.3881950378418
+    },
+    "post": {
+      "policy": "none",
+      "threshold": 20,
+      "mae": 35.45378494262695,
+      "best_mae": 35.32211685180664
+    }
+  },
+  "residual_modes_0906_selected": {
+    "1": "pooled",
+    "2": "pooled",
+    "3": "branch",
+    "5": "branch",
+    "8": "branch",
+    "10": "branch"
+  },
+  "scenario_update": {
+    "D9_D11": "state gate + revealed-prefix conditioning + scenario reanchor to current inventory",
+    "D12": "public-state branch collapse + revealed-prefix conditioning",
+    "post_D12": "new reveals recondition scenarios immediately; current residual updates every future turn with stored rho_b,e(h)"
+  },
+  "residual_formula": "R_cond_j(h)=rho_b,e(h)*r_obs + R_j(h)-rho_b,e(h)*R_j(e)",
+  "calibration": "egg_final_calibration_all_oof_0906.csv",
+  "residual_support": "egg_final_residual_support_0906.csv",
+  "structural_support": "egg_final_structural_support_0906.csv",
+  "scenario_library": "egg_final_scenario_library_v3.npz",
+  "price_map": "egg_price_map_0906_v1.csv",
+  "price_method": "linear",
+  "outputs": [
+    "weighted inventory paths",
+    "weighted price paths",
+    "inventory and price Q10/Q25/Q50/Q75/Q90",
+    "state/branch",
+    "reveal conditioning level",
+    "residual/reveal/price OOD",
+    "confidence"
+  ],
+  "counterfactual": "I_candidate=I_reference+impact(candidate)-impact(baseline)",
+  "value": "official sequential transaction price-impact callback per scenario; never q*spot_price"
+}

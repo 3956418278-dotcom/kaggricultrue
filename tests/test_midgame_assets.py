@@ -1022,39 +1022,54 @@ class SubmitRegressionTests(unittest.TestCase):
         from src.kaggriculture_agent.current_assets import conservative_f_price, _minimum_survival_feed_units
         from src.kaggriculture_agent.market import buy_cost, forecast_inventory
         from src.kaggriculture_agent.midgame_config import DEFAULT_MIDGAME_PARAMETERS as params
+        from src.kaggriculture_agent.scenario_forecast import forecast_product_distribution
+        import numpy as np
         for kind in planner.LONG_ASSETS:
             state = self.state(day=10)
             rule = (rules.ANIMALS if kind in rules.ANIMALS else rules.CROPS)[kind]
-            with patch.object(planner, "forecast_inventory", wraps=forecast_inventory) as forecast:
-                planner._asset_daily_value(state, kind, params)
-            self.assertEqual(forecast.call_args.args[2], (10 + rule.first_yield_day) * 24)
-            self.assertEqual(forecast.call_args.kwargs["planned_assets"], ())
+            if kind in rules.ANIMALS:
+                with patch.object(planner, "forecast_product_distribution", wraps=forecast_product_distribution) as forecast:
+                    planner._asset_daily_value(state, kind, params)
+                self.assertEqual(forecast.call_args.args[1], rule.product)
+            else:
+                with patch.object(planner, "forecast_inventory", wraps=forecast_inventory) as forecast:
+                    planner._asset_daily_value(state, kind, params)
+                self.assertEqual(forecast.call_args.args[2], (10 + rule.first_yield_day) * 24)
+                self.assertEqual(forecast.call_args.kwargs["planned_assets"], ())
             late = self.state(day=29 - rule.first_yield_day)
             value = planner._asset_daily_value(late, kind, params)
-            price = rules.market_price(
-                rule.product if kind in rules.ANIMALS else kind,
-                forecast_inventory(late, rule.product if kind in rules.ANIMALS else kind, 29 * 24))
             if kind in rules.ANIMALS:
                 days = rule.first_yield_day
                 wheat = _minimum_survival_feed_units(days)
-                expected = (price + max(1, wheat) * conservative_f_price(late)
+                dist = forecast_product_distribution(late, rule.product)
+                h = 29 * 24 - late.step
+                prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in dist.inventory_paths[:, h]])
+                expected_rev = float(dist.weights @ prices_s)
+                expected = (expected_rev + max(1, wheat) * conservative_f_price(late)
                             - rule.cost - buy_cost("WHEAT", wheat, late.market.inventory["WHEAT"])) / days
                 self.assertAlmostEqual(value, expected)
             elif rule.ongoing:
+                price = rules.market_price(kind, forecast_inventory(late, kind, 29 * 24))
                 self.assertAlmostEqual(value, (price - rule.seed_cost) / rule.first_yield_day)
             self.assertEqual(planner._asset_daily_value(
                 self.state(day=30 - rule.first_yield_day), kind, params), 0.0)
             if kind in rules.ANIMALS or rule.ongoing:
                 two = self.state(day=29 - rule.first_yield_day - rule.interval)
-                product = rule.product if kind in rules.ANIMALS else kind
-                price = rules.market_price(product, forecast_inventory(
-                    two, product, (two.day + rule.first_yield_day) * 24))
                 days = rule.first_yield_day + rule.interval
                 if kind in rules.ANIMALS:
                     wheat = _minimum_survival_feed_units(days)
-                    expected = (2 * price + max(1, wheat) * conservative_f_price(two)
+                    dist = forecast_product_distribution(two, rule.product)
+                    p_days = [two.day + rule.first_yield_day - 1, two.day + rule.first_yield_day - 1 + rule.interval]
+                    expected_rev = 0.0
+                    for pd in p_days:
+                        h = (pd + 1) * 24 - two.step
+                        prices_s = np.array([rules.market_price(rule.product, int(round(inv))) for inv in dist.inventory_paths[:, h]])
+                        expected_rev += float(dist.weights @ prices_s)
+                    expected = (expected_rev + max(1, wheat) * conservative_f_price(two)
                                 - rule.cost - buy_cost("WHEAT", wheat, two.market.inventory["WHEAT"])) / days
                 else:
+                    price = rules.market_price(kind, forecast_inventory(
+                        two, kind, (two.day + rule.first_yield_day) * 24))
                     expected = (2 * price - rule.seed_cost) / days
                 self.assertAlmostEqual(planner._asset_daily_value(two, kind, params), expected)
 
