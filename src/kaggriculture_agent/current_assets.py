@@ -88,16 +88,34 @@ def _animal_cycle_days(animal: str) -> int:
     return rule.first_yield_day + (rule.max_held - 1) * rule.interval
 
 
-def _minimum_survival_feed_units(days: int) -> int:
-    consecutive = 0
+def _remaining_survival_feed_units(
+    days: int,
+    *,
+    fed_today: bool = False,
+    consecutive_unfed: int = 0,
+) -> int:
+    consecutive = int(consecutive_unfed)
     units = 0
-    for _ in range(max(0, days)):
-        if consecutive:
-            units += 1
-            consecutive = 0
+    for i in range(max(0, days)):
+        if i == 0:
+            if fed_today:
+                consecutive = 0
+            elif consecutive >= 1:
+                units += 1
+                consecutive = 0
+            else:
+                consecutive = 1
         else:
-            consecutive = 1
+            if consecutive >= 1:
+                units += 1
+                consecutive = 0
+            else:
+                consecutive = 1
     return units
+
+
+def _minimum_survival_feed_units(days: int) -> int:
+    return _remaining_survival_feed_units(days)
 
 
 def animal_daily_value(
@@ -106,24 +124,45 @@ def animal_daily_value(
     params: MidgameParameters = DEFAULT_MIDGAME_PARAMETERS,
     *, product_price: float | int | None = None,
     include_purchase_cost: bool = True,
+    days: int | None = None,
+    total_revenue: float | None = None,
+    fed_today: bool = False,
+    consecutive_unfed: int = 0,
 ) -> float:
-    """Current snapshot value of one maximum effective animal cycle."""
+    """Current snapshot value of one maximum effective animal cycle, or full-horizon over specified days."""
     rule = rules.ANIMALS[animal]
-    days = _animal_cycle_days(animal)
-    wheat_units = _minimum_survival_feed_units(days)
+    if days is None:
+        effective_days = _animal_cycle_days(animal)
+        wheat_units = _minimum_survival_feed_units(effective_days)
+    else:
+        effective_days = max(1, days)
+        wheat_units = max(
+            1,
+            _remaining_survival_feed_units(
+                effective_days,
+                fed_today=fed_today,
+                consecutive_unfed=consecutive_unfed,
+            ),
+        )
     wheat_cost = buy_cost(
         "WHEAT", wheat_units,
         int(state.market.inventory.get("WHEAT", rules.MARKET_I0)))
     # Fertilizer cannot stack.  Count only the units available on already
     # necessary maintenance/harvest visits, not every theoretical future night.
     realizable_f = max(1, wheat_units)
+    f_value = realizable_f * conservative_f_price(state, params)
+    if total_revenue is not None:
+        rev = total_revenue
+    else:
+        p = _price(state, rule.product) if product_price is None else product_price
+        rev = rule.max_held * p
     numerator = (
-        rule.max_held * (_price(state, rule.product) if product_price is None else product_price)
-        + realizable_f * conservative_f_price(state, params)
+        rev
+        + f_value
         - (rule.cost if include_purchase_cost else 0)
         - wheat_cost
     )
-    return numerator / max(1, days)
+    return numerator / max(1, effective_days)
 
 
 def _fertilizer_applications(crop: str) -> int:
@@ -364,14 +403,22 @@ def _animal_current_state(
                 rule.product, active_baseline_inv, valid_sale_events, weights=dist.weights
             )
             expected_product_revenue = rev_dict["expected"]
-        else:
-            expected_product_revenue = 0.0
+            last_sale_h = max(h for h, q in valid_sale_events)
+            sale_day = (state.step + last_sale_h) // rules.TURNS_PER_DAY
+            remaining_days = max(1, sale_day - state.day)
 
-        daily = animal_daily_value(
-            state, asset.asset_type, params,
-            product_price=expected_product_revenue / rule.max_held,
-            include_purchase_cost=False,
-        )
+            daily = animal_daily_value(
+                state,
+                asset.asset_type,
+                params,
+                total_revenue=expected_product_revenue,
+                days=remaining_days,
+                fed_today=bool(raw.get("fed_today", False)),
+                consecutive_unfed=int(raw.get("consecutive_unfed", 0)),
+                include_purchase_cost=False,
+            )
+        else:
+            daily = 0.0
     elif production_day is not None:
         forecast_price = float(rules.market_price(rule.product, forecast_inventory(
             state, rule.product, _production_step(production_day),

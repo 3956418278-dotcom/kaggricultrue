@@ -365,6 +365,61 @@ class ScenarioForecastUnitTests(unittest.TestCase):
         # Must be a fresh context with no old D12 anchors
         self.assertEqual(len(ctx2.d12_anchors), 0)
 
+    def test_existing_animal_full_horizon_multi_batch_scaling(self):
+        """Verify full-horizon daily value across 1, 2, and 3 batches for an existing COW."""
+        from src.kaggriculture_agent.current_assets import (
+            _animal_current_state,
+            _remaining_survival_feed_units,
+            _minimum_survival_feed_units,
+        )
+
+        # 1. Verify _remaining_survival_feed_units equivalence and edge cases
+        for d in range(35):
+            self.assertEqual(
+                _remaining_survival_feed_units(d, fed_today=False, consecutive_unfed=0),
+                _minimum_survival_feed_units(d),
+            )
+        self.assertEqual(_remaining_survival_feed_units(1, fed_today=True, consecutive_unfed=1), 0)
+        self.assertEqual(_remaining_survival_feed_units(1, fed_today=False, consecutive_unfed=1), 1)
+
+        # 2. Compare 1, 2, 3 batches for existing adult COW
+        st = self.state(day=10, step=240, shops=("BAKERY", "ICE_CREAM_SHOP"))
+        a = self.animal("COW", placed_day=3, position=(0, 0))
+        params = DEFAULT_MIDGAME_PARAMETERS
+
+        batch_configs = [
+            ("1-batch", [(72, 3)]),
+            ("2-batch", [(72, 3), (144, 3)]),
+            ("3-batch", [(72, 3), (144, 3), (216, 3)]),
+        ]
+
+        results = []
+        for name, batches in batch_configs:
+            with patch("src.kaggriculture_agent.current_assets.animal_batch_sale_events", return_value=batches):
+                cur = _animal_current_state(st, a, prior=None, params=params)
+                results.append((name, cur, batches))
+
+        # Check monotonic scaling of total days and reasonable daily value stability
+        prev_days = 0
+        for name, cur, batches in results:
+            last_h = max(h for h, q in batches)
+            sale_day = (st.step + last_h) // rules.TURNS_PER_DAY
+            expected_days = max(1, sale_day - st.day)
+
+            self.assertGreater(expected_days, prev_days)
+            prev_days = expected_days
+
+            # Daily value should remain stable in normal range (~100-150), not explode with batch count
+            self.assertGreater(cur.daily_value, 80.0)
+            self.assertLess(cur.daily_value, 200.0)
+
+        # Daily values should be within reasonable proximity across 1, 2, 3 batches
+        val_1b = results[0][1].daily_value
+        val_2b = results[1][1].daily_value
+        val_3b = results[2][1].daily_value
+        self.assertAlmostEqual(val_2b / val_1b, 0.95, delta=0.2)
+        self.assertAlmostEqual(val_3b / val_1b, 0.83, delta=0.2)
+
 
 class GoldenReferenceTests(unittest.TestCase):
     """Test Point 3: Strict golden comparison against supplied reference runtimes."""
