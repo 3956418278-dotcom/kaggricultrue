@@ -708,6 +708,7 @@ def optimize_short_sales(
     *,
     consumptions: Mapping[int, Mapping[str, int]] | None = None,
     commitments: Iterable[object] = (),
+    forced_sales: Mapping[int, Mapping[str, int]] | None = None,
 ) -> SalePlan:
     """Runtime trade machine for NOW, +4 and +8 only.
 
@@ -779,6 +780,13 @@ def optimize_short_sales(
         product: {} for product in rules.PRODUCTS}
     if free_f > 0:
         forced["FERTILIZER"][state.step] = free_f
+    if forced_sales:
+        for step, prods in forced_sales.items():
+            if step > horizon or step < state.step:
+                continue
+            for product, quantity in prods.items():
+                if product in forced and quantity > 0:
+                    forced[product][step] = max(forced[product].get(step, 0), quantity)
     blocked: dict[str, set[int]] = {
         product: set() for product in rules.PRODUCTS}
 

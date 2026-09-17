@@ -49,12 +49,21 @@ def _decision(state: State, programme: Programme) -> TurnDecision:
     return TurnDecision(tuple(actions), tuple(orders))
 
 
-def _refresh_sales(state: State, programme: Programme) -> Programme:
+MARKET_FAILURE_SELL_WINDOW = 4
+
+
+def _refresh_sales(
+    state: State,
+    programme: Programme,
+    *,
+    forced_sales: Mapping[int, Mapping[str, int]] | None = None,
+) -> Programme:
     # All non-sale commitments, placements, services and staffing remain frozen.
     sale = optimize_short_sales(
         state, _arrivals(state, programme),
         consumptions=_shed_consumptions(programme),
-        commitments=programme.events)
+        commitments=programme.events,
+        forced_sales=forced_sales)
     if not sale.feasible:
         return replace(
             programme, feasible=False,
@@ -70,17 +79,20 @@ class DailyPlanningSession:
     _plans: dict[int, Programme] = field(default_factory=dict, init=False)
     _last_steps: dict[int, int] = field(default_factory=dict, init=False)
     _market_contexts: dict[int, AnimalMarketContext] = field(default_factory=dict, init=False)
+    _market_failure_steps: dict[int, dict[str, int]] = field(default_factory=dict, init=False)
 
     def reset(self):
         self._plans.clear()
         self._last_steps.clear()
         self._market_contexts.clear()
+        self._market_failure_steps.clear()
 
     def plan_for(self, state: State) -> Programme:
         last = self._last_steps.get(state.player, -1)
         if state.step < last:
             self._plans.pop(state.player, None)
             self._market_contexts[state.player] = AnimalMarketContext()
+            self._market_failure_steps.pop(state.player, None)
 
         ctx = self._market_contexts.setdefault(
             state.player,
@@ -97,31 +109,54 @@ class DailyPlanningSession:
         return prior
 
     def execution_for(self, state: State, programme: Programme) -> TurnDecision:
-        if state.step % 4 == 0:
-            programme = _refresh_sales(state, programme)
-            self._plans[state.player] = programme
+        last = self._last_steps.get(state.player, -1)
+        if state.step < last:
+            self._market_failure_steps.pop(state.player, None)
+        self._last_steps[state.player] = state.step
+
+        # ── Per-turn inventory deviation detection ──
+        _DEVIATION_EXCLUDED = frozenset({"WHEAT", "CARROT"})
+        deviated_products: set[str] = set()
+        predicted = programme.market_inventory
+        if predicted:
+            past_steps = [s for s in predicted if s <= state.step]
+            if past_steps:
+                ref_step = max(past_steps)
+                ref_inv = predicted[ref_step]
+                deviated_products = {
+                    product
+                    for product in rules.PRODUCTS
+                    if product not in _DEVIATION_EXCLUDED
+                    and state.market.inventory.get(product, 0)
+                    != ref_inv.get(product, 0)
+                }
+
+        if deviated_products:
+            player_failures = self._market_failure_steps.setdefault(state.player, {})
+            for product in deviated_products:
+                player_failures[product] = state.step
         else:
-            # ── Per-turn inventory deviation detection ──
-            # Compare actual market inventory against the trajectory
-            # predicted at the last 4-turn refresh.  If any non-excluded
-            # product diverges, trigger an immediate sale refresh for the
-            # whole programme (the optimizer handles per-product decisions).
-            _DEVIATION_EXCLUDED = frozenset({"WHEAT", "CARROT"})
-            predicted = programme.market_inventory
-            if predicted:
-                # Find the latest trajectory step <= current step.
-                past_steps = [s for s in predicted if s <= state.step]
-                if past_steps:
-                    ref_step = max(past_steps)
-                    ref_inv = predicted[ref_step]
-                    deviated = any(
-                        state.market.inventory.get(product, 0) != ref_inv.get(product, 0)
-                        for product in rules.PRODUCTS
-                        if product not in _DEVIATION_EXCLUDED
-                    )
-                    if deviated:
-                        programme = _refresh_sales(state, programme)
-                        self._plans[state.player] = programme
+            player_failures = self._market_failure_steps.get(state.player, {})
+
+        arrivals_now = _arrivals(state, programme).get(state.step, {})
+        forced_now: dict[str, int] = {}
+        for product, last_failure_step in player_failures.items():
+            if 0 <= state.step - last_failure_step <= MARKET_FAILURE_SELL_WINDOW:
+                q = arrivals_now.get(product, 0)
+                if q > 0:
+                    forced_now[product] = q
+
+        forced_sales = {state.step: forced_now} if forced_now else None
+
+        should_refresh = (
+            state.step % 4 == 0
+            or bool(deviated_products)
+            or bool(forced_now)
+        )
+        if should_refresh:
+            programme = _refresh_sales(state, programme, forced_sales=forced_sales)
+            self._plans[state.player] = programme
+
         return _decision(state, programme)
 
     @property

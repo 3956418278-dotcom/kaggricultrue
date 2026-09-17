@@ -68,10 +68,28 @@ for animal products (WOOL, MILK, EGG):
   - `DailyPlanningSession.plan_for` resets per-player `AnimalMarketContext` when `step < last_step`, eliminating cross-episode anchor and cache leakage.
   - WOOL at D8 and earlier routes to legacy `forecast_inventory`; empirical gating begins from step 239 onwards. Crops retain legacy `forecast_inventory` behavior.
 
+## Market prediction failure protection patch
+
+A targeted protection mechanism in `operating.py` and `market.py` guards against market inventory prediction divergence:
+- **Failure tracking**: `DailyPlanningSession._market_failure_steps` records `player -> {product: step}` whenever `state.market.inventory` differs from `programme.market_inventory` for any non-excluded product (`_DEVIATION_EXCLUDED = frozenset({"WHEAT", "CARROT"})`).
+- **4-turn window**: Cooldown is active while `0 <= state.step - last_failure_step <= MARKET_FAILURE_SELL_WINDOW` (`MARKET_FAILURE_SELL_WINDOW = 4`). New failures within the window refresh `last_failure_step`.
+- **New-arrival forced sale**: During cooldown, any new units arriving into the shed at the current step (`_arrivals(state, programme).get(state.step, {}).get(product, 0)`) are immediately scheduled for sale, while existing shed inventory remains subject to normal optimizer timing.
+- **Optimizer integration**: Forced quantities are passed via `forced_sales` to `optimize_short_sales`, merging into `_short_product_plan`'s `forced` minimum constraints and prioritized as hard lines in `_defer_sale_lines`.
+- **Per-product isolation & reset**: Unaffected products follow normal valuation; failure histories are cleared on `DailyPlanningSession.reset()` and whenever `state.step < last_step`.
+
 ## Validation
 
-- Full suite run under runner: 128 passed tests (all midgame asset, scenario forecast, D11 controller,
+- Full suite run under runner: 136 passed tests (all midgame asset, market failure patch, scenario forecast, D11 controller,
   opening base, player day, reference pipeline, replay viewer, scripted opening, and zonal template tests).
+- Dedicated market failure patch tests in `tests/test_market_failure_patch.py`:
+  - Failure recording on non-excluded product mismatch;
+  - Immediate sale of new arrivals at $t+1$;
+  - Only new arrivals forced without liquidating existing shed stock;
+  - Exact 4-turn boundary enforcement ($t..t+4$ active, $t+5$ normal);
+  - Window refresh on repeated deviation;
+  - Per-product isolation;
+  - Zero-arrival safety;
+  - Episode reset and session reset clearance.
 - Dedicated scenario forecast tests in `tests/test_scenario_forecast.py`:
   - Full-horizon multi-batch daily value stability and monotonic scaling across 1, 2, and 3 batches for existing animals;
   - Remaining survival feed calculation (`_remaining_survival_feed_units`) considering `fed_today` and `consecutive_unfed`;
